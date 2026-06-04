@@ -117,6 +117,13 @@ if system_has_kms_drm
   vn_deps += dep_libdrm
 endif
 
+if with_platform_windows
+  # Helios IOCTL backend: the only vn_renderer backend on Windows. setupapi for
+  # the GUID_DEVINTERFACE_HELIOS device-interface enumeration (SetupDi*).
+  libvn_files += files('vn_renderer_helios.c')
+  vn_deps += cc.find_library('setupapi')
+endif
+
 if with_platform_wayland or with_platform_x11 or \
    (system_has_kms_drm and not with_platform_android) or \
    with_platform_windows
@@ -146,6 +153,12 @@ libvulkan_virtio = shared_library(
   c_args : vn_c_args,
   link_args : vn_link_args,
   link_depends : vulkan_icd_link_depends,
+  # Export the 3 vk_icd* loader entrypoints on Windows (gnu_symbol_visibility
+  # 'hidden' otherwise hides vk_icdGetInstanceProcAddr). Ignored on ELF.
+  vs_module_defs : vulkan_api_def,
   gnu_symbol_visibility : 'hidden',
+  # On Windows libname_prefix='' so the manifest expects vulkan_virtio.dll; mingw
+  # would otherwise produce libvulkan_virtio.dll. '' on Windows, default elsewhere.
+  name_prefix : host_machine.system() == 'windows' ? '' : [],
   install : true,
 )

@@ -242,12 +242,22 @@ vn_renderer_create_vtest(struct vn_instance *instance,
                          const VkAllocationCallbacks *alloc,
                          struct vn_renderer **renderer);
 
+#if defined(_WIN32)
+/* Helios IOCTL backend (vn_renderer_helios.c) — the only backend on Windows. */
+VkResult
+vn_renderer_create_helios(struct vn_instance *instance,
+                          const VkAllocationCallbacks *alloc,
+                          struct vn_renderer **renderer);
+#endif
+
 static inline VkResult
 vn_renderer_create(struct vn_instance *instance,
                    const VkAllocationCallbacks *alloc,
                    struct vn_renderer **renderer)
 {
-#ifdef HAVE_LIBDRM
+#if defined(_WIN32)
+   return vn_renderer_create_helios(instance, alloc, renderer);
+#elif defined(HAVE_LIBDRM)
    if (VN_DEBUG(VTEST)) {
       VkResult result = vn_renderer_create_vtest(instance, alloc, renderer);
       if (result == VK_SUCCESS)
