@@ -102,6 +102,8 @@ struct helios_escape_submit_venus {
    uint64_t fence_id;
    uint32_t ctx_id;
    uint32_t buffer_size;
+   uint32_t ring_idx; /* venus per-queue host timeline (0 = CPU/primary ring) */
+   uint32_t _pad;
 };
 
 struct helios_escape_alloc_blob {
@@ -131,7 +133,7 @@ struct helios_escape_wait_fence {
 _Static_assert(sizeof(struct helios_escape_header) == 16, "hdr size");
 _Static_assert(sizeof(struct helios_escape_ctx_create) == 24, "ctx_create size");
 _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size");
-_Static_assert(sizeof(struct helios_escape_submit_venus) == 32, "submit size");
+_Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_wait_fence) == 32, "wait_fence size");
@@ -236,7 +238,10 @@ helios_ioctl_ctx_destroy(struct helios *helios, uint32_t ctx_id)
  * and only reads — see handle_submit_venus. Synchronous: returns after host
  * completion. */
 static bool
-helios_ioctl_submit_cs(struct helios *helios, const void *cs_data, size_t cs_size)
+helios_ioctl_submit_cs(struct helios *helios,
+                       const void *cs_data,
+                       size_t cs_size,
+                       uint32_t ring_idx)
 {
    if (cs_size == 0 || cs_size > UINT32_MAX)
       return false;
@@ -246,6 +251,7 @@ helios_ioctl_submit_cs(struct helios *helios, const void *cs_data, size_t cs_siz
    hdr.fence_id = ++helios->next_fence_id;
    hdr.ctx_id = helios->ctx_id;
    hdr.buffer_size = (uint32_t)cs_size;
+   hdr.ring_idx = ring_idx;
 
    /* lpOutBuffer carries the cs; the KMD only reads it (IN_DIRECT read-lock), so
     * casting away const is safe. */
@@ -379,7 +385,8 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
       const struct vn_renderer_submit_batch *batch = &submit->batches[i];
 
       if (batch->cs_size) {
-         if (!helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size)) {
+         if (!helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
+                                     batch->ring_idx)) {
             result = VK_ERROR_DEVICE_LOST;
             break;
          }
@@ -524,7 +531,8 @@ helios_bo_create_from_device_memory(
     * it via blob_id=mem_id. */
    if (batch) {
       if (batch->cs_size &&
-          !helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size)) {
+          !helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
+                                  batch->ring_idx)) {
          mtx_unlock(&helios->dev_mutex);
          return VK_ERROR_DEVICE_LOST;
       }
