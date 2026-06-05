@@ -1495,6 +1495,11 @@ vn_QueueBindSparse(VkQueue queue,
    return VK_SUCCESS;
 }
 
+static void
+vn_fence_feedback_fini(struct vn_device *dev,
+                       struct vn_fence *fence,
+                       const VkAllocationCallbacks *alloc);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_QueueWaitIdle(VkQueue _queue)
 {
@@ -1516,6 +1521,33 @@ vn_QueueWaitIdle(VkQueue _queue)
          vn_CreateFence(dev_handle, &create_info, NULL, &queue->wait_fence);
       if (result != VK_SUCCESS)
          return result;
+
+      /* Strip fence feedback from the internal idle-wait fence.
+       *
+       * Fence feedback is a fast path for fences the app POLLS repeatedly: the
+       * status is read from a host-visible slot the GPU fills, avoiding a
+       * round-trip per check. The idle-wait fence is the opposite — it is waited
+       * on synchronously exactly once per idle, never polled. Worse, on the
+       * Helios transport the GPU's write to the slot becomes visible to a guest
+       * poll only with some latency: the guest reads the slot through the hostmem
+       * PCI-BAR window (RESOURCE_MAP_BLOB -> host resource_map_fixed), not as the
+       * directly-mapped coherent guest RAM Linux virtgpu uses, so a synchronous
+       * vkGetFenceStatus can report the fence signaled before the slot write is
+       * visible. Nothing in the slot-poll path forces the host to process this
+       * batch's empty submit either, so vn_WaitForFences spins in vn_relax for
+       * ~16s until a relax-warn round-trip finally nudges the host. Without feedback,
+       * vn_get_fence_status falls to the authoritative synchronous
+       * vkGetFenceStatus, which both forces prompt ring processing and returns
+       * the true status — making vkQueueWaitIdle/vkDeviceWaitIdle fast AND
+       * correct. App fences keep feedback (their real GPU work makes the slot
+       * land promptly). */
+      struct vn_fence *wf = vn_fence_from_handle(queue->wait_fence);
+      if (wf->feedback.slot) {
+         vn_fence_feedback_fini(dev, wf, &dev->base.vk.alloc);
+         wf->feedback.slot = NULL;
+         wf->feedback.commands = NULL;
+         wf->feedback.pollable = false;
+      }
    }
 
    result = vn_queue_submit(&(struct vn_queue_submission){
@@ -1773,8 +1805,22 @@ vn_get_fence_status(VkDevice dev_handle,
             }
             if (result == VK_SUCCESS &&
                 vn_feedback_get_status(fence->feedback.slot) != VK_SUCCESS) {
-               vn_log(dev->instance, "ERROR: ffb must be signaled now");
-               result = VK_ERROR_UNKNOWN;
+               /* Helios backend: the "feedback slot is signaled before the fence"
+                * visibility ordering venus assumes does not hold on this transport.
+                * On real virtgpu the guest learns the fence is signaled via the
+                * DEFERRED used-ring interrupt, by which time the GPU's slot write
+                * is already visible; here the relax path instead learns it via this
+                * SYNCHRONOUS vkGetFenceStatus roundtrip, which can outrun the
+                * GPU-write->guest-visible propagation of the slot (observed: the
+                * slot still reads unsignaled right after the roundtrip returns
+                * SUCCESS; it is a host-side propagation lag, not guest CPU cache —
+                * mapping the slot write-combined did not change it). The roundtrip
+                * is authoritative: SUCCESS means the host fence, hence all of the
+                * batch's GPU work including the ffb fill, has completed — so trust
+                * it instead of treating the lagging slot as fatal. The slot stays a
+                * valid fast-path hint whenever it IS already visible (the common
+                * case). Without this, vkQueueWaitIdle's empty fence-feedback submit
+                * races and intermittently returns VK_ERROR_UNKNOWN. */
             }
          }
       } else {
