@@ -56,6 +56,14 @@ static const struct vk_instance_extension_table
 #ifdef VK_USE_PLATFORM_XLIB_XRANDR_EXT
       .EXT_acquire_xlib_display = true,
 #endif
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      /* Helios: present to a Win32 window via the common Mesa WSI. With no
+       * dma-buf on Windows, vn_wsi_init selects the software WSI device, so
+       * VK_KHR_swapchain present uses wsi_common_win32's GDI/DIB blit of the
+       * host-visible swapchain image into the HWND (zero-copy windowed present
+       * is impossible on virtio-gpu — no overlay planes; see wsi-present-plan). */
+      .KHR_win32_surface = true,
+#endif
 #ifndef VK_USE_PLATFORM_WIN32_KHR
       .EXT_headless_surface = true,
 #endif

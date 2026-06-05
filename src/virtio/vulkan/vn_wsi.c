@@ -890,7 +890,15 @@ vn_AcquireNextImage2KHR(VkDevice device,
       return vn_error(dev->instance, result);
 
    int sync_fd = -1;
-   if (!dev->renderer->info.has_implicit_fencing) {
+   /* The software WSI path (Windows: no dma-buf) has no sync file to export, and
+    * its swapchain image is not a venus blit image, so the dedicated_img /
+    * export_sync_file dance below would NULL-deref. Leave sync_fd = -1; the
+    * imports below still run with fd = -1, giving the acquire semaphore/fence a
+    * VN_SYNC_TYPE_IMPORTED_SYNC_FD "already signaled" temporary — which is what
+    * vn_queue_submission_fix_batch_semaphores needs to exclude it from the host
+    * wait (a generic wsi dummy sync would instead make the host block forever). */
+   if (!dev->renderer->info.has_implicit_fencing &&
+       !dev->physical_device->wsi_device.sw) {
       VkDeviceMemory mem_handle =
          wsi_common_get_memory(pAcquireInfo->swapchain, *pImageIndex);
       struct vn_device_memory *mem = vn_device_memory_from_handle(mem_handle);
