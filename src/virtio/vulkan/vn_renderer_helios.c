@@ -41,6 +41,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h> /* Phase-7 gate res_id surfacing (throwaway) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -597,6 +598,23 @@ helios_bo_create_from_device_memory(
 
    if (!res_id)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   /* ── Phase-7 go/no-go gate hook (DISPLAY.md §8) — THROWAWAY ─────────────────
+    * Surface "<res_id> <size>" for the gate test (helios_vk_present), which needs
+    * the virtio-gpu resource_id backing its exportable image's VkDeviceMemory to
+    * feed IOCTL_HELIOS_PRESENT_BLOB. A no-op unless HELIOS_GATE_RESID_FILE is set;
+    * remove once the DOD's real present path lands. (size == the app's
+    * VkMemoryAllocateInfo.allocationSize, so the test disambiguates by size.) */
+   {
+      const char *gate_file = getenv("HELIOS_GATE_RESID_FILE");
+      if (gate_file) {
+         FILE *f = fopen(gate_file, "a");
+         if (f) {
+            fprintf(f, "%u %llu\n", res_id, (unsigned long long)size);
+            fclose(f);
+         }
+      }
+   }
 
    struct helios_bo *bo = calloc(1, sizeof(*bo));
    if (!bo)

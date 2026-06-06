@@ -1423,9 +1423,11 @@ vn_physical_device_get_passthrough_extensions(
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = !VN_DEBUG(NO_GPL),
       .EXT_image_2d_view_of_3d = true,
-#if !DETECT_OS_WINDOWS
+      /* Helios (Phase 7): enable on Windows too — required so DMA_BUF scanout
+       * images use TILING_DRM_FORMAT_MODIFIER (venus rejects legacy tiling for
+       * dma_buf scanout) and the exported dmabuf carries a real modifier the host
+       * can interpret. Modifier queries forward to the host, which supports it. */
       .EXT_image_drm_format_modifier = true,
-#endif
       .EXT_image_sliced_view_of_3d = true,
       .EXT_image_view_min_lod = true,
       .EXT_index_type_uint8 = true,
