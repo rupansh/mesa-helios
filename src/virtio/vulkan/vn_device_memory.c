@@ -22,6 +22,104 @@
 #include "vn_renderer.h"
 #include "vn_renderer_util.h"
 
+static bool
+vn_device_memory_is_coherent_cached(struct vn_device *dev,
+                                    struct vn_device_memory *mem)
+{
+   const struct vk_device_memory *mem_vk = &mem->base.vk;
+   const VkMemoryType *mem_type = &dev->physical_device->memory_properties
+                                      .memoryTypes[mem_vk->memory_type_index];
+   const VkMemoryPropertyFlags flags = mem_type->propertyFlags;
+
+   return (flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
+          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+           VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+}
+
+static void
+vn_device_memory_register_coherent_cached_mapping(struct vn_device *dev,
+                                                  struct vn_device_memory *mem)
+{
+   if (!vn_device_memory_is_coherent_cached(dev, mem) || !mem->base_bo ||
+       !mem->base_bo->mmap_ptr || mem->map_end <= mem->map_start)
+      return;
+
+   simple_mtx_lock(&dev->mutex);
+   if (!mem->coherent_cached_mapped) {
+      list_addtail(&mem->coherent_cached_link,
+                   &dev->coherent_cached_memory);
+      mem->coherent_cached_mapped = true;
+   }
+   simple_mtx_unlock(&dev->mutex);
+}
+
+static void
+vn_device_memory_unregister_coherent_cached_mapping(struct vn_device *dev,
+                                                    struct vn_device_memory *mem)
+{
+   if (!mem->coherent_cached_mapped)
+      return;
+
+   simple_mtx_lock(&dev->mutex);
+   if (mem->coherent_cached_mapped) {
+      list_delinit(&mem->coherent_cached_link);
+      mem->coherent_cached_mapped = false;
+   }
+   simple_mtx_unlock(&dev->mutex);
+}
+
+static void
+vn_device_memory_cache_op_coherent_cached_mappings(struct vn_device *dev,
+                                                   bool invalidate)
+{
+   simple_mtx_lock(&dev->mutex);
+   list_for_each_entry(struct vn_device_memory, mem,
+                       &dev->coherent_cached_memory,
+                       coherent_cached_link) {
+      if (!mem->base_bo || !mem->base_bo->mmap_ptr ||
+          mem->map_end <= mem->map_start)
+         continue;
+
+      const VkDeviceSize size = mem->map_end - mem->map_start;
+      if (invalidate) {
+         vn_renderer_bo_invalidate(dev->renderer, mem->base_bo,
+                                   mem->map_start, size);
+      } else {
+         vn_renderer_bo_flush(dev->renderer, mem->base_bo, mem->map_start,
+                              size);
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+}
+
+void
+vn_device_memory_flush_coherent_cached_mappings(struct vn_device *dev)
+{
+   vn_device_memory_cache_op_coherent_cached_mappings(dev, false);
+}
+
+void
+vn_device_memory_invalidate_coherent_cached_mappings(struct vn_device *dev)
+{
+   vn_device_memory_cache_op_coherent_cached_mappings(dev, true);
+}
+
+void
+vn_device_memory_cleanup_coherent_cached_mappings(struct vn_device *dev)
+{
+   simple_mtx_lock(&dev->mutex);
+   list_for_each_entry_safe(struct vn_device_memory, mem,
+                            &dev->coherent_cached_memory,
+                            coherent_cached_link) {
+      list_delinit(&mem->coherent_cached_link);
+      mem->coherent_cached_mapped = false;
+   }
+   simple_mtx_unlock(&dev->mutex);
+}
+
 /* device memory commands */
 
 static inline VkResult
@@ -379,6 +477,7 @@ vn_AllocateMemory(VkDevice device,
    if (!mem)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   list_inithead(&mem->coherent_cached_link);
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    const VkImportMemoryFdInfoKHR *import_fd_info =
@@ -419,6 +518,7 @@ vn_FreeMemory(VkDevice device,
       return;
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
+   vn_device_memory_unregister_coherent_cached_mapping(dev, mem);
 
    /* ensure renderer side import still sees the resource */
    vn_device_memory_bo_fini(dev, mem);
@@ -496,9 +596,11 @@ vn_MapMemory2(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
+   mem->map_start = offset;
    mem->map_end = size == VK_WHOLE_SIZE ? mem_vk->size : offset + size;
 
    *ppData = ptr + offset;
+   vn_device_memory_register_coherent_cached_mapping(dev, mem);
 
    return VK_SUCCESS;
 }
@@ -506,6 +608,21 @@ vn_MapMemory2(VkDevice device,
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
 {
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_device_memory *mem =
+      vn_device_memory_from_handle(pMemoryUnmapInfo->memory);
+
+   if (mem) {
+      if (mem->coherent_cached_mapped && mem->base_bo &&
+          mem->base_bo->mmap_ptr && mem->map_end > mem->map_start) {
+         vn_renderer_bo_flush(dev->renderer, mem->base_bo, mem->map_start,
+                              mem->map_end - mem->map_start);
+      }
+      vn_device_memory_unregister_coherent_cached_mapping(dev, mem);
+      mem->map_start = 0;
+      mem->map_end = 0;
+   }
+
    return VK_SUCCESS;
 }
 

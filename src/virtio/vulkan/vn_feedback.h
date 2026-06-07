@@ -8,6 +8,10 @@
 
 #include "vn_common.h"
 
+#if DETECT_OS_WINDOWS
+#include "util/cache_ops.h"
+#endif
+
 struct vn_feedback_pool {
    /* single lock for simplicity though free_slots can use another */
    simple_mtx_t mutex;
@@ -66,6 +70,30 @@ struct vn_feedback_buffer {
    struct list_head head;
 };
 
+static inline void
+vn_feedback_cpu_flush(const void *ptr, size_t size)
+{
+#if DETECT_OS_WINDOWS
+   if (util_has_cache_ops())
+      util_flush_range((void *)ptr, size);
+#else
+   (void)ptr;
+   (void)size;
+#endif
+}
+
+static inline void
+vn_feedback_cpu_invalidate(const void *ptr, size_t size)
+{
+#if DETECT_OS_WINDOWS
+   if (util_has_cache_ops())
+      util_flush_inval_range((void *)ptr, size);
+#else
+   (void)ptr;
+   (void)size;
+#endif
+}
+
 struct vn_semaphore_feedback_cmd {
    struct vn_feedback_slot *src_slot;
    VkCommandBuffer *cmd_handles;
@@ -100,6 +128,7 @@ vn_feedback_pool_free(struct vn_feedback_pool *pool,
 static inline VkResult
 vn_feedback_get_status(struct vn_feedback_slot *slot)
 {
+   vn_feedback_cpu_invalidate(slot->status, sizeof(*slot->status));
    return *slot->status;
 }
 
@@ -110,6 +139,7 @@ vn_feedback_reset_status(struct vn_feedback_slot *slot)
           slot->type == VN_FEEDBACK_TYPE_EVENT);
    *slot->status =
       slot->type == VN_FEEDBACK_TYPE_FENCE ? VK_NOT_READY : VK_EVENT_RESET;
+   vn_feedback_cpu_flush(slot->status, sizeof(*slot->status));
 }
 
 static inline void
@@ -118,12 +148,14 @@ vn_feedback_set_status(struct vn_feedback_slot *slot, VkResult status)
    assert(slot->type == VN_FEEDBACK_TYPE_FENCE ||
           slot->type == VN_FEEDBACK_TYPE_EVENT);
    *slot->status = status;
+   vn_feedback_cpu_flush(slot->status, sizeof(*slot->status));
 }
 
 static inline uint64_t
 vn_feedback_get_counter(struct vn_feedback_slot *slot)
 {
    assert(slot->type == VN_FEEDBACK_TYPE_SEMAPHORE);
+   vn_feedback_cpu_invalidate(slot->counter, sizeof(*slot->counter));
    return *slot->counter;
 }
 
@@ -132,6 +164,7 @@ vn_feedback_set_counter(struct vn_feedback_slot *slot, uint64_t counter)
 {
    assert(slot->type == VN_FEEDBACK_TYPE_SEMAPHORE);
    *slot->counter = counter;
+   vn_feedback_cpu_flush(slot->counter, sizeof(*slot->counter));
 }
 
 VkResult

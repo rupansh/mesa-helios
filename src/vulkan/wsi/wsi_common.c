@@ -24,6 +24,7 @@
 #include "wsi_common_private.h"
 #include "wsi_common_entrypoints.h"
 #include "util/u_debug.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/os_time.h"
@@ -229,6 +230,7 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(QueueSubmit2);
    WSI_GET_CB(SetDebugUtilsObjectNameEXT);
    WSI_GET_CB(WaitForFences);
+   WSI_GET_CB(InvalidateMappedMemoryRanges);
    WSI_GET_CB(MapMemory);
    WSI_GET_CB(UnmapMemory);
    if (wsi->has_present_wait)
@@ -2042,8 +2044,13 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
    VkResult result = wsi->QueueSubmit2(vk_queue_to_handle(queue), 1, info,
                                        fence_count > 0 ? fences[0]
                                                        : VK_NULL_HANDLE);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      mesa_logd("wsi: QueueSubmit2 failed: %s, cmd_buffers=%u, wait_sems=%u, signal_sems=%u, fences=%u",
+                vk_Result_to_str(result), info->commandBufferInfoCount,
+                info->waitSemaphoreInfoCount, info->signalSemaphoreInfoCount,
+                fence_count);
       return result;
+   }
 
    for (uint32_t i = 1; i < fence_count; i++) {
       const VkSubmitInfo2 submit_info = {
@@ -2051,8 +2058,11 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
       };
       result = wsi->QueueSubmit2(vk_queue_to_handle(queue),
                                  1, &submit_info, fences[i]);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         mesa_logd("wsi: QueueSubmit2 empty fence[%u/%u] failed: %s",
+                   i, fence_count, vk_Result_to_str(result));
          return result;
+      }
    }
 
    return VK_SUCCESS;
@@ -2502,8 +2512,33 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       }
 
       if (wsi->sw) {
-         wsi->WaitForFences(vk_device_to_handle(dev),
-                            1, &swapchain->fences[image_index], true, ~0ull);
+         VkResult wait_result =
+            wsi->WaitForFences(vk_device_to_handle(dev),
+                               1, &swapchain->fences[image_index], true,
+                               ~0ull);
+         if (wait_result != VK_SUCCESS) {
+            mesa_logd("wsi: sw present WaitForFences(image=%u) failed: %s",
+                      image_index, vk_Result_to_str(wait_result));
+            results[i] = wait_result;
+            continue;
+         }
+
+         if (image->cpu_map != NULL) {
+            const VkMappedMemoryRange range = {
+               .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+               .memory = image->blit.buffer != VK_NULL_HANDLE ?
+                         image->blit.memory : image->memory,
+               .offset = 0,
+               .size = VK_WHOLE_SIZE,
+            };
+            results[i] =
+               wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
+            if (results[i] != VK_SUCCESS) {
+               mesa_logd("wsi: sw present invalidate(image=%u) failed: %s",
+                         image_index, vk_Result_to_str(results[i]));
+               continue;
+            }
+         }
       }
 
       const VkPresentRegionKHR *region = NULL;
@@ -2513,6 +2548,10 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       results[i] = swapchain->queue_present(swapchain, image_index,
                                             image_signal_infos[i].present_id,
                                             region);
+      if (results[i] != VK_SUCCESS) {
+         mesa_logd("wsi: queue_present(image=%u) failed: %s", image_index,
+                   vk_Result_to_str(results[i]));
+      }
       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
          continue;
 

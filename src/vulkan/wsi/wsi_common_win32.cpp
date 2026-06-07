@@ -548,8 +548,15 @@ wsi_win32_image_init(VkDevice device_h,
    if (chain->dxgi)
       return VK_SUCCESS;
 
-   chain->chain_dc = GetDC(chain->wnd);
-   image->sw.dc = CreateCompatibleDC(chain->chain_dc);
+   HDC wnd_dc = GetDC(chain->wnd);
+   if (!wnd_dc)
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   image->sw.dc = CreateCompatibleDC(wnd_dc);
+   ReleaseDC(chain->wnd, wnd_dc);
+   if (!image->sw.dc)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
    HBITMAP bmp = NULL;
 
    BITMAPINFO info = { 0 };
@@ -561,7 +568,8 @@ wsi_win32_image_init(VkDevice device_h,
    info.bmiHeader.biCompression = BI_RGB;
 
    bmp = CreateDIBSection(image->sw.dc, &info, DIB_RGB_COLORS, &image->sw.ppvBits, NULL, 0);
-   assert(bmp && image->sw.ppvBits);
+   if (!bmp || !image->sw.ppvBits)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    SelectObject(image->sw.dc, bmp);
 
@@ -598,8 +606,6 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
-
-   DeleteDC(chain->chain_dc);
 
    if (chain->surface->current_swapchain == chain)
       chain->surface->current_swapchain = NULL;
@@ -817,8 +823,32 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
       dptr += image->sw.bmp_row_pitch;
       ptr += image->base.row_pitches[0];
    }
-   if (!StretchBlt(chain->chain_dc, 0, 0, chain->extent.width, chain->extent.height, image->sw.dc, 0, 0, chain->extent.width, chain->extent.height, SRCCOPY))
+   HDC wnd_dc = GetDC(chain->wnd);
+   if (!wnd_dc) {
+      chain->status = VK_ERROR_SURFACE_LOST_KHR;
+      return chain->status;
+   }
+
+   BITMAPINFO info = { 0 };
+   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+   info.bmiHeader.biWidth = chain->extent.width;
+   info.bmiHeader.biHeight = -(LONG)chain->extent.height;
+   info.bmiHeader.biPlanes = 1;
+   info.bmiHeader.biBitCount = 32;
+   info.bmiHeader.biCompression = BI_RGB;
+
+   int copied = StretchDIBits(wnd_dc, 0, 0, chain->extent.width,
+                              chain->extent.height, 0, 0, chain->extent.width,
+                              chain->extent.height, image->sw.ppvBits, &info,
+                              DIB_RGB_COLORS, SRCCOPY);
+   if (copied == 0 || copied == (int)GDI_ERROR) {
+      fprintf(stderr,
+              "wsi/win32: StretchDIBits failed, ret=%d, GetLastError=%lu, dst=%p, extent=%ux%u\n",
+              copied, (unsigned long)GetLastError(), wnd_dc,
+              chain->extent.width, chain->extent.height);
       chain->status = VK_ERROR_MEMORY_MAP_FAILED;
+   }
+   ReleaseDC(chain->wnd, wnd_dc);
 
    wsi_win32_set_image_idle(chain, image);
 

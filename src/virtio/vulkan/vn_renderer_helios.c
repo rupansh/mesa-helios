@@ -47,6 +47,8 @@
 
 #include "vn_renderer_internal.h"
 
+#include "util/cache_ops.h"
+
 #include <windows.h>
 #include <setupapi.h>
 
@@ -166,6 +168,45 @@ struct helios_sync {
    uint64_t fence_id;
 };
 
+enum helios_ioctl_stat {
+   HELIOS_STAT_CTX_CREATE = 0,
+   HELIOS_STAT_CTX_DESTROY,
+   HELIOS_STAT_SUBMIT,
+   HELIOS_STAT_ALLOC_BLOB,
+   HELIOS_STAT_MAP_BLOB,
+   HELIOS_STAT_WAIT_FENCE,
+   HELIOS_STAT_COUNT,
+};
+
+struct helios_perf_ioctl {
+   uint64_t calls;
+   uint64_t failures;
+   uint64_t bytes_in;
+   uint64_t bytes_out;
+   int64_t ticks;
+};
+
+struct helios_perf_stats {
+   bool enabled;
+   bool dumped;
+   bool live;
+   LARGE_INTEGER qpc_freq;
+   struct helios_perf_ioctl ioctl[HELIOS_STAT_COUNT];
+   uint64_t submit_calls;
+   uint64_t submit_batches;
+   uint64_t submit_empty_batches;
+   uint64_t submit_syncs;
+   uint64_t submit_cs_bytes;
+   uint64_t wait_calls;
+   uint64_t wait_fast;
+   uint64_t wait_slow;
+   uint64_t wait_timeout;
+   uint64_t shmem_cache_hits;
+   uint64_t shmem_creates;
+   uint64_t bo_creates;
+   uint64_t bo_maps;
+};
+
 struct helios {
    struct vn_renderer base;
 
@@ -181,7 +222,16 @@ struct helios {
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
 
    struct vn_renderer_shmem_cache shmem_cache;
+   struct helios_perf_stats perf;
 };
+
+static struct helios *helios_perf_at_exit_renderer;
+static bool helios_perf_at_exit_registered;
+
+static void helios_perf_write(struct helios *helios, bool final);
+static bool helios_ioctl_wait_fence(struct helios *helios,
+                                    uint64_t fence_id,
+                                    uint64_t timeout_ns);
 
 /* ── IOCTL helpers ─────────────────────────────────────────────────────────── */
 
@@ -192,6 +242,27 @@ helios_hdr_init(struct helios_escape_header *hdr, uint32_t cmd_type, uint32_t si
    hdr->cmd_type = cmd_type;
    hdr->version = HELIOS_ESCAPE_VERSION;
    hdr->size = size;
+}
+
+static enum helios_ioctl_stat
+helios_ioctl_stat_from_code(uint32_t code)
+{
+   switch (code) {
+   case IOCTL_HELIOS_CTX_CREATE:
+      return HELIOS_STAT_CTX_CREATE;
+   case IOCTL_HELIOS_CTX_DESTROY:
+      return HELIOS_STAT_CTX_DESTROY;
+   case IOCTL_HELIOS_SUBMIT_VENUS:
+      return HELIOS_STAT_SUBMIT;
+   case IOCTL_HELIOS_ALLOC_BLOB:
+      return HELIOS_STAT_ALLOC_BLOB;
+   case IOCTL_HELIOS_MAP_BLOB:
+      return HELIOS_STAT_MAP_BLOB;
+   case IOCTL_HELIOS_WAIT_FENCE:
+      return HELIOS_STAT_WAIT_FENCE;
+   default:
+      return HELIOS_STAT_COUNT;
+   }
 }
 
 /* One DeviceIoControl round-trip. For METHOD_BUFFERED ops, `in`/`out` are the
@@ -207,8 +278,28 @@ helios_ioctl(struct helios *helios,
              uint32_t out_size)
 {
    DWORD returned = 0;
+   LARGE_INTEGER t0 = { 0 };
+   const enum helios_ioctl_stat stat = helios_ioctl_stat_from_code(code);
+   if (helios->perf.enabled)
+      QueryPerformanceCounter(&t0);
+
    const BOOL ok = DeviceIoControl(helios->dev, code, in, in_size, out, out_size,
                                    &returned, NULL);
+
+   if (helios->perf.enabled && stat < HELIOS_STAT_COUNT) {
+      LARGE_INTEGER t1;
+      QueryPerformanceCounter(&t1);
+      struct helios_perf_ioctl *s = &helios->perf.ioctl[stat];
+      s->calls++;
+      s->bytes_in += in_size;
+      s->bytes_out += out_size;
+      s->ticks += t1.QuadPart - t0.QuadPart;
+      if (!ok)
+         s->failures++;
+      if (helios->perf.live)
+         helios_perf_write(helios, false);
+   }
+
    if (!ok) {
       vn_log(helios->instance, "Helios IOCTL 0x%x failed: Win32 error %lu", code,
              (unsigned long)GetLastError());
@@ -330,6 +421,102 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
    return helios_ioctl(helios, IOCTL_HELIOS_WAIT_FENCE, &req, sizeof(req), NULL, 0);
 }
 
+static void
+helios_perf_init(struct helios *helios)
+{
+   char enabled[8];
+   if (!GetEnvironmentVariableA("HELIOS_PERF", enabled, sizeof(enabled)))
+      return;
+
+   helios->perf.enabled = true;
+   helios->perf.live =
+      GetEnvironmentVariableA("HELIOS_PERF_LIVE", enabled, sizeof(enabled)) != 0;
+   QueryPerformanceFrequency(&helios->perf.qpc_freq);
+}
+
+static double
+helios_perf_ms(const struct helios *helios, int64_t ticks)
+{
+   if (!helios->perf.qpc_freq.QuadPart)
+      return 0.0;
+   return (double)ticks * 1000.0 / (double)helios->perf.qpc_freq.QuadPart;
+}
+
+static void
+helios_perf_write(struct helios *helios, bool final)
+{
+   FILE *f = stderr;
+   char path[MAX_PATH];
+   if (GetEnvironmentVariableA("HELIOS_PERF_FILE", path, sizeof(path))) {
+      FILE *opened = fopen(path, "a");
+      if (opened)
+         f = opened;
+   }
+
+   static const char *names[HELIOS_STAT_COUNT] = {
+      "ctx_create",
+      "ctx_destroy",
+      "submit",
+      "alloc_blob",
+      "map_blob",
+      "wait_fence",
+   };
+
+   fprintf(f, "Helios perf summary (%s)\n", final ? "final" : "live");
+   fprintf(f,
+           "submit_calls=%llu batches=%llu empty_batches=%llu syncs=%llu cs_bytes=%llu\n",
+           (unsigned long long)helios->perf.submit_calls,
+           (unsigned long long)helios->perf.submit_batches,
+           (unsigned long long)helios->perf.submit_empty_batches,
+           (unsigned long long)helios->perf.submit_syncs,
+           (unsigned long long)helios->perf.submit_cs_bytes);
+   fprintf(f, "wait_calls=%llu fast=%llu slow=%llu timeout=%llu\n",
+           (unsigned long long)helios->perf.wait_calls,
+           (unsigned long long)helios->perf.wait_fast,
+           (unsigned long long)helios->perf.wait_slow,
+           (unsigned long long)helios->perf.wait_timeout);
+   fprintf(f, "shmem_creates=%llu shmem_cache_hits=%llu bo_creates=%llu bo_maps=%llu\n",
+           (unsigned long long)helios->perf.shmem_creates,
+           (unsigned long long)helios->perf.shmem_cache_hits,
+           (unsigned long long)helios->perf.bo_creates,
+           (unsigned long long)helios->perf.bo_maps);
+
+   for (uint32_t i = 0; i < HELIOS_STAT_COUNT; i++) {
+      const struct helios_perf_ioctl *s = &helios->perf.ioctl[i];
+      if (!s->calls)
+         continue;
+      fprintf(f,
+              "ioctl.%s calls=%llu failures=%llu ms=%.3f avg_us=%.3f bytes_in=%llu bytes_out=%llu\n",
+              names[i],
+              (unsigned long long)s->calls,
+              (unsigned long long)s->failures,
+              helios_perf_ms(helios, s->ticks),
+              helios_perf_ms(helios, s->ticks) * 1000.0 / (double)s->calls,
+              (unsigned long long)s->bytes_in,
+              (unsigned long long)s->bytes_out);
+   }
+
+   fprintf(f, "\n");
+   if (f != stderr)
+      fclose(f);
+}
+
+static void
+helios_perf_dump(struct helios *helios)
+{
+   if (!helios->perf.enabled || helios->perf.dumped)
+      return;
+   helios->perf.dumped = true;
+   helios_perf_write(helios, true);
+}
+
+static void
+helios_perf_dump_at_exit(void)
+{
+   if (helios_perf_at_exit_renderer)
+      helios_perf_dump(helios_perf_at_exit_renderer);
+}
+
 /* ── Device discovery + open (mirrors probe/src/main.rs::open_helios) ───────── */
 
 static HANDLE
@@ -400,8 +587,18 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
    VkResult result = VK_SUCCESS;
 
    mtx_lock(&helios->dev_mutex);
+   if (helios->perf.enabled)
+      helios->perf.submit_calls++;
    for (uint32_t i = 0; i < submit->batch_count; i++) {
       const struct vn_renderer_submit_batch *batch = &submit->batches[i];
+
+      if (helios->perf.enabled) {
+         helios->perf.submit_batches++;
+         helios->perf.submit_syncs += batch->sync_count;
+         helios->perf.submit_cs_bytes += batch->cs_size;
+         if (!batch->cs_size)
+            helios->perf.submit_empty_batches++;
+      }
 
       uint64_t fence_id = 0;
       if (batch->cs_size) {
@@ -434,6 +631,9 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 {
    struct helios *helios = (struct helios *)renderer;
 
+   if (helios->perf.enabled)
+      helios->perf.wait_calls++;
+
    /* Fast path: optimistic sync->val (set at submit) usually already satisfies. */
    mtx_lock(&helios->dev_mutex);
    bool satisfied = !wait->wait_any; /* wait_all starts true, wait_any starts false */
@@ -454,10 +654,16 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    }
    mtx_unlock(&helios->dev_mutex);
 
-   if (satisfied)
+   if (satisfied) {
+      if (helios->perf.enabled)
+         helios->perf.wait_fast++;
       return VK_SUCCESS;
-   if (wait->timeout == 0)
+   }
+   if (wait->timeout == 0) {
+      if (helios->perf.enabled)
+         helios->perf.wait_timeout++;
       return VK_TIMEOUT;
+   }
 
    /* Slow path (KMD Phase 4e — async submit): a sync may be unsatisfied because
     * its batch is still in flight on the host. Block in the KMD on the batch's
@@ -465,11 +671,20 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
     * it (it completes with an error status on timeout, so the IOCTL returns
     * false). On success the work is done, so advance the waited syncs to their
     * targets and report VK_SUCCESS; otherwise report VK_TIMEOUT honestly. */
-   if (wait_fence_id == 0)
+   if (wait_fence_id == 0) {
+      if (helios->perf.enabled)
+         helios->perf.wait_timeout++;
       return VK_TIMEOUT; /* nothing identifiable to wait on */
+   }
 
-   if (!helios_ioctl_wait_fence(helios, wait_fence_id, wait->timeout))
+   if (helios->perf.enabled)
+      helios->perf.wait_slow++;
+
+   if (!helios_ioctl_wait_fence(helios, wait_fence_id, wait->timeout)) {
+      if (helios->perf.enabled)
+         helios->perf.wait_timeout++;
       return VK_TIMEOUT;
+   }
 
    mtx_lock(&helios->dev_mutex);
    for (uint32_t i = 0; i < wait->sync_count; i++) {
@@ -513,9 +728,14 @@ helios_shmem_create(struct vn_renderer *renderer, size_t size)
    struct vn_renderer_shmem *cached_shmem =
       vn_renderer_shmem_cache_get(&helios->shmem_cache, size);
    if (cached_shmem) {
+      if (helios->perf.enabled)
+         helios->perf.shmem_cache_hits++;
       cached_shmem->refcount = VN_REFCOUNT_INIT(1);
       return cached_shmem;
    }
+
+   if (helios->perf.enabled)
+      helios->perf.shmem_creates++;
 
    /* The command-stream ring + cs/reply pools need genuinely host-coherent,
     * mappable memory the renderer can both read and write (vn_ring head/status).
@@ -561,6 +781,9 @@ helios_bo_create_from_device_memory(
    struct vn_renderer_bo **out_bo)
 {
    struct helios *helios = (struct helios *)renderer;
+
+   if (helios->perf.enabled)
+      helios->perf.bo_creates++;
 
    /* Helios has no external-handle / dma-buf sharing; mappable iff host-visible. */
    uint32_t blob_flags = 0;
@@ -636,6 +859,9 @@ helios_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo, void *pl
    struct helios_bo *bo = (struct helios_bo *)_bo;
    const bool mappable = bo->blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
 
+   if (helios->perf.enabled)
+      helios->perf.bo_maps++;
+
    /* placed_addr (VK_EXT_map_memory_placed) is unsupported by MAP_BLOB; ignore. */
    (void)placed_addr;
 
@@ -668,11 +894,11 @@ helios_bo_flush(struct vn_renderer *renderer,
                 VkDeviceSize offset,
                 VkDeviceSize size)
 {
-   /* HOST3D mappings are host-coherent (ARCH §5): nop. */
    (void)renderer;
-   (void)bo;
-   (void)offset;
-   (void)size;
+   if (!bo->mmap_ptr || !size || !util_has_cache_ops())
+      return;
+
+   util_flush_range((char *)bo->mmap_ptr + offset, size);
 }
 
 static void
@@ -682,9 +908,10 @@ helios_bo_invalidate(struct vn_renderer *renderer,
                      VkDeviceSize size)
 {
    (void)renderer;
-   (void)bo;
-   (void)offset;
-   (void)size;
+   if (!bo->mmap_ptr || !size || !util_has_cache_ops())
+      return;
+
+   util_flush_inval_range((char *)bo->mmap_ptr + offset, size);
 }
 
 /* ── sync ops (synchronous-submit CPU counter; PHASE5_HANDOVER §4) ──────────── */
@@ -811,6 +1038,10 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 {
    struct helios *helios = (struct helios *)renderer;
 
+   helios_perf_dump(helios);
+   if (helios_perf_at_exit_renderer == helios)
+      helios_perf_at_exit_renderer = NULL;
+
    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
 
    if (helios->dev != INVALID_HANDLE_VALUE && helios->dev != NULL) {
@@ -828,6 +1059,14 @@ static VkResult
 helios_init(struct helios *helios)
 {
    mtx_init(&helios->dev_mutex, mtx_plain);
+   helios_perf_init(helios);
+   if (helios->perf.enabled) {
+      helios_perf_at_exit_renderer = helios;
+      if (!helios_perf_at_exit_registered) {
+         atexit(helios_perf_dump_at_exit);
+         helios_perf_at_exit_registered = true;
+      }
+   }
 
    helios->dev = helios_open_device(helios->instance);
    if (helios->dev == INVALID_HANDLE_VALUE)

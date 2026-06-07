@@ -1085,6 +1085,9 @@ vn_QueueSubmit(VkQueue queue,
 
    vn_tls_set_async_pipeline_create();
    vn_wsi_flush(vn_queue_from_handle(queue));
+   VK_FROM_HANDLE(vk_queue, queue_vk, queue);
+   struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
+   vn_device_memory_flush_coherent_cached_mappings(dev);
 
    struct vn_queue_submission submit = {
       .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1243,6 +1246,7 @@ vn_QueueSubmit2(VkQueue _queue,
 
    vn_tls_set_async_pipeline_create();
    vn_wsi_flush(queue);
+   vn_device_memory_flush_coherent_cached_mappings(dev);
 
    if (dev->has_sync2) {
       struct vn_queue_submission submit = {
@@ -1253,8 +1257,15 @@ vn_QueueSubmit2(VkQueue _queue,
          .fence_handle = fence,
       };
       result = vn_queue_submit(&submit);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         if (VN_DEBUG(WSI)) {
+            vn_log(dev->instance,
+                   "%s: submitCount=%u fence=%p via sync2 failed: %s",
+                   __func__, submitCount, (void *)(uintptr_t)fence,
+                   vk_Result_to_str(result));
+         }
          return result;
+      }
    } else {
       VN_TRACE_SCOPE("2->1");
 
@@ -1262,12 +1273,25 @@ vn_QueueSubmit2(VkQueue _queue,
          result = vn_queue_submit_2_to_1(
             dev, _queue, &pSubmits[i],
             i == submitCount - 1 ? fence : VK_NULL_HANDLE);
-         if (result != VK_SUCCESS)
+         if (result != VK_SUCCESS) {
+            if (VN_DEBUG(WSI)) {
+               vn_log(dev->instance,
+                      "%s: submit[%u/%u] fence=%p via 2->1 failed: %s",
+                      __func__, i, submitCount, (void *)(uintptr_t)fence,
+                      vk_Result_to_str(result));
+            }
             return result;
+         }
       }
    }
 
-   return vn_wsi_fence_wait(dev, queue);
+   result = vn_wsi_fence_wait(dev, queue);
+   if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
+      vn_log(dev->instance, "%s: vn_wsi_fence_wait failed: %s", __func__,
+             vk_Result_to_str(result));
+   }
+
+   return result;
 }
 
 static VkResult
@@ -1451,9 +1475,12 @@ vn_QueueBindSparse(VkQueue queue,
                    VkFence fence)
 {
    VN_TRACE_FUNC();
+   VK_FROM_HANDLE(vk_queue, queue_vk, queue);
+   struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
    VkResult result;
 
    vn_wsi_flush(vn_queue_from_handle(queue));
+   vn_device_memory_flush_coherent_cached_mappings(dev);
 
    struct vn_queue_submission submit = {
       .batch_type = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
@@ -1521,33 +1548,6 @@ vn_QueueWaitIdle(VkQueue _queue)
          vn_CreateFence(dev_handle, &create_info, NULL, &queue->wait_fence);
       if (result != VK_SUCCESS)
          return result;
-
-      /* Strip fence feedback from the internal idle-wait fence.
-       *
-       * Fence feedback is a fast path for fences the app POLLS repeatedly: the
-       * status is read from a host-visible slot the GPU fills, avoiding a
-       * round-trip per check. The idle-wait fence is the opposite — it is waited
-       * on synchronously exactly once per idle, never polled. Worse, on the
-       * Helios transport the GPU's write to the slot becomes visible to a guest
-       * poll only with some latency: the guest reads the slot through the hostmem
-       * PCI-BAR window (RESOURCE_MAP_BLOB -> host resource_map_fixed), not as the
-       * directly-mapped coherent guest RAM Linux virtgpu uses, so a synchronous
-       * vkGetFenceStatus can report the fence signaled before the slot write is
-       * visible. Nothing in the slot-poll path forces the host to process this
-       * batch's empty submit either, so vn_WaitForFences spins in vn_relax for
-       * ~16s until a relax-warn round-trip finally nudges the host. Without feedback,
-       * vn_get_fence_status falls to the authoritative synchronous
-       * vkGetFenceStatus, which both forces prompt ring processing and returns
-       * the true status — making vkQueueWaitIdle/vkDeviceWaitIdle fast AND
-       * correct. App fences keep feedback (their real GPU work makes the slot
-       * land promptly). */
-      struct vn_fence *wf = vn_fence_from_handle(queue->wait_fence);
-      if (wf->feedback.slot) {
-         vn_fence_feedback_fini(dev, wf, &dev->base.vk.alloc);
-         wf->feedback.slot = NULL;
-         wf->feedback.commands = NULL;
-         wf->feedback.pollable = false;
-      }
    }
 
    result = vn_queue_submit(&(struct vn_queue_submission){
@@ -1561,6 +1561,8 @@ vn_QueueWaitIdle(VkQueue _queue)
    result =
       vn_WaitForFences(dev_handle, 1, &queue->wait_fence, true, UINT64_MAX);
    vn_ResetFences(dev_handle, 1, &queue->wait_fence);
+   if (result == VK_SUCCESS)
+      vn_device_memory_invalidate_coherent_cached_mappings(dev);
 
    return vn_result(dev->instance, result);
 }
@@ -1805,22 +1807,8 @@ vn_get_fence_status(VkDevice dev_handle,
             }
             if (result == VK_SUCCESS &&
                 vn_feedback_get_status(fence->feedback.slot) != VK_SUCCESS) {
-               /* Helios backend: the "feedback slot is signaled before the fence"
-                * visibility ordering venus assumes does not hold on this transport.
-                * On real virtgpu the guest learns the fence is signaled via the
-                * DEFERRED used-ring interrupt, by which time the GPU's slot write
-                * is already visible; here the relax path instead learns it via this
-                * SYNCHRONOUS vkGetFenceStatus roundtrip, which can outrun the
-                * GPU-write->guest-visible propagation of the slot (observed: the
-                * slot still reads unsignaled right after the roundtrip returns
-                * SUCCESS; it is a host-side propagation lag, not guest CPU cache —
-                * mapping the slot write-combined did not change it). The roundtrip
-                * is authoritative: SUCCESS means the host fence, hence all of the
-                * batch's GPU work including the ffb fill, has completed — so trust
-                * it instead of treating the lagging slot as fatal. The slot stays a
-                * valid fast-path hint whenever it IS already visible (the common
-                * case). Without this, vkQueueWaitIdle's empty fence-feedback submit
-                * races and intermittently returns VK_ERROR_UNKNOWN. */
+               vn_log(dev->instance, "ERROR: ffb must be signaled now");
+               result = VK_ERROR_UNKNOWN;
             }
          }
       } else {
@@ -1847,6 +1835,8 @@ vn_GetFenceStatus(VkDevice device, VkFence fence)
 {
    struct vn_device *dev = vn_device_from_handle(device);
    VkResult result = vn_get_fence_status(device, fence, NULL);
+   if (result == VK_SUCCESS)
+      vn_device_memory_invalidate_coherent_cached_mappings(dev);
    return vn_result(dev->instance, result);
 }
 
@@ -1944,6 +1934,9 @@ vn_WaitForFences(VkDevice device,
       }
       vn_relax_fini(&relax_state);
    }
+
+   if (result == VK_SUCCESS)
+      vn_device_memory_invalidate_coherent_cached_mappings(dev);
 
    return vn_result(dev->instance, result);
 }
@@ -2517,6 +2510,9 @@ vn_WaitSemaphores(VkDevice device,
       }
       vn_relax_fini(&relax_state);
    }
+
+   if (result == VK_SUCCESS)
+      vn_device_memory_invalidate_coherent_cached_mappings(dev);
 
    return vn_result(dev->instance, result);
 }

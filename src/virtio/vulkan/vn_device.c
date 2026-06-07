@@ -552,6 +552,7 @@ vn_device_init(struct vn_device *dev,
 
    simple_mtx_init(&dev->mutex, mtx_plain);
    list_inithead(&dev->chains);
+   list_inithead(&dev->coherent_cached_memory);
 
    return VK_SUCCESS;
 
@@ -640,7 +641,6 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
       return;
 
    assert(list_is_empty(&dev->chains));
-   simple_mtx_destroy(&dev->mutex);
 
    vn_image_reqs_cache_fini(dev);
    vn_buffer_reqs_cache_fini(dev);
@@ -668,6 +668,8 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    vk_free(alloc, dev->queues);
 
    vn_device_base_fini(&dev->base);
+   vn_device_memory_cleanup_coherent_cached_mappings(dev);
+   simple_mtx_destroy(&dev->mutex);
    vk_free(alloc, dev);
 }
 

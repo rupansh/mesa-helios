@@ -248,6 +248,7 @@ struct wsi_device {
    WSI_CB(QueueSubmit2);
    WSI_CB(SetDebugUtilsObjectNameEXT);
    WSI_CB(WaitForFences);
+   WSI_CB(InvalidateMappedMemoryRanges);
    WSI_CB(MapMemory);
    WSI_CB(UnmapMemory);
    WSI_CB(WaitSemaphores);

@@ -49,6 +49,7 @@ struct vn_device {
 
    simple_mtx_t mutex;
    struct list_head chains;
+   struct list_head coherent_cached_memory;
 };
 VK_DEFINE_HANDLE_CASTS(vn_device,
                        base.vk.base,

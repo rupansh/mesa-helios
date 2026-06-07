@@ -418,8 +418,13 @@ vn_wsi_fence_wait(struct vn_device *dev, struct vn_queue *queue)
 
    VkQueue queue_handle = vn_queue_to_handle(queue);
    result = vn_QueueSubmit(queue_handle, 0, NULL, queue->async_present.fence);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      if (VN_DEBUG(WSI)) {
+         vn_log(dev->instance, "%s: QueueSubmit(empty, fence) failed: %s",
+                __func__, vk_Result_to_str(result));
+      }
       return result;
+   }
 
    /* Common wsi does queue submit for each chain, so here we can only safely
     * unlock the queue mutex if presenting to a single chain.
@@ -432,6 +437,10 @@ vn_wsi_fence_wait(struct vn_device *dev, struct vn_queue *queue)
 
    result = vn_WaitForFences(dev_handle, 1, &queue->async_present.fence, true,
                              UINT64_MAX);
+   if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
+      vn_log(dev->instance, "%s: WaitForFences failed: %s", __func__,
+             vk_Result_to_str(result));
+   }
 
    vn_wsi_chains_lock(dev, queue->async_present.info, /*all=*/false);
    if (can_unlock_queue)
@@ -440,7 +449,13 @@ vn_wsi_fence_wait(struct vn_device *dev, struct vn_queue *queue)
    if (result != VK_SUCCESS)
       return result;
 
-   return vn_ResetFences(dev_handle, 1, &queue->async_present.fence);
+   result = vn_ResetFences(dev_handle, 1, &queue->async_present.fence);
+   if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
+      vn_log(dev->instance, "%s: ResetFences failed: %s", __func__,
+             vk_Result_to_str(result));
+   }
+
+   return result;
 }
 
 void
@@ -744,6 +759,10 @@ vn_wsi_present_thread(void *data)
       queue->async_present.result =
          wsi_common_queue_present(queue_vk->base.device->physical->wsi_device,
                                   queue_vk, queue->async_present.info);
+      if (VN_DEBUG(WSI)) {
+         vn_log(dev->instance, "%s: wsi_common_queue_present -> %s", __func__,
+                vk_Result_to_str(queue->async_present.result));
+      }
 
       vn_wsi_chains_unlock(dev, queue->async_present.info, /*all=*/true);
       simple_mtx_unlock(&queue->async_present.queue_mutex);
@@ -777,6 +796,11 @@ vn_wsi_present_async(struct vn_device *dev,
    assert(!queue->async_present.info);
    assert(!queue->async_present.pending);
    result = queue->async_present.result;
+   if (VN_DEBUG(WSI) && result != VK_SUCCESS &&
+       result != VK_SUBOPTIMAL_KHR) {
+      vn_log(dev->instance, "%s: returning previous async result %s",
+             __func__, vk_Result_to_str(result));
+   }
    if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
       queue->async_present.info = vn_wsi_clone_present_info(dev, pi);
       queue->async_present.pending = true;
@@ -877,6 +901,12 @@ vn_AcquireNextImage2KHR(VkDevice device,
    simple_mtx_lock(&chain->acquire_mutex);
    result = wsi_common_acquire_next_image2(&dev->physical_device->wsi_device,
                                            device, pAcquireInfo, pImageIndex);
+   if (VN_DEBUG(WSI)) {
+      const int idx = result >= VK_SUCCESS ? *pImageIndex : -1;
+      vn_log(dev->instance, "%s: common acquire swapchain=%p idx=%d -> %s",
+             __func__, VN_WSI_PTR(pAcquireInfo->swapchain), idx,
+             vk_Result_to_str(result));
+   }
    simple_mtx_unlock(&chain->acquire_mutex);
 
    if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
@@ -949,6 +979,10 @@ vn_AcquireNextImage2KHR(VkDevice device,
       if (ret == VK_SUCCESS) {
          sem_fd = -1;
       } else {
+         if (VN_DEBUG(WSI)) {
+            vn_log(dev->instance, "%s: ImportSemaphoreFdKHR(fd=%d) failed: %s",
+                   __func__, sem_fd, vk_Result_to_str(ret));
+         }
          result = ret;
          goto out;
       }
@@ -966,6 +1000,10 @@ vn_AcquireNextImage2KHR(VkDevice device,
       if (ret == VK_SUCCESS) {
          fence_fd = -1;
       } else {
+         if (VN_DEBUG(WSI)) {
+            vn_log(dev->instance, "%s: ImportFenceFdKHR(fd=%d) failed: %s",
+                   __func__, fence_fd, vk_Result_to_str(ret));
+         }
          result = ret;
          goto out;
       }

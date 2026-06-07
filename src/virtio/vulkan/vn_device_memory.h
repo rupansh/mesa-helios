@@ -48,6 +48,9 @@ struct vn_device_memory {
    uint64_t bo_roundtrip_seqno;
 
    VkDeviceSize map_end;
+   VkDeviceSize map_start;
+   bool coherent_cached_mapped;
+   struct list_head coherent_cached_link;
 
    /* only valid when wsi platform is used */
    struct vn_image *dedicated_img;
@@ -67,5 +70,14 @@ VkResult
 vn_get_memory_dma_buf_properties(struct vn_device *dev,
                                  int fd,
                                  uint32_t *out_mem_type_bits);
+
+void
+vn_device_memory_flush_coherent_cached_mappings(struct vn_device *dev);
+
+void
+vn_device_memory_invalidate_coherent_cached_mappings(struct vn_device *dev);
+
+void
+vn_device_memory_cleanup_coherent_cached_mappings(struct vn_device *dev);
 
 #endif /* VN_DEVICE_MEMORY_H */
