@@ -19,12 +19,10 @@
  *
  * KMD semantics that shape this backend (PHASE5_HANDOVER §2; KMD Phase 4e):
  *   - SUBMIT_VENUS is NON-BLOCKING: the KMD queues the submission and returns
- *     immediately (multiple submits in flight at once). ops.submit therefore sets
- *     each batch sync to its target optimistically (the host will retire it) and
- *     records the batch fence id; ops.wait falls back to a real WAIT_FENCE on that
- *     id when the optimistic fast path is unsatisfied. This breaks the
- *     synchronous-submit deadlock class (a fence whose completion depends on a
- *     later submit no longer stalls the single channel).
+ *     immediately (multiple submits in flight at once). ops.submit records each
+ *     sync target as pending on the batch fence. ops.wait advances sync values
+ *     only after WAIT_FENCE confirms retirement, preserving present ordering
+ *     without returning to a synchronous submit channel.
  *   - SUBMIT_VENUS is METHOD_IN_DIRECT: the fixed header rides lpInBuffer
  *     (buffered) and the variable Venus cs rides lpOutBuffer (read-locked MDL) —
  *     see kmd/src/ioctl.rs::handle_submit_venus.
@@ -156,16 +154,22 @@ struct helios_bo {
    uint32_t blob_flags;
 };
 
-struct helios_sync {
-   struct vn_renderer_sync base;
-   /* A sync is a CPU counter. ops.submit sets `val` to the requested value
-    * optimistically when the batch is submitted (the host WILL complete it — all
-    * submits are in flight, so ordering-dependent fences can resolve), which keeps
-    * the common vkWaitForFences fast path working. `fence_id` records the virtio
-    * fence id of the batch that last updated this sync, so ops.wait can fall back
-    * to a real KMD WAIT_FENCE on that id if the fast path is ever unsatisfied. */
+#define HELIOS_SYNC_PENDING_MAX 256
+
+struct helios_sync_pending {
    uint64_t val;
    uint64_t fence_id;
+   bool complete;
+};
+
+struct helios_sync {
+   struct vn_renderer_sync base;
+   /* Last value known to have retired on the host. Pending target values are kept
+    * ordered so a later out-of-order fence cannot make an older frame appear
+    * complete. */
+   uint64_t val;
+   uint32_t pending_count;
+   struct helios_sync_pending pending[HELIOS_SYNC_PENDING_MAX];
 };
 
 enum helios_ioctl_stat {
@@ -422,6 +426,68 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
 }
 
 static void
+helios_sync_retire_locked(struct helios_sync *sync)
+{
+   uint32_t n = 0;
+   while (n < sync->pending_count && sync->pending[n].complete)
+      n++;
+
+   if (!n)
+      return;
+
+   const uint64_t val = sync->pending[n - 1].val;
+   if (sync->val < val)
+      sync->val = val;
+
+   sync->pending_count -= n;
+   if (sync->pending_count) {
+      memmove(sync->pending, sync->pending + n,
+              sync->pending_count * sizeof(sync->pending[0]));
+   }
+}
+
+static bool
+helios_sync_append_locked(struct helios_sync *sync, uint64_t val, uint64_t fence_id)
+{
+   if (!fence_id) {
+      if (sync->val < val)
+         sync->val = val;
+      sync->pending_count = 0;
+      return true;
+   }
+
+   if (sync->pending_count >= HELIOS_SYNC_PENDING_MAX)
+      return false;
+
+   sync->pending[sync->pending_count++] = (struct helios_sync_pending) {
+      .val = val,
+      .fence_id = fence_id,
+      .complete = false,
+   };
+   return true;
+}
+
+static void
+helios_sync_mark_fence_locked(struct helios_sync *sync, uint64_t fence_id)
+{
+   for (uint32_t i = 0; i < sync->pending_count; i++) {
+      if (sync->pending[i].fence_id == fence_id)
+         sync->pending[i].complete = true;
+   }
+   helios_sync_retire_locked(sync);
+}
+
+static bool
+helios_wait_fence_list_contains(const uint64_t *fences, uint32_t count, uint64_t fence_id)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      if (fences[i] == fence_id)
+         return true;
+   }
+   return false;
+}
+
+static void
 helios_perf_init(struct helios *helios)
 {
    char enabled[8];
@@ -609,17 +675,15 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
          }
       }
 
-      /* Submit is non-blocking now (KMD Phase 4e). Set each sync to its target
-       * optimistically (the host WILL retire the batch — all submits are in
-       * flight, so ordering-dependent fences can resolve) so the common
-       * vkWaitForFences fast path stays satisfied, and record the batch fence id
-       * so ops.wait can fall back to a real WAIT_FENCE if a sync is ever found
-       * unsatisfied. */
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
-         sync->val = batch->sync_values[j];
-         sync->fence_id = fence_id;
+         if (!helios_sync_append_locked(sync, batch->sync_values[j], fence_id)) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
       }
+      if (result != VK_SUCCESS)
+         break;
    }
    mtx_unlock(&helios->dev_mutex);
 
@@ -630,22 +694,18 @@ static VkResult
 helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 {
    struct helios *helios = (struct helios *)renderer;
+   uint64_t *wait_fences = NULL;
+   uint32_t wait_fence_count = 0;
+   VkResult result = VK_SUCCESS;
 
    if (helios->perf.enabled)
       helios->perf.wait_calls++;
 
-   /* Fast path: optimistic sync->val (set at submit) usually already satisfies. */
    mtx_lock(&helios->dev_mutex);
    bool satisfied = !wait->wait_any; /* wait_all starts true, wait_any starts false */
-   /* For the slow path: the largest fence id among the not-yet-satisfied syncs.
-    * Fence ids are monotonic, so waiting on the max covers the earlier ones on
-    * the same in-order ring (and the KMD checks each id out-of-order-safely). */
-   uint64_t wait_fence_id = 0;
    for (uint32_t i = 0; i < wait->sync_count; i++) {
       const struct helios_sync *sync = (const struct helios_sync *)wait->syncs[i];
       const bool reached = sync->val >= wait->sync_values[i];
-      if (!reached && sync->fence_id > wait_fence_id)
-         wait_fence_id = sync->fence_id;
       if (wait->wait_any) {
          satisfied = satisfied || reached;
       } else {
@@ -665,36 +725,63 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
       return VK_TIMEOUT;
    }
 
-   /* Slow path (KMD Phase 4e — async submit): a sync may be unsatisfied because
-    * its batch is still in flight on the host. Block in the KMD on the batch's
-    * fence id; WAIT_FENCE returns success only when the host has actually retired
-    * it (it completes with an error status on timeout, so the IOCTL returns
-    * false). On success the work is done, so advance the waited syncs to their
-    * targets and report VK_SUCCESS; otherwise report VK_TIMEOUT honestly. */
-   if (wait_fence_id == 0) {
+   const uint32_t wait_fence_capacity =
+      wait->sync_count * HELIOS_SYNC_PENDING_MAX;
+   wait_fences = calloc(wait_fence_capacity, sizeof(*wait_fences));
+   if (!wait_fences)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   mtx_lock(&helios->dev_mutex);
+   for (uint32_t i = 0; i < wait->sync_count; i++) {
+      const struct helios_sync *sync = (const struct helios_sync *)wait->syncs[i];
+      if (sync->val >= wait->sync_values[i])
+         continue;
+
+      for (uint32_t j = 0; j < sync->pending_count; j++) {
+         const struct helios_sync_pending *pending = &sync->pending[j];
+         if (pending->val > wait->sync_values[i])
+            break;
+         if (!pending->complete &&
+             wait_fence_count < wait_fence_capacity &&
+             !helios_wait_fence_list_contains(wait_fences, wait_fence_count,
+                                              pending->fence_id))
+            wait_fences[wait_fence_count++] = pending->fence_id;
+      }
+   }
+   mtx_unlock(&helios->dev_mutex);
+
+   if (!wait_fence_count) {
       if (helios->perf.enabled)
          helios->perf.wait_timeout++;
+      free(wait_fences);
       return VK_TIMEOUT; /* nothing identifiable to wait on */
    }
 
    if (helios->perf.enabled)
       helios->perf.wait_slow++;
 
-   if (!helios_ioctl_wait_fence(helios, wait_fence_id, wait->timeout)) {
-      if (helios->perf.enabled)
-         helios->perf.wait_timeout++;
-      return VK_TIMEOUT;
+   for (uint32_t i = 0; i < wait_fence_count; i++) {
+      if (!helios_ioctl_wait_fence(helios, wait_fences[i], wait->timeout)) {
+         result = VK_TIMEOUT;
+         break;
+      }
    }
 
-   mtx_lock(&helios->dev_mutex);
-   for (uint32_t i = 0; i < wait->sync_count; i++) {
-      struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
-      if (sync->val < wait->sync_values[i] && sync->fence_id &&
-          sync->fence_id <= wait_fence_id)
-         sync->val = wait->sync_values[i];
+   if (result == VK_SUCCESS) {
+      mtx_lock(&helios->dev_mutex);
+      for (uint32_t i = 0; i < wait->sync_count; i++) {
+         struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+         for (uint32_t j = 0; j < wait_fence_count; j++) {
+            helios_sync_mark_fence_locked(sync, wait_fences[j]);
+         }
+      }
+      mtx_unlock(&helios->dev_mutex);
+   } else if (helios->perf.enabled) {
+      helios->perf.wait_timeout++;
    }
-   mtx_unlock(&helios->dev_mutex);
-   return VK_SUCCESS;
+
+   free(wait_fences);
+   return result;
 }
 
 /* ── shmem ops ─────────────────────────────────────────────────────────────── */
@@ -810,8 +897,7 @@ helios_bo_create_from_device_memory(
        * batch's vkAllocateMemory has actually completed on the host. */
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
-         sync->val = batch->sync_values[j];
-         sync->fence_id = fence_id;
+         helios_sync_append_locked(sync, batch->sync_values[j], 0);
       }
    }
 
@@ -952,7 +1038,7 @@ helios_sync_reset(struct vn_renderer *renderer,
 
    mtx_lock(&helios->dev_mutex);
    sync->val = initial_val;
-   sync->fence_id = 0; /* CPU-set value; no host fence pending */
+   sync->pending_count = 0;
    mtx_unlock(&helios->dev_mutex);
    return VK_SUCCESS;
 }
@@ -964,6 +1050,27 @@ helios_sync_read(struct vn_renderer *renderer,
 {
    struct helios *helios = (struct helios *)renderer;
    struct helios_sync *sync = (struct helios_sync *)_sync;
+   uint64_t fences[HELIOS_SYNC_PENDING_MAX];
+   uint32_t fence_count = 0;
+
+   mtx_lock(&helios->dev_mutex);
+   for (uint32_t i = 0; i < sync->pending_count; i++) {
+      const uint64_t fence_id = sync->pending[i].fence_id;
+      if (!sync->pending[i].complete &&
+          !helios_wait_fence_list_contains(fences, fence_count, fence_id))
+         fences[fence_count++] = fence_id;
+   }
+   mtx_unlock(&helios->dev_mutex);
+
+   for (uint32_t i = 0; i < fence_count; i++) {
+      if (helios_ioctl_wait_fence(helios, fences[i], 0)) {
+         mtx_lock(&helios->dev_mutex);
+         helios_sync_mark_fence_locked(sync, fences[i]);
+         mtx_unlock(&helios->dev_mutex);
+      } else {
+         break;
+      }
+   }
 
    mtx_lock(&helios->dev_mutex);
    *val = sync->val;
@@ -981,7 +1088,7 @@ helios_sync_write(struct vn_renderer *renderer,
 
    mtx_lock(&helios->dev_mutex);
    sync->val = val;
-   sync->fence_id = 0; /* CPU-set value; no host fence pending */
+   sync->pending_count = 0;
    mtx_unlock(&helios->dev_mutex);
    return VK_SUCCESS;
 }
