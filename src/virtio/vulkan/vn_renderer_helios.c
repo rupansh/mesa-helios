@@ -822,15 +822,14 @@ helios_bo_create_from_device_memory(
    if (!res_id)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   /* ── Phase-7 go/no-go gate hook (DISPLAY.md §8) — THROWAWAY ─────────────────
-    * Surface "<res_id> <size>" for the gate test (helios_vk_present), which needs
-    * the virtio-gpu resource_id backing its exportable image's VkDeviceMemory to
-    * feed IOCTL_HELIOS_PRESENT_BLOB. A no-op unless HELIOS_GATE_RESID_FILE is set;
-    * remove once the DOD's real present path lands. (size == the app's
-    * VkMemoryAllocateInfo.allocationSize, so the test disambiguates by size.) */
+   /* Surface "<res_id> <size>" for the IDD fast path and present gate tests.
+    * Use the Win32 environment API instead of CRT getenv(): the ICD may be linked
+    * with a different/static CRT than its caller, but the process environment is
+    * shared by the OS. */
    {
-      const char *gate_file = getenv("HELIOS_GATE_RESID_FILE");
-      if (gate_file) {
+      char gate_file[MAX_PATH];
+      if (GetEnvironmentVariableA("HELIOS_GATE_RESID_FILE", gate_file,
+                                  sizeof(gate_file))) {
          FILE *f = fopen(gate_file, "a");
          if (f) {
             fprintf(f, "%u %llu\n", res_id, (unsigned long long)size);
