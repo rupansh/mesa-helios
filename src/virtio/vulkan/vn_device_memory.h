@@ -50,6 +50,7 @@ struct vn_device_memory {
    VkDeviceSize map_end;
    VkDeviceSize map_start;
    bool coherent_cached_mapped;
+   bool wsi_buffer_blit_dst;
    struct list_head coherent_cached_link;
 
    /* only valid when wsi platform is used */

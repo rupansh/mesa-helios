@@ -26,6 +26,7 @@ struct vn_renderer_bo {
    /* for internal use only */
    size_t mmap_size;
    void *mmap_ptr;
+   bool prefer_cached_map;
 };
 
 /*

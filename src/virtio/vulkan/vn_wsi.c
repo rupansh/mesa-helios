@@ -278,6 +278,7 @@ vn_wsi_memory_info_init(struct vn_device_memory *mem,
    if (wsi_info && dedicated_info->buffer != VK_NULL_HANDLE) {
       struct vn_buffer *buf = vn_buffer_from_handle(dedicated_info->buffer);
       buf->wsi.mem = mem;
+      mem->wsi_buffer_blit_dst = true;
    }
 
    /* wsi_memory_allocate_info is not chained for prime blit src */

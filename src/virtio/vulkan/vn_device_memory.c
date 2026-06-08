@@ -26,6 +26,9 @@ static bool
 vn_device_memory_is_coherent_cached(struct vn_device *dev,
                                     struct vn_device_memory *mem)
 {
+   if (!mem->base_bo || !mem->base_bo->prefer_cached_map)
+      return false;
+
    const struct vk_device_memory *mem_vk = &mem->base.vk;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
                                       .memoryTypes[mem_vk->memory_type_index];
@@ -87,6 +90,12 @@ vn_device_memory_cache_op_coherent_cached_mappings(struct vn_device *dev,
       if (invalidate) {
          vn_renderer_bo_invalidate(dev->renderer, mem->base_bo,
                                    mem->map_start, size);
+      } else if (mem->wsi_buffer_blit_dst) {
+         /* The CPU only reads software WSI blit buffers after the GPU writes
+          * them.  Flushing them before submit is unnecessary and can dominate
+          * present time when the buffer is host-cached.
+          */
+         continue;
       } else {
          vn_renderer_bo_flush(dev->renderer, mem->base_bo, mem->map_start,
                               size);
@@ -574,6 +583,8 @@ vn_MapMemory2(VkDevice device,
          return vn_error(dev->instance, result);
    }
 
+   mem->base_bo->prefer_cached_map = mem->wsi_buffer_blit_dst;
+
    if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
       const VkMemoryMapPlacedInfoEXT *placed_info = vk_find_struct_const(
          pMemoryMapInfo->pNext, MEMORY_MAP_PLACED_INFO_EXT);
@@ -614,7 +625,8 @@ vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
 
    if (mem) {
       if (mem->coherent_cached_mapped && mem->base_bo &&
-          mem->base_bo->mmap_ptr && mem->map_end > mem->map_start) {
+          mem->base_bo->mmap_ptr && mem->map_end > mem->map_start &&
+          !mem->wsi_buffer_blit_dst) {
          vn_renderer_bo_flush(dev->renderer, mem->base_bo, mem->map_start,
                               mem->map_end - mem->map_start);
       }

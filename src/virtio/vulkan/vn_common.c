@@ -219,9 +219,9 @@ vn_relax_get_profile(enum vn_relax_reason reason)
        */
       return (struct vn_relax_profile){
          .base_sleep_us = 160,
-         .busy_wait_order = 4,
-         .warn_order = 10,
-         .abort_order = 14,
+         .busy_wait_order = 12,
+         .warn_order = 14,
+         .abort_order = 18,
       };
    }
 

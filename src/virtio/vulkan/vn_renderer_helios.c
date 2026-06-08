@@ -78,6 +78,10 @@ static const GUID GUID_DEVINTERFACE_HELIOS = {
 #define HELIOS_ESCAPE_MAP_BLOB     0x0005u
 #define HELIOS_ESCAPE_WAIT_FENCE   0x0006u
 
+#define HELIOS_MAP_CACHE_CACHED    0x00000001u
+#define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
+#define HELIOS_MAP_CACHE_WC        0x00000003u
+
 /* virtio-gpu constants the backend needs (protocol/src/virtio_gpu.rs) */
 #define VIRTIO_GPU_CAPSET_VENUS          4u
 #define VIRTIO_GPU_BLOB_MEM_HOST3D       2u
@@ -125,7 +129,7 @@ struct helios_escape_map_blob {
    struct helios_escape_header hdr;
    uint64_t out_user_va; /* out: user-mode virtual address of the mapping */
    uint32_t resource_id; /* in:  blob to map */
-   uint32_t padding;
+   uint32_t map_cache;   /* in/out: requested/effective VIRTIO_GPU_MAP_CACHE_* */
 };
 
 struct helios_escape_wait_fence {
@@ -152,9 +156,12 @@ struct helios_shmem {
 struct helios_bo {
    struct vn_renderer_bo base;
    uint32_t blob_flags;
+   uint32_t map_cache;
+   VkMemoryPropertyFlags memory_flags;
 };
 
 #define HELIOS_SYNC_PENDING_MAX 256
+#define HELIOS_WAIT_FENCE_STACK_MAX 256
 
 struct helios_sync_pending {
    uint64_t val;
@@ -209,6 +216,10 @@ struct helios_perf_stats {
    uint64_t shmem_creates;
    uint64_t bo_creates;
    uint64_t bo_maps;
+   uint64_t bo_map_cached;
+   uint64_t bo_map_wc;
+   uint64_t bo_map_uncached;
+   uint64_t bo_map_unknown;
 };
 
 struct helios {
@@ -401,17 +412,23 @@ helios_ioctl_alloc_blob(struct helios *helios,
 /* MAP_BLOB. Caller MUST hold dev_mutex (the KMD requires serialized maps from
  * the opening process). Returns the user VA, or 0 on failure. */
 static uint64_t
-helios_ioctl_map_blob(struct helios *helios, uint32_t resource_id)
+helios_ioctl_map_blob(struct helios *helios,
+                      uint32_t resource_id,
+                      uint32_t requested_map_cache,
+                      uint32_t *out_map_cache)
 {
    struct helios_escape_map_blob req = { 0 };
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_MAP_BLOB, sizeof(req));
    req.resource_id = resource_id;
+   req.map_cache = requested_map_cache;
 
    struct helios_escape_map_blob out = req;
    if (!helios_ioctl(helios, IOCTL_HELIOS_MAP_BLOB, &req, sizeof(req), &out,
                      sizeof(out)))
       return 0;
 
+   if (out_map_cache)
+      *out_map_cache = out.map_cache;
    return out.out_user_va;
 }
 
@@ -546,6 +563,11 @@ helios_perf_write(struct helios *helios, bool final)
            (unsigned long long)helios->perf.shmem_cache_hits,
            (unsigned long long)helios->perf.bo_creates,
            (unsigned long long)helios->perf.bo_maps);
+   fprintf(f, "bo_map_cache cached=%llu wc=%llu uncached=%llu unknown=%llu\n",
+           (unsigned long long)helios->perf.bo_map_cached,
+           (unsigned long long)helios->perf.bo_map_wc,
+           (unsigned long long)helios->perf.bo_map_uncached,
+           (unsigned long long)helios->perf.bo_map_unknown);
 
    for (uint32_t i = 0; i < HELIOS_STAT_COUNT; i++) {
       const struct helios_perf_ioctl *s = &helios->perf.ioctl[i];
@@ -694,7 +716,8 @@ static VkResult
 helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 {
    struct helios *helios = (struct helios *)renderer;
-   uint64_t *wait_fences = NULL;
+   uint64_t stack_wait_fences[HELIOS_WAIT_FENCE_STACK_MAX];
+   uint64_t *wait_fences = stack_wait_fences;
    uint32_t wait_fence_count = 0;
    VkResult result = VK_SUCCESS;
 
@@ -727,9 +750,11 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 
    const uint32_t wait_fence_capacity =
       wait->sync_count * HELIOS_SYNC_PENDING_MAX;
-   wait_fences = calloc(wait_fence_capacity, sizeof(*wait_fences));
-   if (!wait_fences)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (wait_fence_capacity > HELIOS_WAIT_FENCE_STACK_MAX) {
+      wait_fences = calloc(wait_fence_capacity, sizeof(*wait_fences));
+      if (!wait_fences)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    mtx_lock(&helios->dev_mutex);
    for (uint32_t i = 0; i < wait->sync_count; i++) {
@@ -753,7 +778,8 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    if (!wait_fence_count) {
       if (helios->perf.enabled)
          helios->perf.wait_timeout++;
-      free(wait_fences);
+      if (wait_fences != stack_wait_fences)
+         free(wait_fences);
       return VK_TIMEOUT; /* nothing identifiable to wait on */
    }
 
@@ -780,7 +806,8 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
       helios->perf.wait_timeout++;
    }
 
-   free(wait_fences);
+   if (wait_fences != stack_wait_fences)
+      free(wait_fences);
    return result;
 }
 
@@ -834,7 +861,7 @@ helios_shmem_create(struct vn_renderer *renderer, size_t size)
                               VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, 0, size);
    uint64_t user_va = 0;
    if (res_id)
-      user_va = helios_ioctl_map_blob(helios, res_id);
+      user_va = helios_ioctl_map_blob(helios, res_id, 0, NULL);
    mtx_unlock(&helios->dev_mutex);
 
    if (!res_id || !user_va) {
@@ -932,6 +959,7 @@ helios_bo_create_from_device_memory(
    bo->base.res_id = res_id;
    bo->base.mmap_size = (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) ? size : 0;
    bo->blob_flags = blob_flags;
+   bo->memory_flags = flags;
 
    *out_bo = &bo->base;
    return VK_SUCCESS;
@@ -954,9 +982,32 @@ helios_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo, void *pl
     * serialize anyway (MAP_BLOB must be serialized in the KMD). */
    mtx_lock(&helios->dev_mutex);
    if (!bo->base.mmap_ptr && mappable) {
-      const uint64_t va = helios_ioctl_map_blob(helios, bo->base.res_id);
-      if (va)
+      uint32_t map_cache = 0;
+      const uint32_t requested_map_cache = bo->base.prefer_cached_map ?
+         HELIOS_MAP_CACHE_CACHED : HELIOS_MAP_CACHE_WC;
+      const uint64_t va =
+         helios_ioctl_map_blob(helios, bo->base.res_id, requested_map_cache,
+                               &map_cache);
+      if (va) {
          bo->base.mmap_ptr = (void *)(uintptr_t)va;
+         bo->map_cache = map_cache;
+         if (helios->perf.enabled) {
+            switch (map_cache) {
+            case HELIOS_MAP_CACHE_CACHED:
+               helios->perf.bo_map_cached++;
+               break;
+            case HELIOS_MAP_CACHE_WC:
+               helios->perf.bo_map_wc++;
+               break;
+            case HELIOS_MAP_CACHE_UNCACHED:
+               helios->perf.bo_map_uncached++;
+               break;
+            default:
+               helios->perf.bo_map_unknown++;
+               break;
+            }
+         }
+      }
    }
    mtx_unlock(&helios->dev_mutex);
 

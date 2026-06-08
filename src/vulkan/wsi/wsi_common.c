@@ -41,6 +41,7 @@
 #include "vk_util.h"
 
 #include <assert.h>
+#include <inttypes.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -50,6 +51,107 @@
 #endif
 
 uint64_t WSI_DEBUG;
+
+struct helios_wsi_perf {
+   bool initialized;
+   bool enabled;
+   uint64_t interval;
+   uint64_t frames;
+   uint64_t submit_calls;
+   uint64_t submit_ns;
+   uint64_t wait_ns;
+   uint64_t invalidate_ns;
+   uint64_t queue_present_ns;
+};
+
+static struct helios_wsi_perf helios_wsi_perf;
+
+static void
+helios_wsi_perf_init(void)
+{
+   if (helios_wsi_perf.initialized)
+      return;
+
+   helios_wsi_perf.initialized = true;
+   helios_wsi_perf.interval = 300;
+
+   const char *enabled = os_get_option("HELIOS_WSI_PERF");
+   helios_wsi_perf.enabled = enabled && enabled[0] && enabled[0] != '0';
+
+   const char *interval = os_get_option("HELIOS_WSI_PERF_INTERVAL");
+   if (interval) {
+      char *end = NULL;
+      unsigned long long parsed = strtoull(interval, &end, 10);
+      if (end && *end == '\0' && parsed > 0)
+         helios_wsi_perf.interval = parsed;
+   }
+}
+
+static void
+helios_wsi_perf_write(void)
+{
+   FILE *f = stderr;
+   const char *path = os_get_option("HELIOS_WSI_PERF_FILE");
+   if (path && path[0]) {
+      FILE *opened = fopen(path, "a");
+      if (opened)
+         f = opened;
+   }
+
+   fprintf(f,
+           "Helios WSI common frames=%" PRIu64
+           " submit_calls=%" PRIu64
+           " submit_ms=%.3f submit_avg_us=%.3f"
+           " wait_ms=%.3f wait_avg_us=%.3f"
+           " invalidate_ms=%.3f invalidate_avg_us=%.3f"
+           " queue_present_ms=%.3f queue_present_avg_us=%.3f\n",
+           helios_wsi_perf.frames,
+           helios_wsi_perf.submit_calls,
+           (double)helios_wsi_perf.submit_ns / 1000000.0,
+           helios_wsi_perf.submit_calls ?
+              (double)helios_wsi_perf.submit_ns / 1000.0 /
+              (double)helios_wsi_perf.submit_calls : 0.0,
+           (double)helios_wsi_perf.wait_ns / 1000000.0,
+           helios_wsi_perf.frames ?
+              (double)helios_wsi_perf.wait_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
+           (double)helios_wsi_perf.invalidate_ns / 1000000.0,
+           helios_wsi_perf.frames ?
+              (double)helios_wsi_perf.invalidate_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
+           (double)helios_wsi_perf.queue_present_ns / 1000000.0,
+           helios_wsi_perf.frames ?
+              (double)helios_wsi_perf.queue_present_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0);
+
+   if (f != stderr)
+      fclose(f);
+}
+
+static void
+helios_wsi_perf_note_submit(uint64_t submit_ns)
+{
+   helios_wsi_perf_init();
+   if (!helios_wsi_perf.enabled)
+      return;
+
+   helios_wsi_perf.submit_calls++;
+   helios_wsi_perf.submit_ns += submit_ns;
+}
+
+static void
+helios_wsi_perf_note_frame(uint64_t wait_ns, uint64_t invalidate_ns,
+                           uint64_t queue_present_ns)
+{
+   helios_wsi_perf_init();
+   if (!helios_wsi_perf.enabled)
+      return;
+
+   helios_wsi_perf.frames++;
+   helios_wsi_perf.wait_ns += wait_ns;
+   helios_wsi_perf.invalidate_ns += invalidate_ns;
+   helios_wsi_perf.queue_present_ns += queue_present_ns;
+
+   if (helios_wsi_perf.frames % helios_wsi_perf.interval == 0)
+      helios_wsi_perf_write();
+}
 
 static const struct debug_control debug_control[] = {
    { "buffer",       WSI_DEBUG_BUFFER },
@@ -2041,9 +2143,11 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
                                                fence_count, fences);
    }
 
+   uint64_t helios_submit_start_ns = os_time_get_nano();
    VkResult result = wsi->QueueSubmit2(vk_queue_to_handle(queue), 1, info,
                                        fence_count > 0 ? fences[0]
                                                        : VK_NULL_HANDLE);
+   helios_wsi_perf_note_submit(os_time_get_nano() - helios_submit_start_ns);
    if (result != VK_SUCCESS) {
       mesa_logd("wsi: QueueSubmit2 failed: %s, cmd_buffers=%u, wait_sems=%u, signal_sems=%u, fences=%u",
                 vk_Result_to_str(result), info->commandBufferInfoCount,
@@ -2056,8 +2160,10 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
       const VkSubmitInfo2 submit_info = {
          .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
       };
+      helios_submit_start_ns = os_time_get_nano();
       result = wsi->QueueSubmit2(vk_queue_to_handle(queue),
                                  1, &submit_info, fences[i]);
+      helios_wsi_perf_note_submit(os_time_get_nano() - helios_submit_start_ns);
       if (result != VK_SUCCESS) {
          mesa_logd("wsi: QueueSubmit2 empty fence[%u/%u] failed: %s",
                    i, fence_count, vk_Result_to_str(result));
@@ -2511,11 +2617,17 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
+      uint64_t helios_wait_ns = 0;
+      uint64_t helios_invalidate_ns = 0;
+      uint64_t helios_queue_present_ns = 0;
+
       if (wsi->sw) {
+         uint64_t helios_start_ns = os_time_get_nano();
          VkResult wait_result =
             wsi->WaitForFences(vk_device_to_handle(dev),
                                1, &swapchain->fences[image_index], true,
                                ~0ull);
+         helios_wait_ns = os_time_get_nano() - helios_start_ns;
          if (wait_result != VK_SUCCESS) {
             mesa_logd("wsi: sw present WaitForFences(image=%u) failed: %s",
                       image_index, vk_Result_to_str(wait_result));
@@ -2524,6 +2636,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
 
          if (image->cpu_map != NULL) {
+            helios_start_ns = os_time_get_nano();
             const VkMappedMemoryRange range = {
                .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                .memory = image->blit.buffer != VK_NULL_HANDLE ?
@@ -2533,6 +2646,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             };
             results[i] =
                wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
+            helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
             if (results[i] != VK_SUCCESS) {
                mesa_logd("wsi: sw present invalidate(image=%u) failed: %s",
                          image_index, vk_Result_to_str(results[i]));
@@ -2545,9 +2659,14 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       if (regions && regions->pRegions)
          region = &regions->pRegions[i];
 
+      uint64_t helios_start_ns = os_time_get_nano();
       results[i] = swapchain->queue_present(swapchain, image_index,
                                             image_signal_infos[i].present_id,
                                             region);
+      helios_queue_present_ns = os_time_get_nano() - helios_start_ns;
+      if (wsi->sw)
+         helios_wsi_perf_note_frame(helios_wait_ns, helios_invalidate_ns,
+                                    helios_queue_present_ns);
       if (results[i] != VK_SUCCESS) {
          mesa_logd("wsi: queue_present(image=%u) failed: %s", image_index,
                    vk_Result_to_str(results[i]));

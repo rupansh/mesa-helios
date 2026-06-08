@@ -25,7 +25,121 @@
 #include "vn_renderer.h"
 #include "vn_wsi.h"
 
+#include "util/os_time.h"
+#include "util/u_debug.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 /* queue commands */
+
+struct helios_queue_submit2_perf {
+   bool initialized;
+   bool enabled;
+   uint64_t interval;
+   uint64_t calls;
+   uint64_t tls_ns;
+   uint64_t wsi_flush_ns;
+   uint64_t cache_flush_ns;
+   uint64_t submit_ns;
+   uint64_t wsi_fence_wait_ns;
+};
+
+static struct helios_queue_submit2_perf helios_queue_submit2_perf;
+
+static void
+helios_queue_submit2_perf_init(void)
+{
+   if (helios_queue_submit2_perf.initialized)
+      return;
+
+   helios_queue_submit2_perf.initialized = true;
+   helios_queue_submit2_perf.interval = 300;
+
+   const char *enabled = os_get_option("HELIOS_QUEUE_PERF");
+   if (!enabled)
+      enabled = os_get_option("HELIOS_PERF");
+   helios_queue_submit2_perf.enabled =
+      enabled && enabled[0] && enabled[0] != '0';
+
+   const char *interval = os_get_option("HELIOS_QUEUE_PERF_INTERVAL");
+   if (interval && interval[0]) {
+      const uint64_t parsed = strtoull(interval, NULL, 10);
+      if (parsed)
+         helios_queue_submit2_perf.interval = parsed;
+   }
+}
+
+static void
+helios_queue_submit2_perf_write(void)
+{
+   helios_queue_submit2_perf_init();
+   if (!helios_queue_submit2_perf.enabled || !helios_queue_submit2_perf.calls)
+      return;
+
+   FILE *fp = stderr;
+   const char *path = os_get_option("HELIOS_PERF_FILE");
+   if (path && path[0]) {
+      fp = fopen(path, "a");
+      if (!fp)
+         fp = stderr;
+   }
+
+#define HELIOS_AVG_US(ns)                                                      \
+   ((double)(ns) / 1000.0 /                                                    \
+    (double)(helios_queue_submit2_perf.calls ?                                \
+                helios_queue_submit2_perf.calls :                             \
+                1))
+
+   fprintf(fp,
+           "Helios QueueSubmit2 calls=%" PRIu64
+           " tls_ms=%.3f tls_avg_us=%.3f"
+           " wsi_flush_ms=%.3f wsi_flush_avg_us=%.3f"
+           " cache_flush_ms=%.3f cache_flush_avg_us=%.3f"
+           " submit_ms=%.3f submit_avg_us=%.3f"
+           " wsi_fence_wait_ms=%.3f wsi_fence_wait_avg_us=%.3f\n",
+           helios_queue_submit2_perf.calls,
+           helios_queue_submit2_perf.tls_ns / 1000000.0,
+           HELIOS_AVG_US(helios_queue_submit2_perf.tls_ns),
+           helios_queue_submit2_perf.wsi_flush_ns / 1000000.0,
+           HELIOS_AVG_US(helios_queue_submit2_perf.wsi_flush_ns),
+           helios_queue_submit2_perf.cache_flush_ns / 1000000.0,
+           HELIOS_AVG_US(helios_queue_submit2_perf.cache_flush_ns),
+           helios_queue_submit2_perf.submit_ns / 1000000.0,
+           HELIOS_AVG_US(helios_queue_submit2_perf.submit_ns),
+           helios_queue_submit2_perf.wsi_fence_wait_ns / 1000000.0,
+           HELIOS_AVG_US(helios_queue_submit2_perf.wsi_fence_wait_ns));
+
+#undef HELIOS_AVG_US
+
+   if (fp != stderr)
+      fclose(fp);
+}
+
+static void
+helios_queue_submit2_perf_note(uint64_t tls_ns,
+                               uint64_t wsi_flush_ns,
+                               uint64_t cache_flush_ns,
+                               uint64_t submit_ns,
+                               uint64_t wsi_fence_wait_ns)
+{
+   helios_queue_submit2_perf_init();
+   if (!helios_queue_submit2_perf.enabled)
+      return;
+
+   helios_queue_submit2_perf.calls++;
+   helios_queue_submit2_perf.tls_ns += tls_ns;
+   helios_queue_submit2_perf.wsi_flush_ns += wsi_flush_ns;
+   helios_queue_submit2_perf.cache_flush_ns += cache_flush_ns;
+   helios_queue_submit2_perf.submit_ns += submit_ns;
+   helios_queue_submit2_perf.wsi_fence_wait_ns += wsi_fence_wait_ns;
+
+   if (helios_queue_submit2_perf.calls %
+          helios_queue_submit2_perf.interval ==
+       0)
+      helios_queue_submit2_perf_write();
+}
 
 struct vn_submit_info_pnext_fix {
    VkDeviceGroupSubmitInfo group;
@@ -1243,11 +1357,26 @@ vn_QueueSubmit2(VkQueue _queue,
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
    struct vn_queue *queue = vn_queue_from_handle(_queue);
    VkResult result;
+   uint64_t helios_start_ns;
+   uint64_t helios_tls_ns = 0;
+   uint64_t helios_wsi_flush_ns = 0;
+   uint64_t helios_cache_flush_ns = 0;
+   uint64_t helios_submit_ns = 0;
+   uint64_t helios_wsi_fence_wait_ns = 0;
 
+   helios_start_ns = os_time_get_nano();
    vn_tls_set_async_pipeline_create();
-   vn_wsi_flush(queue);
-   vn_device_memory_flush_coherent_cached_mappings(dev);
+   helios_tls_ns = os_time_get_nano() - helios_start_ns;
 
+   helios_start_ns = os_time_get_nano();
+   vn_wsi_flush(queue);
+   helios_wsi_flush_ns = os_time_get_nano() - helios_start_ns;
+
+   helios_start_ns = os_time_get_nano();
+   vn_device_memory_flush_coherent_cached_mappings(dev);
+   helios_cache_flush_ns = os_time_get_nano() - helios_start_ns;
+
+   helios_start_ns = os_time_get_nano();
    if (dev->has_sync2) {
       struct vn_queue_submission submit = {
          .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -1257,6 +1386,7 @@ vn_QueueSubmit2(VkQueue _queue,
          .fence_handle = fence,
       };
       result = vn_queue_submit(&submit);
+      helios_submit_ns = os_time_get_nano() - helios_start_ns;
       if (result != VK_SUCCESS) {
          if (VN_DEBUG(WSI)) {
             vn_log(dev->instance,
@@ -1264,6 +1394,10 @@ vn_QueueSubmit2(VkQueue _queue,
                    __func__, submitCount, (void *)(uintptr_t)fence,
                    vk_Result_to_str(result));
          }
+         helios_queue_submit2_perf_note(helios_tls_ns, helios_wsi_flush_ns,
+                                        helios_cache_flush_ns,
+                                        helios_submit_ns,
+                                        helios_wsi_fence_wait_ns);
          return result;
       }
    } else {
@@ -1280,16 +1414,30 @@ vn_QueueSubmit2(VkQueue _queue,
                       __func__, i, submitCount, (void *)(uintptr_t)fence,
                       vk_Result_to_str(result));
             }
+            helios_submit_ns = os_time_get_nano() - helios_start_ns;
+            helios_queue_submit2_perf_note(helios_tls_ns, helios_wsi_flush_ns,
+                                           helios_cache_flush_ns,
+                                           helios_submit_ns,
+                                           helios_wsi_fence_wait_ns);
             return result;
          }
       }
+      helios_submit_ns = os_time_get_nano() - helios_start_ns;
    }
 
-   result = vn_wsi_fence_wait(dev, queue);
-   if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
-      vn_log(dev->instance, "%s: vn_wsi_fence_wait failed: %s", __func__,
-             vk_Result_to_str(result));
+   if (fence == VK_NULL_HANDLE) {
+      helios_start_ns = os_time_get_nano();
+      result = vn_wsi_fence_wait(dev, queue);
+      helios_wsi_fence_wait_ns = os_time_get_nano() - helios_start_ns;
+      if (VN_DEBUG(WSI) && result != VK_SUCCESS) {
+         vn_log(dev->instance, "%s: vn_wsi_fence_wait failed: %s", __func__,
+                vk_Result_to_str(result));
+      }
    }
+
+   helios_queue_submit2_perf_note(helios_tls_ns, helios_wsi_flush_ns,
+                                  helios_cache_flush_ns, helios_submit_ns,
+                                  helios_wsi_fence_wait_ns);
 
    return result;
 }
