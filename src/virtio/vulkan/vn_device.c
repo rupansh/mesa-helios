@@ -654,7 +654,16 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
 
    vn_device_queue_family_fini(dev);
 
-   vn_async_vkDestroyDevice(dev->primary_ring, device, NULL);
+   /* Helios uses a System-class transport without the Linux DRM syncobj/fd
+    * lifetime machinery.  Do not let renderer/context teardown race host-side
+    * vkDestroyDevice consumption.
+    */
+   {
+      struct vn_ring_submit_command ring_submit;
+      vn_submit_vkDestroyDevice(dev->primary_ring, 0, device, NULL, &ring_submit);
+      if (ring_submit.ring_seqno_valid)
+         vn_ring_wait_seqno(dev->primary_ring, ring_submit.ring_seqno);
+   }
 
    /* We must emit vkDestroyDevice before releasing bound ring_idx. Otherwise,
     * another thread might reuse their ring_idx while they are still bound to

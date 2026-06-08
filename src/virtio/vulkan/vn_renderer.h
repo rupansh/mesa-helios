@@ -164,6 +164,9 @@ struct vn_renderer_bo_ops {
 
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
 
+   void (*release_resource)(struct vn_renderer *renderer,
+                            struct vn_renderer_bo *bo);
+
    int (*export_dma_buf)(struct vn_renderer *renderer,
                          struct vn_renderer_bo *bo);
 
@@ -382,6 +385,14 @@ vn_renderer_bo_unref(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
    if (vn_refcount_dec(&bo->refcount))
       return renderer->bo_ops.destroy(renderer, bo);
    return false;
+}
+
+static inline void
+vn_renderer_bo_release_resource(struct vn_renderer *renderer,
+                                struct vn_renderer_bo *bo)
+{
+   if (renderer->bo_ops.release_resource)
+      renderer->bo_ops.release_resource(renderer, bo);
 }
 
 static inline int

@@ -22,6 +22,15 @@
 #include "vn_renderer.h"
 #include "vn_renderer_util.h"
 
+#include <stdio.h>
+
+static bool
+vn_helios_env_enabled(const char *name)
+{
+   const char *value = os_get_option(name);
+   return value && strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0;
+}
+
 static bool
 vn_device_memory_is_coherent_cached(struct vn_device *dev,
                                     struct vn_device_memory *mem)
@@ -224,7 +233,9 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
                                 vn_cs_encoder_get_len(&local_enc));
    }
 
+   vn_renderer_bo_release_resource(dev->renderer, mem->base_bo);
    vn_renderer_bo_unref(dev->renderer, mem->base_bo);
+   mem->base_bo = NULL;
 }
 
 VkResult
@@ -525,6 +536,10 @@ vn_FreeMemory(VkDevice device,
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
    if (!mem)
       return;
+
+   if (vn_helios_env_enabled("HELIOS_RELEASE_TRACE"))
+      fprintf(stderr, "Helios vn_FreeMemory mem=%p base_bo=%p\n", mem,
+              mem->base_bo);
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
    vn_device_memory_unregister_coherent_cached_mapping(dev, mem);

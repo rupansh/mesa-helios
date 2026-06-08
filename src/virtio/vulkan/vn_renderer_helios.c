@@ -26,10 +26,8 @@
  *   - SUBMIT_VENUS is METHOD_IN_DIRECT: the fixed header rides lpInBuffer
  *     (buffered) and the variable Venus cs rides lpOutBuffer (read-locked MDL) —
  *     see kmd/src/ioctl.rs::handle_submit_venus.
- *   - There is no per-resource RESOURCE_UNREF / UNMAP_BLOB IOCTL yet, so blob
- *     resources and their user mappings are reclaimed at handle-close
- *     (EvtFileCleanup) / CTX_DESTROY. shmem/bo destroy here only frees the guest
- *     tracking struct (the shmem cache keeps churn — and thus the leak — bounded).
+ *   - Blob destroy releases the KMD/host resource immediately. The shmem cache
+ *     still keeps command-ring blobs alive until eviction/final teardown.
  */
 
 /* WIN32_LEAN_AND_MEAN is already defined on the Mesa build command line. */
@@ -66,6 +64,7 @@ static const GUID GUID_DEVINTERFACE_HELIOS = {
 #define IOCTL_HELIOS_ALLOC_BLOB   0x0022E40Cu
 #define IOCTL_HELIOS_MAP_BLOB     0x0022E410u
 #define IOCTL_HELIOS_WAIT_FENCE   0x0022E414u
+#define IOCTL_HELIOS_RELEASE_BLOB 0x0022E41Cu
 
 /* ── Escape payload structs (protocol/src/escape.rs) — repr(C), padding-free ─── */
 #define HELIOS_ESCAPE_MAGIC   0x48454C53u /* 'HELS' */
@@ -77,6 +76,7 @@ static const GUID GUID_DEVINTERFACE_HELIOS = {
 #define HELIOS_ESCAPE_ALLOC_BLOB   0x0004u
 #define HELIOS_ESCAPE_MAP_BLOB     0x0005u
 #define HELIOS_ESCAPE_WAIT_FENCE   0x0006u
+#define HELIOS_ESCAPE_RELEASE_BLOB 0x0008u
 
 #define HELIOS_MAP_CACHE_CACHED    0x00000001u
 #define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
@@ -132,6 +132,14 @@ struct helios_escape_map_blob {
    uint32_t map_cache;   /* in/out: requested/effective VIRTIO_GPU_MAP_CACHE_* */
 };
 
+struct helios_escape_release_blob {
+   struct helios_escape_header hdr;
+   uint32_t ctx_id;
+   uint32_t resource_id;
+   uint32_t flags;
+   uint32_t padding;
+};
+
 struct helios_escape_wait_fence {
    struct helios_escape_header hdr;
    uint64_t fence_id;
@@ -145,19 +153,23 @@ _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size
 _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
+_Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
 _Static_assert(sizeof(struct helios_escape_wait_fence) == 32, "wait_fence size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
 struct helios_shmem {
    struct vn_renderer_shmem base;
+   uint32_t ctx_id;
 };
 
 struct helios_bo {
    struct vn_renderer_bo base;
+   uint32_t ctx_id;
    uint32_t blob_flags;
    uint32_t map_cache;
    VkMemoryPropertyFlags memory_flags;
+   bool resource_released;
 };
 
 #define HELIOS_SYNC_PENDING_MAX 256
@@ -185,6 +197,7 @@ enum helios_ioctl_stat {
    HELIOS_STAT_SUBMIT,
    HELIOS_STAT_ALLOC_BLOB,
    HELIOS_STAT_MAP_BLOB,
+   HELIOS_STAT_RELEASE_BLOB,
    HELIOS_STAT_WAIT_FENCE,
    HELIOS_STAT_COUNT,
 };
@@ -273,6 +286,8 @@ helios_ioctl_stat_from_code(uint32_t code)
       return HELIOS_STAT_ALLOC_BLOB;
    case IOCTL_HELIOS_MAP_BLOB:
       return HELIOS_STAT_MAP_BLOB;
+   case IOCTL_HELIOS_RELEASE_BLOB:
+      return HELIOS_STAT_RELEASE_BLOB;
    case IOCTL_HELIOS_WAIT_FENCE:
       return HELIOS_STAT_WAIT_FENCE;
    default:
@@ -443,6 +458,23 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
 }
 
 static void
+helios_ioctl_release_blob(struct helios *helios, uint32_t ctx_id, uint32_t resource_id)
+{
+   if (!ctx_id || !resource_id)
+      return;
+
+   char trace[8];
+   if (GetEnvironmentVariableA("HELIOS_RELEASE_TRACE", trace, sizeof(trace)))
+      fprintf(stderr, "Helios release_blob ctx=%u res=%u\n", ctx_id, resource_id);
+
+   struct helios_escape_release_blob req = { 0 };
+   helios_hdr_init(&req.hdr, HELIOS_ESCAPE_RELEASE_BLOB, sizeof(req));
+   req.ctx_id = ctx_id;
+   req.resource_id = resource_id;
+   helios_ioctl(helios, IOCTL_HELIOS_RELEASE_BLOB, &req, sizeof(req), NULL, 0);
+}
+
+static void
 helios_sync_retire_locked(struct helios_sync *sync)
 {
    uint32_t n = 0;
@@ -542,6 +574,7 @@ helios_perf_write(struct helios *helios, bool final)
       "submit",
       "alloc_blob",
       "map_blob",
+      "release_blob",
       "wait_fence",
    };
 
@@ -813,13 +846,18 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
 
 /* ── shmem ops ─────────────────────────────────────────────────────────────── */
 
-/* Cache-eviction / final teardown callback. There is no RESOURCE_UNREF / unmap
- * IOCTL yet, so the host resource + its user mapping persist until handle close
- * (KMD EvtFileCleanup) / CTX_DESTROY; we only free the guest tracking struct. */
+/* Cache-eviction / final teardown callback. Cached shmems intentionally remain
+ * live until they reach this callback; only then release the KMD/host blob. */
 static void
 helios_shmem_destroy_now(struct vn_renderer *renderer, struct vn_renderer_shmem *shmem)
 {
-   (void)renderer;
+   struct helios *helios = (struct helios *)renderer;
+   struct helios_shmem *hshmem = (struct helios_shmem *)shmem;
+
+   mtx_lock(&helios->dev_mutex);
+   helios_ioctl_release_blob(helios, hshmem->ctx_id, shmem->res_id);
+   mtx_unlock(&helios->dev_mutex);
+
    free(shmem); /* base is the first member of struct helios_shmem */
 }
 
@@ -867,17 +905,27 @@ helios_shmem_create(struct vn_renderer *renderer, size_t size)
    if (!res_id || !user_va) {
       vn_log(helios->instance, "shmem create failed (res_id=%u, mapped=%d)", res_id,
              user_va != 0);
+      if (res_id) {
+         mtx_lock(&helios->dev_mutex);
+         helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+         mtx_unlock(&helios->dev_mutex);
+      }
       return NULL;
    }
 
    struct helios_shmem *shmem = calloc(1, sizeof(*shmem));
-   if (!shmem)
+   if (!shmem) {
+      mtx_lock(&helios->dev_mutex);
+      helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+      mtx_unlock(&helios->dev_mutex);
       return NULL;
+   }
 
    shmem->base.refcount = VN_REFCOUNT_INIT(1);
    shmem->base.res_id = res_id;
    shmem->base.mmap_size = size;
    shmem->base.mmap_ptr = (void *)(uintptr_t)user_va;
+   shmem->ctx_id = helios->ctx_id;
 
    return &shmem->base;
 }
@@ -952,12 +1000,17 @@ helios_bo_create_from_device_memory(
    }
 
    struct helios_bo *bo = calloc(1, sizeof(*bo));
-   if (!bo)
+   if (!bo) {
+      mtx_lock(&helios->dev_mutex);
+      helios_ioctl_release_blob(helios, helios->ctx_id, res_id);
+      mtx_unlock(&helios->dev_mutex);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    bo->base.refcount = VN_REFCOUNT_INIT(1);
    bo->base.res_id = res_id;
    bo->base.mmap_size = (blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) ? size : 0;
+   bo->ctx_id = helios->ctx_id;
    bo->blob_flags = blob_flags;
    bo->memory_flags = flags;
 
@@ -1017,11 +1070,28 @@ helios_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo, void *pl
 static bool
 helios_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
 {
-   (void)renderer;
-   /* No RESOURCE_UNREF / unmap IOCTL yet — host resource + mapping persist until
-    * handle close / CTX_DESTROY (PHASE5_HANDOVER §9 #6). Free the guest struct. */
-   free(bo);
+   struct helios_bo *hbo = (struct helios_bo *)bo;
+
+   if (!hbo->resource_released)
+      vn_renderer_bo_release_resource(renderer, bo);
+
+   free(hbo);
    return true;
+}
+
+static void
+helios_bo_release_resource(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
+{
+   struct helios *helios = (struct helios *)renderer;
+   struct helios_bo *hbo = (struct helios_bo *)bo;
+
+   if (hbo->resource_released)
+      return;
+
+   mtx_lock(&helios->dev_mutex);
+   helios_ioctl_release_blob(helios, hbo->ctx_id, bo->res_id);
+   mtx_unlock(&helios->dev_mutex);
+   hbo->resource_released = true;
 }
 
 static void
@@ -1253,6 +1323,7 @@ helios_init(struct helios *helios)
       helios_bo_create_from_device_memory;
    helios->base.bo_ops.create_from_dma_buf = NULL;
    helios->base.bo_ops.destroy = helios_bo_destroy;
+   helios->base.bo_ops.release_resource = helios_bo_release_resource;
    helios->base.bo_ops.export_dma_buf = NULL;
    helios->base.bo_ops.export_sync_file = NULL;
    helios->base.bo_ops.map = helios_bo_map;
