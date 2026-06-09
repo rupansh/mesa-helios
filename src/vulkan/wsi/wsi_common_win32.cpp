@@ -1297,6 +1297,7 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    const void *present_bits = image->base.cpu_map;
    LONG present_bitmap_width = (LONG)(src_row_pitch / 4);
+   bool present_from_shadow_dib = false;
    uint64_t helios_copy_ns = 0;
    uint64_t helios_get_dc_ns = 0;
    uint64_t helios_stretch_ns = 0;
@@ -1321,6 +1322,7 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
       present_bits = image->sw.ppvBits;
       present_bitmap_width = (LONG)chain->extent.width;
+      present_from_shadow_dib = true;
       helios_copy_ns = os_time_get_nano() - helios_start_ns;
    }
 
@@ -1341,14 +1343,20 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    info.bmiHeader.biCompression = BI_RGB;
 
    helios_start_ns = os_time_get_nano();
-   int copied = StretchDIBits(wnd_dc, 0, 0, chain->extent.width,
-                              chain->extent.height, 0, 0, chain->extent.width,
-                              chain->extent.height, present_bits, &info,
-                              DIB_RGB_COLORS, SRCCOPY);
+   int copied;
+   if (present_from_shadow_dib) {
+      copied = BitBlt(wnd_dc, 0, 0, chain->extent.width, chain->extent.height,
+                      image->sw.dc, 0, 0, SRCCOPY) ? (int)chain->extent.height : 0;
+   } else {
+      copied = StretchDIBits(wnd_dc, 0, 0, chain->extent.width,
+                             chain->extent.height, 0, 0, chain->extent.width,
+                             chain->extent.height, present_bits, &info,
+                             DIB_RGB_COLORS, SRCCOPY);
+   }
    helios_stretch_ns = os_time_get_nano() - helios_start_ns;
    if (copied == 0 || copied == (int)GDI_ERROR) {
       fprintf(stderr,
-              "wsi/win32: StretchDIBits failed, ret=%d, GetLastError=%lu, dst=%p, extent=%ux%u\n",
+              "wsi/win32: GDI present failed, ret=%d, GetLastError=%lu, dst=%p, extent=%ux%u\n",
               copied, (unsigned long)GetLastError(), wnd_dc,
               chain->extent.width, chain->extent.height);
       chain->status = VK_ERROR_MEMORY_MAP_FAILED;
