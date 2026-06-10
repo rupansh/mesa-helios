@@ -637,13 +637,23 @@ wsi_swapchain_init(const struct wsi_device *wsi,
          if (chain->blit.queue != NULL) {
             queue_family_index = chain->blit.queue->queue_family_index;
          } else {
-            uint64_t effective_queues = wsi->queue_supports_blit;
+            /* Only families with a queue actually created on this logical
+             * device: a command pool on any other family violates
+             * VUID-vkCreateCommandPool-queueFamilyIndex-01937 (and present
+             * only ever uses the present queue's family, which is enabled). */
+            uint64_t enabled_families = 0;
+            list_for_each_entry(const struct vk_queue, queue, &device->queues,
+                                link)
+               enabled_families |= BITFIELD64_BIT(queue->queue_family_index);
+
+            uint64_t effective_queues =
+               wsi->queue_supports_blit & enabled_families;
             if (pCreateInfo->flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT)
                effective_queues &= wsi->queue_supports_timestamps;
 
             /* Fallback. If this happens we don't advertise support for queue complete times. */
             if (!effective_queues)
-               effective_queues = wsi->queue_supports_blit;
+               effective_queues = wsi->queue_supports_blit & enabled_families;
 
             /* Queues returned by get_blit_queue() might not be listed in
             * GetPhysicalDeviceQueueFamilyProperties, so this check is skipped for those queues.
