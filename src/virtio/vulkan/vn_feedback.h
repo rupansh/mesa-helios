@@ -70,28 +70,27 @@ struct vn_feedback_buffer {
    struct list_head head;
 };
 
+/* Feedback slots live in mappable Venus device memory the Helios backend maps
+ * WC (prefer_cached_map is only set for the WSI blit destination), and WC/UC
+ * guest mappings never hold CPU cache lines — the GPU's slot write reaches
+ * host RAM coherently and a guest read goes straight to memory. The
+ * clflush-per-poll these helpers used to issue on Windows was pure overhead
+ * on the hottest path in the driver (every vkGetFenceStatus/vkWaitForFences
+ * slot poll). Were a feedback slot ever mapped CACHED over a non-WB host
+ * mapping, helios_bo_flush/invalidate (which keep the precise aliasing
+ * check) would be the place to handle it, not per-access ops here. */
 static inline void
 vn_feedback_cpu_flush(const void *ptr, size_t size)
 {
-#if DETECT_OS_WINDOWS
-   if (util_has_cache_ops())
-      util_flush_range((void *)ptr, size);
-#else
    (void)ptr;
    (void)size;
-#endif
 }
 
 static inline void
 vn_feedback_cpu_invalidate(const void *ptr, size_t size)
 {
-#if DETECT_OS_WINDOWS
-   if (util_has_cache_ops())
-      util_flush_inval_range((void *)ptr, size);
-#else
    (void)ptr;
    (void)size;
-#endif
 }
 
 struct vn_semaphore_feedback_cmd {

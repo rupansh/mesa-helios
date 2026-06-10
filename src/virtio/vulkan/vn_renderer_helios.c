@@ -1094,6 +1094,24 @@ helios_bo_release_resource(struct vn_renderer *renderer, struct vn_renderer_bo *
    hbo->resource_released = true;
 }
 
+/* CPU cache-line ops are only meaningful for a CACHED guest mapping that
+ * aliases a non-WB host mapping. WC/UC guest mappings never hold cache lines
+ * (write-combine buffers drain on the submit syscall's serialization), and
+ * when the memory type is HOST_COHERENT|HOST_CACHED the host map_info is
+ * CACHED (vkr reports CACHED iff coherent && cached), so guest WB over host
+ * WB is hardware-coherent under KVM and clflush is pure overhead — measured
+ * ~175 us/frame in the WSI present invalidate sweep alone. */
+static bool
+helios_bo_needs_cache_ops(const struct helios_bo *bo)
+{
+   if (bo->map_cache != HELIOS_MAP_CACHE_CACHED)
+      return false;
+
+   const VkMemoryPropertyFlags host_wb = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+   return (bo->memory_flags & host_wb) != host_wb;
+}
+
 static void
 helios_bo_flush(struct vn_renderer *renderer,
                 struct vn_renderer_bo *bo,
@@ -1101,7 +1119,8 @@ helios_bo_flush(struct vn_renderer *renderer,
                 VkDeviceSize size)
 {
    (void)renderer;
-   if (!bo->mmap_ptr || !size || !util_has_cache_ops())
+   if (!bo->mmap_ptr || !size || !util_has_cache_ops() ||
+       !helios_bo_needs_cache_ops((const struct helios_bo *)bo))
       return;
 
    util_flush_range((char *)bo->mmap_ptr + offset, size);
@@ -1114,7 +1133,8 @@ helios_bo_invalidate(struct vn_renderer *renderer,
                      VkDeviceSize size)
 {
    (void)renderer;
-   if (!bo->mmap_ptr || !size || !util_has_cache_ops())
+   if (!bo->mmap_ptr || !size || !util_has_cache_ops() ||
+       !helios_bo_needs_cache_ops((const struct helios_bo *)bo))
       return;
 
    util_flush_inval_range((char *)bo->mmap_ptr + offset, size);
