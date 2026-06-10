@@ -187,11 +187,11 @@ helios_win32_wsi_direct_map_enabled(void)
 }
 
 static bool
-helios_lg_env_disabled(const char *name)
+helios_lg_env_enabled(const char *name)
 {
    char value[64];
    return GetEnvironmentVariableA(name, value, sizeof(value)) &&
-      (!value[0] || value[0] == '0');
+      value[0] && value[0] != '0';
 }
 
 static bool
@@ -219,7 +219,9 @@ helios_lg_direct_init(void)
       return helios_lg_direct.enabled && !helios_lg_direct.unavailable;
 
    helios_lg_direct.initialized = true;
-   helios_lg_direct.enabled = !helios_lg_env_disabled("HELIOS_LG_DIRECT");
+   /* Opt-in (HELIOS_LG_DIRECT=1): the default GDI DIB-shadow + BitBlt path
+    * measures equivalently, so the direct producer is no longer default. */
+   helios_lg_direct.enabled = helios_lg_env_enabled("HELIOS_LG_DIRECT");
    if (!helios_lg_direct.enabled)
       return false;
 
