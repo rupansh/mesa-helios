@@ -481,6 +481,7 @@ vn_image_fix_create_info(
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
    struct vn_image_create_info *local_info)
 {
+   bool has_external = false;
    local_info->create = *create_info;
    VkBaseOutStructure *cur = (void *)&local_info->create;
 
@@ -490,6 +491,7 @@ vn_image_fix_create_info(
       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO:
          memcpy(&local_info->external, src, sizeof(local_info->external));
          local_info->external.handleTypes = renderer_handle_type;
+         has_external = true;
          next = &local_info->external;
          break;
       case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
@@ -519,6 +521,19 @@ vn_image_fix_create_info(
          cur->pNext = next;
          cur = next;
       }
+   }
+
+   /* Helios: append external info when the app provided none (see
+    * vn_buffer_fix_create_info — vkr force-exports HOST_VISIBLE memory, so
+    * an image that may bind such memory must carry matching handleTypes or
+    * the bind violates VUID-VkBindImageMemoryInfo-memory-02728). */
+   if (!has_external) {
+      local_info->external = (VkExternalMemoryImageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .handleTypes = (VkExternalMemoryHandleTypeFlags)renderer_handle_type,
+      };
+      cur->pNext = (void *)&local_info->external;
+      cur = (void *)&local_info->external;
    }
 
    cur->pNext = NULL;
@@ -600,8 +615,23 @@ vn_CreateImage(VkDevice device,
 #endif
    } else {
       struct vn_image_create_info local_info;
-      if (external_info &&
-          external_info->handleTypes != renderer_handle_type) {
+      /* Helios: also inject external info into LINEAR images with no
+       * external info of their own. The Win32 software swapchain creates
+       * its present images without the wsi_image_create_info marker and
+       * binds them to HOST_VISIBLE memory, which vkr force-exports
+       * (VUID-VkBindImageMemoryInfo-memory-02728 otherwise). LINEAR limits
+       * the change to cpu-mappable images; OPTIMAL device-local images are
+       * left untouched. PREINITIALIZED images cannot legally carry external
+       * info (VUID-VkImageCreateInfo-pNext-01443), so those keep the
+       * upstream-venus bind mismatch — apps like vkcube use them for
+       * staging textures; Doom does not. */
+      const bool fix_external =
+         renderer_handle_type &&
+         (external_info
+             ? external_info->handleTypes != renderer_handle_type
+             : (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+                pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED));
+      if (fix_external) {
          pCreateInfo = vn_image_fix_create_info(
             pCreateInfo, renderer_handle_type, &local_info);
       }

@@ -340,6 +340,7 @@ vn_buffer_fix_create_info(
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
    struct vn_buffer_create_info *local_info)
 {
+   bool has_external = false;
    local_info->create = *create_info;
    VkBaseOutStructure *cur = (void *)&local_info->create;
 
@@ -349,6 +350,7 @@ vn_buffer_fix_create_info(
       case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO:
          memcpy(&local_info->external, src, sizeof(local_info->external));
          local_info->external.handleTypes = renderer_handle_type;
+         has_external = true;
          next = &local_info->external;
          break;
       case VK_STRUCTURE_TYPE_BUFFER_OPAQUE_CAPTURE_ADDRESS_CREATE_INFO:
@@ -367,6 +369,21 @@ vn_buffer_fix_create_info(
          cur->pNext = next;
          cur = next;
       }
+   }
+
+   /* Helios: vkr force-exports every HOST_VISIBLE allocation (with the
+    * renderer handle type), so a buffer that may bind such memory must carry
+    * matching handleTypes or the bind violates
+    * VUID-VkBindBufferMemoryInfo-memory-02726 (UB; observed faulting the
+    * GPU on the NVIDIA proprietary driver while ANV tolerates it). Inject
+    * the renderer handle type when the app provided no external info. */
+   if (!has_external) {
+      local_info->external = (VkExternalMemoryBufferCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+         .handleTypes = renderer_handle_type,
+      };
+      cur->pNext = (void *)&local_info->external;
+      cur = (void *)&local_info->external;
    }
 
    cur->pNext = NULL;
@@ -390,8 +407,9 @@ vn_CreateBuffer(VkDevice device,
    const VkExternalMemoryBufferCreateInfo *external_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
-   if (external_info && external_info->handleTypes &&
-       external_info->handleTypes != renderer_handle_type) {
+   if (renderer_handle_type &&
+       (!external_info || !external_info->handleTypes ||
+        external_info->handleTypes != renderer_handle_type)) {
       pCreateInfo = vn_buffer_fix_create_info(
          pCreateInfo, renderer_handle_type, &local_info);
    }

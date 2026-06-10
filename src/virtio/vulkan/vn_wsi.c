@@ -237,6 +237,30 @@ vn_wsi_create_image(struct vn_device *dev,
       }
    }
 
+   /* Helios: the Win32 software swapchain binds its images to HOST_VISIBLE
+    * memory, which vkr force-exports with the renderer handle type. Tag the
+    * image with matching handleTypes or the bind violates
+    * VUID-VkBindImageMemoryInfo-memory-02728 (UB on the NVIDIA proprietary
+    * host driver). The Linux native-image path gets this from common wsi's
+    * own dma_buf external info; the sw path provides none. */
+   VkExternalMemoryImageCreateInfo local_external_info;
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      dev->physical_device->external_memory.renderer_handle_type;
+   if (renderer_handle_type &&
+       !vk_find_struct_const(create_info->pNext,
+                             EXTERNAL_MEMORY_IMAGE_CREATE_INFO)) {
+      if (create_info != &local_create_info) {
+         local_create_info = *create_info;
+         create_info = &local_create_info;
+      }
+      local_external_info = (VkExternalMemoryImageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .pNext = local_create_info.pNext,
+         .handleTypes = (VkExternalMemoryHandleTypeFlags)renderer_handle_type,
+      };
+      local_create_info.pNext = &local_external_info;
+   }
+
    struct vn_image *img;
    VkResult result = vn_image_create(dev, create_info, alloc, &img);
    if (result != VK_SUCCESS)

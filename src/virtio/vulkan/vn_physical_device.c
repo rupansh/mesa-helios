@@ -1043,11 +1043,70 @@ vn_physical_device_init_external_memory(
     *
     * For vtest, the protocol does not support external memory import. So we
     * only mask out the importable bit so that wsi over vtest can be supported.
+    *
+    * Helios: renderer_handle_type must match the export handle type vkr
+    * force-adds to every HOST_VISIBLE allocation (vkr_device_memory.c), or
+    * every vkBindBufferMemory/vkBindImageMemory on host-visible memory is
+    * invalid (VUID-VkBindBufferMemoryInfo-memory-02726): vkr probes ACTUAL
+    * exportability via vkGetPhysicalDeviceExternalBufferProperties and falls
+    * back dma_buf -> opaque fd -> gbm/udmabuf import. Extension presence
+    * alone is not enough: the NVIDIA proprietary driver exposes
+    * EXT_external_memory_dma_buf but does not support dma_buf EXPORT, so vkr
+    * picks opaque fd there while Intel uses dma_buf. Mirror vkr's probe and
+    * pick the same handle type it will pick (validation-confirmed on
+    * NVIDIA 610.43.02: mismatched DMA_BUF buffers on OPAQUE_FD memory).
     */
-   if (physical_dev->renderer_extensions.EXT_external_memory_dma_buf) {
+   const struct vk_device_extension_table *renderer_exts =
+      &physical_dev->renderer_extensions;
+   struct vn_ring *ring = physical_dev->instance->ring.ring;
+   VkPhysicalDevice handle = vn_physical_device_to_handle(physical_dev);
+   bool dma_buf_exportable = false;
+   bool opaque_fd_exportable = false;
+
+   VkPhysicalDeviceExternalBufferInfo info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+   };
+   VkExternalBufferProperties props = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES,
+   };
+
+   if (renderer_exts->EXT_external_memory_dma_buf) {
+      info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+      vn_call_vkGetPhysicalDeviceExternalBufferProperties(ring, handle, &info,
+                                                          &props);
+      dma_buf_exportable =
+         (props.externalMemoryProperties.externalMemoryFeatures &
+          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+         (props.externalMemoryProperties.exportFromImportedHandleTypes &
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+   }
+
+   if (renderer_exts->KHR_external_memory_fd) {
+      info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      vn_call_vkGetPhysicalDeviceExternalBufferProperties(ring, handle, &info,
+                                                          &props);
+      opaque_fd_exportable =
+         (props.externalMemoryProperties.externalMemoryFeatures &
+          VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
+         (props.externalMemoryProperties.exportFromImportedHandleTypes &
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
+   }
+
+   if (dma_buf_exportable) {
       physical_dev->external_memory.renderer_handle_type =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   } else if (opaque_fd_exportable) {
+      physical_dev->external_memory.renderer_handle_type =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+   } else if (renderer_exts->EXT_external_memory_dma_buf) {
+      /* vkr's gbm/udmabuf-import fallback: memory becomes a dma_buf IMPORT,
+       * so dma_buf remains the matching handle type for buffers/images. */
+      physical_dev->external_memory.renderer_handle_type =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+   }
 
+   if (physical_dev->external_memory.renderer_handle_type) {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       physical_dev->external_memory.supported_handle_types |=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
