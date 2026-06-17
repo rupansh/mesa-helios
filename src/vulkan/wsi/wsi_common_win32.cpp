@@ -71,19 +71,6 @@ struct helios_win32_wsi_perf {
    uint64_t interval;
    uint64_t frames;
    uint64_t direct_frames;
-   uint64_t lg_attempts;
-   uint64_t lg_success;
-   uint64_t lg_fail_pipe;
-   uint64_t lg_fail_ivshmem;
-   uint64_t lg_fail_acquire;
-   uint64_t lg_fail_acquire_read;
-   uint64_t lg_fail_bounds;
-   uint64_t lg_fail_commit;
-   uint64_t lg_fail_commit_read;
-   uint32_t lg_last_error;
-   uint64_t lg_acquire_ns;
-   uint64_t lg_upload_ns;
-   uint64_t lg_commit_ns;
    uint64_t copy_ns;
    uint64_t stretch_ns;
    uint64_t get_dc_ns;
@@ -92,85 +79,6 @@ struct helios_win32_wsi_perf {
 static struct helios_win32_wsi_perf helios_win32_wsi_perf;
 static bool helios_win32_wsi_direct_map_initialized;
 static bool helios_win32_wsi_direct_map;
-
-#define LG_HELIOS_PIPE_NAME "\\\\.\\pipe\\LookingGlassIDDHelios"
-#define LG_HELIOS_UPLOAD_MAPPING_NAME "Global\\LookingGlassIDDHeliosUpload"
-#define LG_HELIOS_UPLOAD_SIZE (64u * 1024u * 1024u)
-#define LG_HELIOS_DIRECT_PRESENT_VERSION 1
-#define LG_FRAME_TYPE_BGRA 1
-
-struct helios_lg_pipe_msg {
-   uint32_t size;
-   uint32_t type;
-   union {
-      struct {
-         uint32_t version;
-         uint32_t width;
-         uint32_t height;
-         uint32_t pitch;
-         uint32_t frame_type;
-      } acquire;
-      struct {
-         uint32_t version;
-         uint32_t status;
-         uint32_t frame_index;
-         uint32_t frame_offset;
-         uint32_t data_offset;
-         uint32_t max_size;
-         uint32_t serial;
-      } acquire_reply;
-      struct {
-         uint32_t version;
-         uint32_t frame_index;
-         uint32_t width;
-         uint32_t height;
-         uint32_t pitch;
-         uint32_t frame_type;
-         uint32_t damage_x;
-         uint32_t damage_y;
-         uint32_t damage_width;
-         uint32_t damage_height;
-      } commit;
-      struct {
-         uint32_t version;
-         uint32_t status;
-      } commit_reply;
-      uint8_t padding[64];
-   };
-};
-
-enum {
-   LG_PIPE_MSG_SET_CURSOR_POS = 0,
-   LG_PIPE_MSG_SET_DISPLAY_MODE = 1,
-   LG_PIPE_MSG_GPU_STATUS = 2,
-   LG_PIPE_MSG_RELOAD_SETTINGS = 3,
-   LG_PIPE_MSG_HELIOS_ACQUIRE_FRAME = 4,
-   LG_PIPE_MSG_HELIOS_ACQUIRE_FRAME_REPLY = 5,
-   LG_PIPE_MSG_HELIOS_COMMIT_FRAME = 6,
-   LG_PIPE_MSG_HELIOS_COMMIT_FRAME_REPLY = 7,
-};
-
-struct helios_lg_direct {
-   bool initialized;
-   bool enabled;
-   bool unavailable;
-   HANDLE pipe;
-   HANDLE upload_mapping;
-   void *mem;
-   size_t size;
-};
-
-static struct helios_lg_direct helios_lg_direct = {
-   .pipe = INVALID_HANDLE_VALUE,
-   .upload_mapping = INVALID_HANDLE_VALUE,
-};
-
-static void
-helios_lg_perf_fail(uint64_t *counter, uint32_t error)
-{
-   (*counter)++;
-   helios_win32_wsi_perf.lg_last_error = error;
-}
 
 static bool
 helios_win32_wsi_direct_map_enabled(void)
@@ -184,247 +92,6 @@ helios_win32_wsi_direct_map_enabled(void)
    }
 
    return helios_win32_wsi_direct_map;
-}
-
-static bool
-helios_lg_env_enabled(const char *name)
-{
-   char value[64];
-   return GetEnvironmentVariableA(name, value, sizeof(value)) &&
-      value[0] && value[0] != '0';
-}
-
-static bool
-helios_lg_open_upload_mapping(void)
-{
-   helios_lg_direct.upload_mapping =
-      OpenFileMappingA(FILE_MAP_WRITE, FALSE, LG_HELIOS_UPLOAD_MAPPING_NAME);
-   if (helios_lg_direct.upload_mapping == INVALID_HANDLE_VALUE)
-      return false;
-
-   helios_lg_direct.mem =
-      MapViewOfFile(helios_lg_direct.upload_mapping, FILE_MAP_WRITE,
-                    0, 0, LG_HELIOS_UPLOAD_SIZE);
-   if (!helios_lg_direct.mem)
-      return false;
-
-   helios_lg_direct.size = LG_HELIOS_UPLOAD_SIZE;
-   return true;
-}
-
-static bool
-helios_lg_direct_init(void)
-{
-   if (helios_lg_direct.initialized)
-      return helios_lg_direct.enabled && !helios_lg_direct.unavailable;
-
-   helios_lg_direct.initialized = true;
-   /* Opt-in (HELIOS_LG_DIRECT=1): the default GDI DIB-shadow + BitBlt path
-    * measures equivalently, so the direct producer is no longer default. */
-   helios_lg_direct.enabled = helios_lg_env_enabled("HELIOS_LG_DIRECT");
-   if (!helios_lg_direct.enabled)
-      return false;
-
-   helios_lg_direct.pipe =
-      CreateFileA(LG_HELIOS_PIPE_NAME, GENERIC_READ | GENERIC_WRITE,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                  OPEN_EXISTING, 0, NULL);
-   if (helios_lg_direct.pipe == INVALID_HANDLE_VALUE) {
-      uint32_t error = GetLastError();
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_pipe, error);
-      fprintf(stderr, "wsi/win32: Helios LG direct disabled: pipe open failed (%lu)\n",
-              (unsigned long)error);
-      helios_lg_direct.unavailable = true;
-      return false;
-   }
-
-   DWORD mode = PIPE_READMODE_MESSAGE;
-   SetNamedPipeHandleState(helios_lg_direct.pipe, &mode, NULL, NULL);
-
-   if (!helios_lg_open_upload_mapping()) {
-      uint32_t error = GetLastError();
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_ivshmem, error);
-      fprintf(stderr, "wsi/win32: Helios LG direct disabled: upload map failed (%lu)\n",
-              (unsigned long)error);
-      helios_lg_direct.unavailable = true;
-      return false;
-   }
-
-   fprintf(stderr, "wsi/win32: Helios LG direct present enabled, upload=%zu bytes\n",
-           helios_lg_direct.size);
-   return true;
-}
-
-static bool
-helios_lg_pipe_write(const struct helios_lg_pipe_msg *msg)
-{
-   DWORD written = 0;
-   return WriteFile(helios_lg_direct.pipe, msg, sizeof(*msg), &written, NULL) &&
-      written == sizeof(*msg);
-}
-
-static bool
-helios_lg_pipe_read_reply(uint32_t type, struct helios_lg_pipe_msg *reply)
-{
-   for (uint32_t i = 0; i < 8; i++) {
-      DWORD read = 0;
-      if (!ReadFile(helios_lg_direct.pipe, reply, sizeof(*reply), &read, NULL) ||
-          read != sizeof(*reply))
-         return false;
-      if (reply->size == sizeof(*reply) && reply->type == type)
-         return true;
-   }
-   return false;
-}
-
-static bool
-helios_lg_get_window_pos(HWND wnd, uint32_t *out_x, uint32_t *out_y)
-{
-   POINT pt = { 0, 0 };
-   if (!ClientToScreen(wnd, &pt))
-      return false;
-
-   HMONITOR mon = MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST);
-   MONITORINFO mi = {};
-   mi.cbSize = sizeof(mi);
-   if (!GetMonitorInfoA(mon, &mi))
-      return false;
-
-   LONG x = pt.x - mi.rcMonitor.left;
-   LONG y = pt.y - mi.rcMonitor.top;
-   if (x < 0)
-      x = 0;
-   if (y < 0)
-      y = 0;
-
-   *out_x = (uint32_t)x;
-   *out_y = (uint32_t)y;
-   return true;
-}
-
-static bool
-helios_lg_direct_present(HWND wnd, uint32_t width, uint32_t height,
-                         uint32_t src_pitch, const void *src_bits)
-{
-   helios_win32_wsi_perf.lg_attempts++;
-   if (!src_bits || !helios_lg_direct_init())
-      return false;
-
-   uint32_t pos_x = 0;
-   uint32_t pos_y = 0;
-   helios_lg_get_window_pos(wnd, &pos_x, &pos_y);
-
-   const uint32_t dst_pitch = width * 4;
-   struct helios_lg_pipe_msg msg = {};
-   struct helios_lg_pipe_msg reply = {};
-
-   msg.size = sizeof(msg);
-   msg.type = LG_PIPE_MSG_HELIOS_ACQUIRE_FRAME;
-   msg.acquire.version = LG_HELIOS_DIRECT_PRESENT_VERSION;
-   msg.acquire.width = width;
-   msg.acquire.height = height;
-   msg.acquire.pitch = dst_pitch;
-   msg.acquire.frame_type = LG_FRAME_TYPE_BGRA;
-
-   uint64_t lg_start_ns = os_time_get_nano();
-   if (!helios_lg_pipe_write(&msg) ||
-       !helios_lg_pipe_read_reply(LG_PIPE_MSG_HELIOS_ACQUIRE_FRAME_REPLY, &reply)) {
-      helios_win32_wsi_perf.lg_acquire_ns += os_time_get_nano() - lg_start_ns;
-      helios_lg_direct.unavailable = true;
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_acquire_read,
-                          GetLastError());
-      fprintf(stderr, "wsi/win32: Helios LG direct acquire read failed\n");
-      return false;
-   }
-   if (reply.acquire_reply.status != 0) {
-      if (reply.acquire_reply.status != 3)
-         helios_lg_direct.unavailable = true;
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_acquire,
-                          reply.acquire_reply.status);
-      fprintf(stderr, "wsi/win32: Helios LG direct acquire failed: %u\n",
-              reply.acquire_reply.status);
-      return false;
-   }
-   helios_win32_wsi_perf.lg_acquire_ns += os_time_get_nano() - lg_start_ns;
-
-   const uint64_t frame_bytes = (uint64_t)dst_pitch * (uint64_t)height;
-   if (frame_bytes > (uint64_t)helios_lg_direct.size) {
-      helios_lg_direct.unavailable = true;
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_bounds, 0);
-      fprintf(stderr, "wsi/win32: Helios LG direct invalid frame offset\n");
-      return false;
-   }
-
-   uint8_t *dst = (uint8_t *)helios_lg_direct.mem;
-   const uint8_t *src = (const uint8_t *)src_bits;
-   lg_start_ns = os_time_get_nano();
-   for (uint32_t y = 0; y < height; y++)
-      memcpy(dst + (size_t)y * dst_pitch, src + (size_t)y * src_pitch, dst_pitch);
-   helios_win32_wsi_perf.lg_upload_ns += os_time_get_nano() - lg_start_ns;
-
-   memset(&msg, 0, sizeof(msg));
-   msg.size = sizeof(msg);
-   msg.type = LG_PIPE_MSG_HELIOS_COMMIT_FRAME;
-   msg.commit.version = LG_HELIOS_DIRECT_PRESENT_VERSION;
-   msg.commit.frame_index = reply.acquire_reply.frame_index;
-   msg.commit.width = width;
-   msg.commit.height = height;
-   msg.commit.pitch = dst_pitch;
-   msg.commit.frame_type = LG_FRAME_TYPE_BGRA;
-   msg.commit.damage_x = pos_x;
-   msg.commit.damage_y = pos_y;
-   msg.commit.damage_width = width;
-   msg.commit.damage_height = height;
-
-   lg_start_ns = os_time_get_nano();
-   if (!helios_lg_pipe_write(&msg) ||
-       !helios_lg_pipe_read_reply(LG_PIPE_MSG_HELIOS_COMMIT_FRAME_REPLY, &reply)) {
-      helios_win32_wsi_perf.lg_commit_ns += os_time_get_nano() - lg_start_ns;
-      helios_lg_direct.unavailable = true;
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_commit_read,
-                          GetLastError());
-      fprintf(stderr, "wsi/win32: Helios LG direct commit read failed\n");
-      return false;
-   }
-   if (reply.commit_reply.status != 0) {
-      if (reply.commit_reply.status != 3)
-         helios_lg_direct.unavailable = true;
-      helios_lg_perf_fail(&helios_win32_wsi_perf.lg_fail_commit,
-                          reply.commit_reply.status);
-      fprintf(stderr, "wsi/win32: Helios LG direct commit failed: %u\n",
-              reply.commit_reply.status);
-      return false;
-   }
-   helios_win32_wsi_perf.lg_commit_ns += os_time_get_nano() - lg_start_ns;
-
-   helios_win32_wsi_perf.lg_success++;
-   return true;
-}
-
-static void
-helios_lg_direct_clear(void)
-{
-   if (!helios_lg_direct.initialized ||
-       !helios_lg_direct.enabled ||
-       helios_lg_direct.pipe == INVALID_HANDLE_VALUE)
-      return;
-
-   struct helios_lg_pipe_msg msg = {};
-   struct helios_lg_pipe_msg reply = {};
-
-   msg.size = sizeof(msg);
-   msg.type = LG_PIPE_MSG_HELIOS_COMMIT_FRAME;
-   msg.commit.version = LG_HELIOS_DIRECT_PRESENT_VERSION;
-   msg.commit.frame_index = UINT32_MAX;
-   msg.commit.width = 0;
-   msg.commit.height = 0;
-
-   if (!helios_lg_pipe_write(&msg) ||
-       !helios_lg_pipe_read_reply(LG_PIPE_MSG_HELIOS_COMMIT_FRAME_REPLY, &reply))
-      return;
-
-   if (reply.commit_reply.status != 0 && reply.commit_reply.status != 3)
-      helios_lg_direct.unavailable = true;
 }
 
 static void
@@ -462,42 +129,11 @@ helios_win32_wsi_perf_write(void)
 
    fprintf(f,
            "Helios WSI win32 frames=%" PRIu64 " direct=%" PRIu64
-           " lg_attempts=%" PRIu64 " lg_success=%" PRIu64
-           " lg_fail_pipe=%" PRIu64 " lg_fail_ivshmem=%" PRIu64
-           " lg_fail_acquire=%" PRIu64 " lg_fail_acquire_read=%" PRIu64
-           " lg_fail_bounds=%" PRIu64
-           " lg_fail_commit=%" PRIu64 " lg_fail_commit_read=%" PRIu64
-           " lg_last_error=%u"
-           " lg_acquire_ms=%.3f lg_acquire_avg_us=%.3f"
-           " lg_upload_ms=%.3f lg_upload_avg_us=%.3f"
-           " lg_commit_ms=%.3f lg_commit_avg_us=%.3f"
            " copy_ms=%.3f copy_avg_us=%.3f"
            " getdc_ms=%.3f getdc_avg_us=%.3f"
            " stretch_ms=%.3f stretch_avg_us=%.3f\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
-           helios_win32_wsi_perf.lg_attempts,
-           helios_win32_wsi_perf.lg_success,
-           helios_win32_wsi_perf.lg_fail_pipe,
-           helios_win32_wsi_perf.lg_fail_ivshmem,
-           helios_win32_wsi_perf.lg_fail_acquire,
-           helios_win32_wsi_perf.lg_fail_acquire_read,
-           helios_win32_wsi_perf.lg_fail_bounds,
-           helios_win32_wsi_perf.lg_fail_commit,
-           helios_win32_wsi_perf.lg_fail_commit_read,
-           helios_win32_wsi_perf.lg_last_error,
-           (double)helios_win32_wsi_perf.lg_acquire_ns / 1000000.0,
-           helios_win32_wsi_perf.lg_attempts ?
-              (double)helios_win32_wsi_perf.lg_acquire_ns / 1000.0 /
-              (double)helios_win32_wsi_perf.lg_attempts : 0.0,
-           (double)helios_win32_wsi_perf.lg_upload_ns / 1000000.0,
-           helios_win32_wsi_perf.lg_attempts ?
-              (double)helios_win32_wsi_perf.lg_upload_ns / 1000.0 /
-              (double)helios_win32_wsi_perf.lg_attempts : 0.0,
-           (double)helios_win32_wsi_perf.lg_commit_ns / 1000000.0,
-           helios_win32_wsi_perf.lg_attempts ?
-              (double)helios_win32_wsi_perf.lg_commit_ns / 1000.0 /
-              (double)helios_win32_wsi_perf.lg_attempts : 0.0,
            (double)helios_win32_wsi_perf.copy_ns / 1000000.0,
            helios_win32_wsi_perf.frames ?
               (double)helios_win32_wsi_perf.copy_ns / 1000.0 /
@@ -1076,8 +712,6 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    struct wsi_win32_swapchain *chain =
       (struct wsi_win32_swapchain *) drv_chain;
 
-   helios_lg_direct_clear();
-
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
 
@@ -1303,13 +937,6 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    uint64_t helios_copy_ns = 0;
    uint64_t helios_get_dc_ns = 0;
    uint64_t helios_stretch_ns = 0;
-
-   if (helios_lg_direct_present(chain->wnd, chain->extent.width, chain->extent.height,
-                                src_row_pitch, image->base.cpu_map)) {
-      helios_win32_wsi_perf_note_frame(false, 0, 0, 0);
-      wsi_win32_set_image_idle(chain, image);
-      return chain->status;
-   }
 
    if (!can_present_cpu_map_directly) {
       uint64_t helios_start_ns = os_time_get_nano();
