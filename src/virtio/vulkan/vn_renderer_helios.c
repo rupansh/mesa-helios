@@ -40,6 +40,7 @@
 #include <stdio.h> /* Phase-7 gate res_id surfacing (throwaway) */
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h> /* wcsstr — adapter description match in helios_open_d3dkmt */
 
 #include "vn_renderer_internal.h"
 
@@ -47,17 +48,24 @@
 
 #include <windows.h>
 #include <setupapi.h>
-
-/* ── Helios device interface GUID (protocol/src/ioctl.rs) ───────────────────── */
-/* {C8F84237-CD89-48F5-AFC5-32944524625C} */
-static const GUID GUID_DEVINTERFACE_HELIOS = {
-   0xC8F84237,
-   0xCD89,
-   0x48F5,
-   { 0xAF, 0xC5, 0x32, 0x94, 0x45, 0x24, 0x62, 0x5C }
-};
+/* Gate 5a: the venus transport reaches the kmd_render WDDM adapter through the
+ * D3DKMT thunks (gdi32 exports) instead of DeviceIoControl. mingw-w64 ships no
+ * D3DKMT headers, so the build adds the vendored WDK headers
+ * (icd/win-build/wdk-include, via -I in meson.build); this is the real
+ * d3dkmthk.h, so the D3DKMT_* structs are the authoritative OS ABI. */
+/* d3dkmthk.h's D3DKMT* prototypes return NTSTATUS, but the header pulls no
+ * header that defines it and mingw's <windows.h> doesn't either. Provide it,
+ * guarded by the SDK's _NTDEF_ so we never double-define if <ntdef.h> is in. */
+#ifndef _NTDEF_
+typedef LONG NTSTATUS, *PNTSTATUS;
+#endif
+#include <d3dkmthk.h>
 
 /* ── Helios IOCTL codes (protocol/src/ioctl.rs) ────────────────────────────── */
+/* Retained only for the not-yet-ported verbs that still route through the
+ * fail-clean helios_ioctl() stub (submit/blob/wait). The System-class device
+ * interface GUID + SetupDi open path are gone — the WDDM adapter is reached via
+ * D3DKMT (helios_open_d3dkmt). */
 #define IOCTL_HELIOS_CTX_CREATE   0x0022E400u
 #define IOCTL_HELIOS_CTX_DESTROY  0x0022E404u
 #define IOCTL_HELIOS_SUBMIT_VENUS 0x0022E409u /* METHOD_IN_DIRECT */
@@ -244,7 +252,19 @@ struct helios {
     * MAP_BLOB in particular must be serialized and issued from the process that
     * opened the handle (this process) — see kmd/src/ioctl.rs::handle_map_blob. */
    mtx_t dev_mutex;
+   /* Legacy System-class IOCTL handle. Gate 5a retires this transport: it stays
+    * INVALID_HANDLE_VALUE so any not-yet-ported verb (submit/blob/wait via
+    * helios_ioctl) fails cleanly until it moves onto the D3DKMT path. */
    HANDLE dev;
+
+   /* WDDM D3DKMT handle set for the kmd_render adapter (Gate 5a). The adapter is
+    * mandatory (carries the DxgkDdiEscape control channel); device/context are
+    * best-effort here and become load-bearing for Stage 2/3 (CreateAllocation /
+    * Render). */
+   D3DKMT_HANDLE adapter;
+   D3DKMT_HANDLE device;
+   D3DKMT_HANDLE context;
+   LUID adapter_luid;
 
    uint32_t ctx_id;
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
@@ -338,6 +358,36 @@ helios_ioctl(struct helios *helios,
    return true;
 }
 
+/* One D3DKMTEscape round-trip carrying a Helios escape struct as adapter-scoped
+ * driver-private data. The escape buffer is in/out: the KMD's DxgkDdiEscape
+ * validates the helios_escape_header and writes any out-fields (e.g. out_ctx_id)
+ * back into the same buffer, which the runtime reflects to user mode. Caller
+ * MUST hold dev_mutex. Returns false on a D3DKMT failure. */
+static bool
+helios_escape(struct helios *helios, void *buf, uint32_t size)
+{
+   if (!helios->adapter)
+      return false;
+
+   D3DKMT_ESCAPE esc;
+   memset(&esc, 0, sizeof(esc));
+   esc.hAdapter = helios->adapter; /* KMD escape is adapter-scoped (design §8.3) */
+   esc.hDevice = helios->device;   /* pass the device too (some OS builds require it) */
+   esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
+   esc.pPrivateDriverData = buf;
+   esc.PrivateDriverDataSize = size;
+
+   const NTSTATUS st = D3DKMTEscape(&esc);
+   if (st != 0) {
+      vn_log(helios->instance, "Helios D3DKMTEscape failed: status 0x%08x",
+             (unsigned)st);
+      fprintf(stderr, "HELIOS[gate5a]: D3DKMTEscape status=0x%08x (adapter=0x%x device=0x%x size=%u)\n",
+              (unsigned)st, (unsigned)helios->adapter, (unsigned)helios->device, size);
+      return false;
+   }
+   return true;
+}
+
 static bool
 helios_ioctl_ctx_create(struct helios *helios, uint32_t capset_id, uint32_t *out_ctx_id)
 {
@@ -345,12 +395,11 @@ helios_ioctl_ctx_create(struct helios *helios, uint32_t capset_id, uint32_t *out
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_CTX_CREATE, sizeof(req));
    req.capset_id = capset_id;
 
-   struct helios_escape_ctx_create out = req;
-   if (!helios_ioctl(helios, IOCTL_HELIOS_CTX_CREATE, &req, sizeof(req), &out,
-                     sizeof(out)))
+   /* Escape is in/out: out_ctx_id comes back in the same buffer. */
+   if (!helios_escape(helios, &req, sizeof(req)))
       return false;
 
-   *out_ctx_id = out.out_ctx_id;
+   *out_ctx_id = req.out_ctx_id;
    return true;
 }
 
@@ -360,7 +409,7 @@ helios_ioctl_ctx_destroy(struct helios *helios, uint32_t ctx_id)
    struct helios_escape_ctx_destroy req = { 0 };
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_CTX_DESTROY, sizeof(req));
    req.ctx_id = ctx_id;
-   helios_ioctl(helios, IOCTL_HELIOS_CTX_DESTROY, &req, sizeof(req), NULL, 0);
+   helios_escape(helios, &req, sizeof(req));
 }
 
 /* SUBMIT_VENUS (METHOD_IN_DIRECT). Caller MUST hold dev_mutex (next_fence_id +
@@ -638,65 +687,108 @@ helios_perf_dump_at_exit(void)
       helios_perf_dump(helios_perf_at_exit_renderer);
 }
 
-/* ── Device discovery + open (mirrors probe/src/main.rs::open_helios) ───────── */
+/* ── Adapter discovery + open (Gate 5a: WDDM D3DKMT, kmd_render) ────────────── */
 
-static HANDLE
-helios_open_device(struct vn_instance *instance)
+/* Enumerate WDDM adapters via the KMT thunks (no DXGI/COM needed in C), match
+ * the Helios render adapter by its registry description, open it, and create a
+ * device + context on it. On success fills helios->{adapter,device,context,
+ * adapter_luid}. The adapter handle carries the DxgkDdiEscape control channel
+ * the venus context rides; device/context are created here for the Stage 2/3
+ * CreateAllocation / Render path (best-effort for Stage 1). */
+static bool
+helios_open_d3dkmt(struct helios *helios)
 {
-   HDEVINFO dev_info =
-      SetupDiGetClassDevsW(&GUID_DEVINTERFACE_HELIOS, NULL, NULL,
-                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-   if (dev_info == INVALID_HANDLE_VALUE) {
-      vn_log(instance, "SetupDiGetClassDevs failed: %lu",
-             (unsigned long)GetLastError());
-      return INVALID_HANDLE_VALUE;
+   struct vn_instance *instance = helios->instance;
+
+   D3DKMT_ENUMADAPTERS2 ea;
+   memset(&ea, 0, sizeof(ea));
+   /* First call with NULL pAdapters returns the adapter count. */
+   NTSTATUS st = D3DKMTEnumAdapters2(&ea);
+   if (st != 0 || ea.NumAdapters == 0) {
+      vn_log(instance, "D3DKMTEnumAdapters2 count failed: status 0x%08x count %u",
+             (unsigned)st, (unsigned)ea.NumAdapters);
+      return false;
+   }
+   ea.pAdapters = calloc(ea.NumAdapters, sizeof(D3DKMT_ADAPTERINFO));
+   if (!ea.pAdapters)
+      return false;
+   st = D3DKMTEnumAdapters2(&ea);
+   if (st != 0) {
+      vn_log(instance, "D3DKMTEnumAdapters2 failed: status 0x%08x", (unsigned)st);
+      free(ea.pAdapters);
+      return false;
    }
 
-   SP_DEVICE_INTERFACE_DATA ifd = { 0 };
-   ifd.cbSize = sizeof(ifd);
-   if (!SetupDiEnumDeviceInterfaces(dev_info, NULL, &GUID_DEVINTERFACE_HELIOS, 0,
-                                    &ifd)) {
-      vn_log(instance, "no GUID_DEVINTERFACE_HELIOS instance present: %lu",
-             (unsigned long)GetLastError());
-      SetupDiDestroyDeviceInfoList(dev_info);
-      return INVALID_HANDLE_VALUE;
-   }
+   D3DKMT_HANDLE chosen = 0;
+   LUID chosen_luid = { 0 };
+   for (UINT i = 0; i < ea.NumAdapters; i++) {
+      const D3DKMT_HANDLE h = ea.pAdapters[i].hAdapter;
 
-   /* First call: required detail buffer size. */
-   DWORD required = 0;
-   SetupDiGetDeviceInterfaceDetailW(dev_info, &ifd, NULL, 0, &required, NULL);
-   if (required == 0) {
-      vn_log(instance, "interface detail size query failed: %lu",
-             (unsigned long)GetLastError());
-      SetupDiDestroyDeviceInfoList(dev_info);
-      return INVALID_HANDLE_VALUE;
-   }
+      D3DKMT_ADAPTERREGISTRYINFO reg;
+      memset(&reg, 0, sizeof(reg));
+      D3DKMT_QUERYADAPTERINFO qai;
+      memset(&qai, 0, sizeof(qai));
+      qai.hAdapter = h;
+      qai.Type = KMTQAITYPE_ADAPTERREGISTRYINFO;
+      qai.pPrivateDriverData = &reg;
+      qai.PrivateDriverDataSize = sizeof(reg);
 
-   SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = calloc(1, required);
-   if (!detail) {
-      SetupDiDestroyDeviceInfoList(dev_info);
-      return INVALID_HANDLE_VALUE;
+      const bool match = chosen == 0 &&
+                         D3DKMTQueryAdapterInfo(&qai) == 0 &&
+                         wcsstr(reg.AdapterString, L"Helios") != NULL;
+      if (match) {
+         chosen = h;
+         chosen_luid = ea.pAdapters[i].AdapterLuid;
+      } else {
+         /* Release adapters we won't use (D3DKMTEnumAdapters2 opens each one). */
+         D3DKMT_CLOSEADAPTER ca;
+         memset(&ca, 0, sizeof(ca));
+         ca.hAdapter = h;
+         (void)D3DKMTCloseAdapter(&ca);
+      }
    }
-   /* cbSize is the FIXED header size, NOT the buffer size (8 on x64). */
-   detail->cbSize = sizeof(*detail);
+   free(ea.pAdapters);
 
-   HANDLE dev = INVALID_HANDLE_VALUE;
-   if (SetupDiGetDeviceInterfaceDetailW(dev_info, &ifd, detail, required, NULL,
-                                        NULL)) {
-      dev = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0,
-                        NULL);
-      if (dev == INVALID_HANDLE_VALUE)
-         vn_log(instance, "CreateFile on Helios device failed: %lu",
-                (unsigned long)GetLastError());
-   } else {
-      vn_log(instance, "SetupDiGetDeviceInterfaceDetail failed: %lu",
-             (unsigned long)GetLastError());
+   if (chosen == 0) {
+      vn_log(instance, "no Helios WDDM adapter found via D3DKMTEnumAdapters2");
+      return false;
    }
+   helios->adapter = chosen;
+   helios->adapter_luid = chosen_luid;
+   /* Gate 5a bring-up breadcrumb (stderr): adapter opened by LUID. */
+   fprintf(stderr, "HELIOS[gate5a]: opened Helios WDDM adapter hAdapter=0x%x luid=%08lx:%08lx\n",
+           (unsigned)chosen, (unsigned long)chosen_luid.HighPart,
+           (unsigned long)chosen_luid.LowPart);
 
-   free(detail);
-   SetupDiDestroyDeviceInfoList(dev_info);
-   return dev;
+   /* Create a device on the adapter (drives DxgkDdiCreateDevice). The escape
+    * control channel is adapter-scoped and works without this, but Stage 2
+    * allocations need it, so log loudly rather than fail Stage 1 on it. */
+   D3DKMT_CREATEDEVICE cd;
+   memset(&cd, 0, sizeof(cd));
+   cd.hAdapter = chosen;
+   st = D3DKMTCreateDevice(&cd);
+   if (st != 0) {
+      vn_log(instance, "D3DKMTCreateDevice failed: status 0x%08x", (unsigned)st);
+      return true;
+   }
+   helios->device = cd.hDevice;
+
+   /* Create a context (drives DxgkDdiCreateContext) for the eventual
+    * D3DKMTRender submit path. Best-effort for Stage 1. */
+   D3DKMT_CREATECONTEXT cc;
+   memset(&cc, 0, sizeof(cc));
+   cc.hDevice = cd.hDevice;
+   cc.NodeOrdinal = 0;
+   cc.EngineAffinity = 0;
+   st = D3DKMTCreateContext(&cc);
+   if (st != 0)
+      vn_log(instance, "D3DKMTCreateContext failed: status 0x%08x", (unsigned)st);
+   else
+      helios->context = cc.hContext;
+
+   fprintf(stderr, "HELIOS[gate5a]: D3DKMT device=0x%x context=0x%x\n",
+           (unsigned)helios->device, (unsigned)helios->context);
+   return true;
 }
 
 /* ── ops ───────────────────────────────────────────────────────────────────── */
@@ -1291,11 +1383,33 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 
    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
 
-   if (helios->dev != INVALID_HANDLE_VALUE && helios->dev != NULL) {
-      if (helios->ctx_id)
-         helios_ioctl_ctx_destroy(helios, helios->ctx_id);
-      CloseHandle(helios->dev);
+   if (helios->ctx_id)
+      helios_ioctl_ctx_destroy(helios, helios->ctx_id); /* CTX_DESTROY via escape */
+
+   /* WDDM D3DKMT teardown (reverse of helios_open_d3dkmt). */
+   if (helios->context) {
+      D3DKMT_DESTROYCONTEXT dc;
+      memset(&dc, 0, sizeof(dc));
+      dc.hContext = helios->context;
+      (void)D3DKMTDestroyContext(&dc);
    }
+   if (helios->device) {
+      D3DKMT_DESTROYDEVICE dd;
+      memset(&dd, 0, sizeof(dd));
+      dd.hDevice = helios->device;
+      (void)D3DKMTDestroyDevice(&dd);
+   }
+   if (helios->adapter) {
+      D3DKMT_CLOSEADAPTER ca;
+      memset(&ca, 0, sizeof(ca));
+      ca.hAdapter = helios->adapter;
+      (void)D3DKMTCloseAdapter(&ca);
+   }
+
+   /* The legacy IOCTL handle is never opened on the D3DKMT path, but guard it in
+    * case a future transport reuses it. */
+   if (helios->dev != INVALID_HANDLE_VALUE && helios->dev != NULL)
+      CloseHandle(helios->dev);
 
    mtx_destroy(&helios->dev_mutex);
 
@@ -1315,8 +1429,7 @@ helios_init(struct helios *helios)
       }
    }
 
-   helios->dev = helios_open_device(helios->instance);
-   if (helios->dev == INVALID_HANDLE_VALUE)
+   if (!helios_open_d3dkmt(helios))
       return VK_ERROR_INITIALIZATION_FAILED;
 
    /* Create the single venus virtio-gpu context up front so it exists before the
@@ -1324,8 +1437,13 @@ helios_init(struct helios *helios)
    if (!helios_ioctl_ctx_create(helios, VIRTIO_GPU_CAPSET_VENUS, &helios->ctx_id) ||
        helios->ctx_id == 0) {
       vn_log(helios->instance, "CTX_CREATE(VENUS) failed or returned ctx_id 0");
+      fprintf(stderr, "HELIOS[gate5a]: CTX_CREATE(VENUS) over D3DKMTEscape FAILED\n");
       return VK_ERROR_INITIALIZATION_FAILED;
    }
+   /* Gate 5a STAGE-1 SUCCESS SIGNAL: the venus context came up over D3DKMTEscape
+    * → the KMD's DxgkDdiEscape handled CTX_CREATE against the kmd_render adapter. */
+   fprintf(stderr, "HELIOS[gate5a]: CTX_CREATE(VENUS) over D3DKMTEscape OK ctx_id=%u\n",
+           helios->ctx_id);
 
    vn_renderer_shmem_cache_init(&helios->shmem_cache, &helios->base,
                                 helios_shmem_destroy_now);

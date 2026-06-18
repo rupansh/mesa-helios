@@ -118,10 +118,20 @@ if system_has_kms_drm
 endif
 
 if with_platform_windows
-  # Helios IOCTL backend: the only vn_renderer backend on Windows. setupapi for
-  # the GUID_DEVINTERFACE_HELIOS device-interface enumeration (SetupDi*).
+  # Helios venus backend: the only vn_renderer backend on Windows. Gate 5a reaches
+  # the kmd_render WDDM adapter through the D3DKMT thunks (gdi32 exports:
+  # D3DKMTEnumAdapters2 / CreateDevice / CreateContext / Escape). setupapi is kept
+  # for the legacy device-interface helpers still referenced by the fail-clean
+  # IOCTL stub until those verbs move onto D3DKMT (Stage 2/3).
   libvn_files += files('vn_renderer_helios.c')
   vn_deps += cc.find_library('setupapi')
+  vn_deps += cc.find_library('gdi32')
+  # mingw-w64 ships no D3DKMT headers; use the real WDK ones (d3dkmthk.h +
+  # d3dkmdt.h + d3dukmdt.h, the only WDK-only headers in the chain — they pull
+  # only winapifamily.h, which mingw has) vendored under icd/win-build/wdk-include.
+  # Real headers = authoritative ABI (they self-default DXGKDDI_INTERFACE_VERSION
+  # to WDDM3_2, matching the OS), so no hand-shimmed D3DKMT structs to keep in sync.
+  vn_c_args += '-IZ:/icd/win-build/wdk-include'
 endif
 
 if with_platform_wayland or with_platform_x11 or \
