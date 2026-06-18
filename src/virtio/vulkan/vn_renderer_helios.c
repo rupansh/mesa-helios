@@ -438,11 +438,20 @@ helios_ioctl_submit_cs(struct helios *helios,
    hdr.buffer_size = (uint32_t)cs_size;
    hdr.ring_idx = ring_idx;
 
-   /* lpOutBuffer carries the cs; the KMD only reads it (IN_DIRECT read-lock), so
-    * casting away const is safe. */
-   const bool ok = helios_ioctl(helios, IOCTL_HELIOS_SUBMIT_VENUS, &hdr,
-                                sizeof(hdr), (void *)(uintptr_t)cs_data,
-                                (uint32_t)cs_size);
+   /* Over D3DKMTEscape the venus stream rides INSIDE the escape buffer, directly
+    * after the fixed header (the KMD reads it at buf[sizeof(hdr)..]); there is no
+    * IN_DIRECT side buffer. Stage header+cs into one contiguous buffer. */
+   const size_t total = sizeof(hdr) + cs_size;
+   if (total > UINT32_MAX)
+      return false;
+   uint8_t *buf = malloc(total);
+   if (!buf)
+      return false;
+   memcpy(buf, &hdr, sizeof(hdr));
+   memcpy(buf + sizeof(hdr), cs_data, cs_size);
+   const bool ok = helios_escape(helios, buf, (uint32_t)total);
+   free(buf);
+
    if (ok && out_fence_id)
       *out_fence_id = fence_id;
    return ok;
@@ -465,12 +474,11 @@ helios_ioctl_alloc_blob(struct helios *helios,
    req.blob_mem = blob_mem;
    req.ctx_id = helios->ctx_id;
 
-   struct helios_escape_alloc_blob out = req;
-   if (!helios_ioctl(helios, IOCTL_HELIOS_ALLOC_BLOB, &req, sizeof(req), &out,
-                     sizeof(out)))
+   /* D3DKMTEscape writes the out-fields back into `req` in place. */
+   if (!helios_escape(helios, &req, sizeof(req)))
       return 0;
 
-   return out.out_resource_id;
+   return req.out_resource_id;
 }
 
 /* MAP_BLOB. Caller MUST hold dev_mutex (the KMD requires serialized maps from
@@ -486,14 +494,13 @@ helios_ioctl_map_blob(struct helios *helios,
    req.resource_id = resource_id;
    req.map_cache = requested_map_cache;
 
-   struct helios_escape_map_blob out = req;
-   if (!helios_ioctl(helios, IOCTL_HELIOS_MAP_BLOB, &req, sizeof(req), &out,
-                     sizeof(out)))
+   /* D3DKMTEscape writes the out-fields back into `req` in place. */
+   if (!helios_escape(helios, &req, sizeof(req)))
       return 0;
 
    if (out_map_cache)
-      *out_map_cache = out.map_cache;
-   return out.out_user_va;
+      *out_map_cache = req.map_cache;
+   return req.out_user_va;
 }
 
 static bool
@@ -503,7 +510,7 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_WAIT_FENCE, sizeof(req));
    req.fence_id = fence_id;
    req.timeout_ns = timeout_ns;
-   return helios_ioctl(helios, IOCTL_HELIOS_WAIT_FENCE, &req, sizeof(req), NULL, 0);
+   return helios_escape(helios, &req, sizeof(req));
 }
 
 static void
@@ -520,7 +527,7 @@ helios_ioctl_release_blob(struct helios *helios, uint32_t ctx_id, uint32_t resou
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_RELEASE_BLOB, sizeof(req));
    req.ctx_id = ctx_id;
    req.resource_id = resource_id;
-   helios_ioctl(helios, IOCTL_HELIOS_RELEASE_BLOB, &req, sizeof(req), NULL, 0);
+   helios_escape(helios, &req, sizeof(req));
 }
 
 static void
