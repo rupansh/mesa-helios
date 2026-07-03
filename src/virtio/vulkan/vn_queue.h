@@ -194,6 +194,15 @@ struct vn_semaphore {
          uint64_t suspended_counter;
       };
 
+      /* Helios forward-progress deadline (guarded by counter_mtx): when the
+       * slot counter sits unchanged past the deadline while a submitted
+       * signal op is pending, the renderer context is treated as lost even
+       * if it keeps answering counter queries with stale success (the host
+       * driver may never report VK_ERROR_DEVICE_LOST after killing the GPU
+       * channel). stall_since_ns == 0 means "not stalled". */
+      int64_t stall_since_ns;
+      uint64_t stall_counter;
+
       /* Lock for checking if an async sem wait call is needed based on
        * the current counter value and signaled_counter to ensure async
        * wait order across threads.

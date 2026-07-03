@@ -47,6 +47,14 @@ struct vn_device {
 
    bool has_sync2;
 
+   /* Helios: latched when a forward-progress deadline concluded the renderer
+    * context is dead (host GPU channel loss the renderer never reports —
+    * e.g. NVIDIA Xid 109 kills the channel while counter queries keep
+    * returning stale success). Once set, sync waits fail fast with
+    * VK_ERROR_DEVICE_LOST so callers run their device-removed recovery
+    * instead of wedging. Read/written with p_atomic_*. */
+   int helios_lost;
+
    simple_mtx_t mutex;
    struct list_head chains;
    struct list_head coherent_cached_memory;

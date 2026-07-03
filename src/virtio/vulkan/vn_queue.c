@@ -2538,6 +2538,24 @@ vn_DestroySemaphore(VkDevice device,
    vk_free(alloc, sem);
 }
 
+/* Helios: how long a submitted-but-unsignaled semaphore may sit with zero
+ * forward progress before the renderer context is declared lost. The host
+ * driver can kill the GPU channel without ever reporting device loss through
+ * counter queries (observed: NVIDIA Xid 109 at 2026-07-03 23:45 — dwm wedged
+ * for 80+ minutes on stale-success replies). 0 disables the deadline.
+ */
+static int64_t
+vn_helios_sem_deadline_ns(void)
+{
+   static int64_t deadline_ns = -1;
+   if (deadline_ns < 0) {
+      const uint64_t ms =
+         debug_get_num_option("VN_HELIOS_SEM_DEADLINE_MS", 30000);
+      deadline_ns = (int64_t)ms * 1000000;
+   }
+   return deadline_ns;
+}
+
 static VkResult
 vn_get_semaphore_counter_value(VkDevice dev_handle,
                                VkSemaphore sem_handle,
@@ -2548,8 +2566,12 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
    struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
    ASSERTED struct vn_sync_payload *payload = sem->payload;
    bool check_device_lost = false;
+   bool deadline_hit = false;
 
    assert(payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
+
+   if (p_atomic_read(&dev->helios_lost))
+      return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
 
    if (sem->feedback.pollable) {
       assert(sem->feedback.slot);
@@ -2615,21 +2637,65 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
        * the slot. So the semaphore counter query here must consider both.
        */
       counter = MAX2(counter, sem->feedback.signaled_counter);
+
+      /* Helios forward-progress deadline: only inside waits (relax_state),
+       * and only when a signal op has actually been submitted (pending sfb
+       * cmds) — a wait on a value the app will submit later is legal and
+       * must not trip this. */
+      if (relax_state) {
+         if (sem->feedback.stall_since_ns == 0 ||
+             sem->feedback.stall_counter != counter) {
+            sem->feedback.stall_since_ns = os_time_get_nano();
+            sem->feedback.stall_counter = counter;
+         } else if (vn_helios_sem_deadline_ns() &&
+                    os_time_get_nano() - sem->feedback.stall_since_ns >=
+                       vn_helios_sem_deadline_ns()) {
+            simple_mtx_lock(&sem->feedback.cmd_mtx);
+            const bool signal_submitted =
+               !list_is_empty(&sem->feedback.pending_cmds);
+            simple_mtx_unlock(&sem->feedback.cmd_mtx);
+            if (signal_submitted) {
+               deadline_hit = true;
+               check_device_lost = true;
+            }
+         }
+      }
       simple_mtx_unlock(&sem->feedback.counter_mtx);
 
       if (check_device_lost) {
          /* Emit a synchronous vkGetSemaphoreCounterValue to catch renderer
           * device lost without tangling with sfb internals.
           */
-         uint64_t tmp;
+         uint64_t tmp = 0;
          VkResult result = vn_call_vkGetSemaphoreCounterValue(
             dev->primary_ring, dev_handle, sem_handle, &tmp);
-         if (result == VK_ERROR_DEVICE_LOST) {
-            vn_log(dev->instance, "aborting on sfb device lost");
-            abort();
+         if (result == VK_ERROR_DEVICE_LOST ||
+             (deadline_hit && result == VK_SUCCESS && tmp <= counter)) {
+            /* Either the renderer admits the loss, or it keeps answering
+             * with a stale counter past the deadline while a submitted
+             * signal op is pending — the GPU channel is gone and the
+             * renderer will never say so. Fail the wait so the caller runs
+             * its device-removed recovery instead of wedging forever. */
+            vn_log(dev->instance,
+                   "HELIOS: semaphore forward-progress deadline exceeded "
+                   "(result=%d slot=%" PRIu64 " renderer=%" PRIu64
+                   ") — treating renderer context as lost",
+                   result, counter, tmp);
+            p_atomic_set(&dev->helios_lost, 1);
+            return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
          }
          if (result != VK_SUCCESS)
             return result;
+         if (deadline_hit && tmp > counter) {
+            /* the renderer progressed but the feedback slot missed it —
+             * resync and keep waiting instead of declaring loss */
+            simple_mtx_lock(&sem->feedback.counter_mtx);
+            sem->feedback.signaled_counter =
+               MAX2(sem->feedback.signaled_counter, tmp);
+            sem->feedback.stall_since_ns = 0;
+            simple_mtx_unlock(&sem->feedback.counter_mtx);
+            counter = MAX2(counter, tmp);
+         }
       }
 
       *out_value = counter;
