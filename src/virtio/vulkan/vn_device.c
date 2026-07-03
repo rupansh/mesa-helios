@@ -332,6 +332,17 @@ vn_device_fix_create_info(const struct vn_device *dev,
       extra_exts[extra_count++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
    }
 
+#if DETECT_OS_WINDOWS
+   if (app_exts->KHR_external_semaphore_win32) {
+      /* This is implemented by the Windows Venus frontend with D3DKMT sync
+       * objects.  The Linux virglrenderer/Venus renderer does not advertise
+       * the Win32 device extension and must only receive the renderer-side
+       * semaphore extension names it actually supports.
+       */
+      block_exts[block_count++] = VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME;
+   }
+#endif
+
    /* see vn_cmd_set_external_acquire_unmodified */
    if (VN_PRESENT_SRC_INTERNAL_LAYOUT != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
        renderer_exts->EXT_external_memory_acquire_unmodified &&

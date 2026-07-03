@@ -145,22 +145,21 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
                               struct vn_device_memory *mem,
                               const VkMemoryAllocateInfo *alloc_info)
 {
+   /* ALWAYS synchronous on this transport (matches upstream's
+    * VN_PERF=no_async_mem_alloc semantics; mirrors import_resource_id and
+    * alloc_export, which were already made sync). Upstream's async path
+    * assumes host vkAllocateMemory cannot fail; on this stack it can
+    * (external-handle rules, udmabuf limits, host driver changes). An
+    * unconfirmed alloc lets the guest emit vkBindImageMemory2/vkFreeMemory
+    * against a host object that does not exist, and vkr treats
+    * phantom-object commands as fatal decoder state — the whole venus
+    * context of the process dies ("failed to look up object N of type 8").
+    * The async branch is deleted, not gated, so it cannot regress.
+    */
    VkDevice dev_handle = vn_device_to_handle(dev);
    VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
-   if (VN_PERF(NO_ASYNC_MEM_ALLOC)) {
-      return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
-                                      alloc_info, NULL, &mem_handle);
-   }
-
-   struct vn_ring_submit_command ring_submit;
-   vn_submit_vkAllocateMemory(dev->primary_ring, 0, dev_handle, alloc_info,
-                              NULL, &mem_handle, &ring_submit);
-   if (!ring_submit.ring_seqno_valid)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-   mem->bo_ring_seqno_valid = true;
-   mem->bo_ring_seqno = ring_submit.ring_seqno;
-   return VK_SUCCESS;
+   return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle, alloc_info,
+                                   NULL, &mem_handle);
 }
 
 static inline void
@@ -236,6 +235,54 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
    vn_renderer_bo_release_resource(dev->renderer, mem->base_bo);
    vn_renderer_bo_unref(dev->renderer, mem->base_bo);
    mem->base_bo = NULL;
+}
+
+static VkResult
+vn_device_memory_import_resource_id(struct vn_device *dev,
+                                    struct vn_device_memory *mem,
+                                    const VkMemoryAllocateInfo *alloc_info,
+                                    const VkImportMemoryResourceInfoMESA *import_info)
+{
+   if (!import_info->resourceId)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   const struct vk_device_memory *mem_vk = &mem->base.vk;
+   const VkMemoryType *mem_type = &dev->physical_device->memory_properties
+                                      .memoryTypes[mem_vk->memory_type_index];
+
+   VkResult result = vn_renderer_bo_create_from_resource_id(
+      dev->renderer, mem_vk->size, import_info->resourceId,
+      mem_type->propertyFlags, &mem->base_bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const VkMemoryAllocateInfo memory_allocate_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = alloc_info->pNext,
+      .allocationSize = alloc_info->allocationSize,
+      .memoryTypeIndex = alloc_info->memoryTypeIndex,
+   };
+
+   vn_ring_roundtrip(dev->primary_ring);
+
+   /* Synchronous on purpose: a host-side import failure must surface here as
+    * a clean VkResult. The async path returns VK_SUCCESS optimistically; the
+    * caller then binds an image to a memory object the host never created,
+    * which poisons the ring ("failed to look up object of type 8" ->
+    * vkBindImageMemory2 CS error -> fatal decoder state) and kills the whole
+    * venus context (observed live with DWM opening Helios KMD allocations).
+    */
+   VkDevice dev_handle = vn_device_to_handle(dev);
+   VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
+   result = vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+                                     &memory_allocate_info, NULL, &mem_handle);
+   if (result != VK_SUCCESS) {
+      vn_renderer_bo_unref(dev->renderer, mem->base_bo);
+      mem->base_bo = NULL;
+      return result;
+   }
+
+   return VK_SUCCESS;
 }
 
 VkResult
@@ -335,7 +382,21 @@ vn_device_memory_alloc_export(struct vn_device *dev,
                               struct vn_device_memory *mem,
                               const VkMemoryAllocateInfo *alloc_info)
 {
-   VkResult result = vn_device_memory_alloc_simple(dev, mem, alloc_info);
+   /* Synchronous on purpose (mirrors vn_device_memory_import_resource_id): a
+    * host-side failure of an EXPORT allocation must surface here as a clean
+    * VkResult. The async path returns VK_SUCCESS optimistically; when the
+    * host allocation actually failed (observed with DWM shared-surface
+    * export allocs on the NVIDIA render server), the subsequent blob create
+    * silently EPERMs (vkr_context_create_resource_from_device_memory cannot
+    * find the object) and the cleanup below then sends vkFreeMemory for an
+    * object the host never created — "failed to look up object N of type 8"
+    * → CS error → fatal decoder state → the whole venus context dies and
+    * takes DWM down with it (0xc0000409 crash-loop, ~4 min cadence).
+    */
+   VkDevice dev_handle = vn_device_to_handle(dev);
+   VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
+   VkResult result = vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+                                              alloc_info, NULL, &mem_handle);
    if (result != VK_SUCCESS)
       return result;
 
@@ -502,10 +563,17 @@ vn_AllocateMemory(VkDevice device,
 
    const VkImportMemoryFdInfoKHR *import_fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkImportMemoryResourceInfoMESA *import_resource_info =
+      (const VkImportMemoryResourceInfoMESA *)__vk_find_struct(
+         (void *)pAllocateInfo->pNext,
+         VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
 
    VkResult result;
    if (mem->base.vk.ahardware_buffer) {
       result = vn_android_device_import_ahb(dev, mem, pAllocateInfo);
+   } else if (import_resource_info) {
+      result = vn_device_memory_import_resource_id(dev, mem, pAllocateInfo,
+                                                   import_resource_info);
    } else if (import_fd_info) {
       result = vn_device_memory_import_dma_buf(dev, mem, pAllocateInfo,
                                                import_fd_info->fd);

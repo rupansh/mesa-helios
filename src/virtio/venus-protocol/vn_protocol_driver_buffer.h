@@ -390,6 +390,9 @@ vn_encode_VkBindBufferMemoryDeviceGroupInfo(struct vn_cs_encoder *enc, const VkB
 static inline size_t
 vn_sizeof_VkBindBufferMemoryInfo_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -417,6 +420,7 @@ vn_sizeof_VkBindBufferMemoryInfo_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -445,6 +449,9 @@ vn_sizeof_VkBindBufferMemoryInfo(const VkBindBufferMemoryInfo *val)
 static inline void
 vn_encode_VkBindBufferMemoryInfo_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -471,6 +478,7 @@ vn_encode_VkBindBufferMemoryInfo_pnext(struct vn_cs_encoder *enc, const void *va
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void

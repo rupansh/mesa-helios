@@ -1301,14 +1301,22 @@ static inline void vn_submit_vkQueueBindSparse(struct vn_ring *vn_ring, VkComman
     uint8_t local_cmd_data[VN_SUBMIT_LOCAL_CMD_SIZE];
     void *cmd_data = local_cmd_data;
     size_t cmd_size = vn_sizeof_vkQueueBindSparse(queue, bindInfoCount, pBindInfo, fence);
-    if (cmd_size > sizeof(local_cmd_data)) {
-        cmd_data = malloc(cmd_size);
+    /* Helios: DWM/DXVK can hit the sparse-bind path where Venus' generated
+     * sizeof helper undercounts an internally rebuilt pNext chain.  Pointer
+     * backed command encoders cannot grow and abort on overflow, so reserve
+     * slack here while the actual submitted length still comes from enc->cur.
+     */
+    size_t cmd_alloc_size = cmd_size ? cmd_size + 4096 : 0;
+    if (cmd_alloc_size > sizeof(local_cmd_data)) {
+        cmd_data = malloc(cmd_alloc_size);
         if (!cmd_data)
             cmd_size = 0;
+    } else {
+        cmd_alloc_size = sizeof(local_cmd_data);
     }
     const size_t reply_size = cmd_flags & VK_COMMAND_GENERATE_REPLY_BIT_EXT ? vn_sizeof_vkQueueBindSparse_reply(queue, bindInfoCount, pBindInfo, fence) : 0;
 
-    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_size, reply_size);
+    struct vn_cs_encoder *enc = vn_ring_submit_command_init(vn_ring, submit, cmd_data, cmd_alloc_size, reply_size);
     if (cmd_size) {
         vn_encode_vkQueueBindSparse(enc, cmd_flags, queue, bindInfoCount, pBindInfo, fence);
         vn_ring_submit_command(vn_ring, submit);

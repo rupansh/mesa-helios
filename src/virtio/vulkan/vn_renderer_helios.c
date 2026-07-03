@@ -40,9 +40,12 @@
 #include <stdio.h> /* Phase-7 gate res_id surfacing (throwaway) */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <stdarg.h>
 #include <wchar.h> /* wcsstr — adapter description match in helios_open_d3dkmt */
 
 #include "vn_renderer_internal.h"
+#include "vn_device_memory.h"
 
 #include "util/cache_ops.h"
 
@@ -60,6 +63,15 @@
 typedef LONG NTSTATUS, *PNTSTATUS;
 #endif
 #include <d3dkmthk.h>
+
+struct _OBJECT_ATTRIBUTES {
+   ULONG Length;
+   HANDLE RootDirectory;
+   PVOID ObjectName;
+   ULONG Attributes;
+   PVOID SecurityDescriptor;
+   PVOID SecurityQualityOfService;
+};
 
 /* ── Helios IOCTL codes (protocol/src/ioctl.rs) ────────────────────────────── */
 /* Retained only for the not-yet-ported verbs that still route through the
@@ -85,6 +97,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #define HELIOS_ESCAPE_MAP_BLOB     0x0005u
 #define HELIOS_ESCAPE_WAIT_FENCE   0x0006u
 #define HELIOS_ESCAPE_RELEASE_BLOB 0x0008u
+#define HELIOS_ESCAPE_ATTACH_RESOURCE 0x0009u
 
 #define HELIOS_MAP_CACHE_CACHED    0x00000001u
 #define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
@@ -94,6 +107,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #define VIRTIO_GPU_CAPSET_VENUS          4u
 #define VIRTIO_GPU_BLOB_MEM_HOST3D       2u
 #define VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE 1u
+#define VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE 2u
 
 struct helios_escape_header {
    uint32_t magic;    /* == HELIOS_ESCAPE_MAGIC */
@@ -148,6 +162,12 @@ struct helios_escape_release_blob {
    uint32_t padding;
 };
 
+struct helios_escape_attach_resource {
+   struct helios_escape_header hdr;
+   uint32_t ctx_id;
+   uint32_t resource_id;
+};
+
 struct helios_escape_wait_fence {
    struct helios_escape_header hdr;
    uint64_t fence_id;
@@ -162,6 +182,7 @@ _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
+_Static_assert(sizeof(struct helios_escape_attach_resource) == 24, "attach_resource size");
 _Static_assert(sizeof(struct helios_escape_wait_fence) == 32, "wait_fence size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
@@ -197,6 +218,9 @@ struct helios_sync {
    uint64_t val;
    uint32_t pending_count;
    struct helios_sync_pending pending[HELIOS_SYNC_PENDING_MAX];
+   D3DKMT_HANDLE wddm_local;
+   D3DKMT_HANDLE wddm_global;
+   void *wddm_cpu_va;
 };
 
 enum helios_ioctl_stat {
@@ -275,6 +299,449 @@ struct helios {
 
 static struct helios *helios_perf_at_exit_renderer;
 static bool helios_perf_at_exit_registered;
+static uint32_t helios_current_ctx_id;
+
+/* Open a diag log under C:\ProgramData\Helios. The restricted IddCx host
+ * process (which loads this ICD via DXVK to open the IDD swapchain surface)
+ * cannot write C:\Windows\Temp, so its ICD diag lines vanished. ProgramData is
+ * standard-user writable. Best effort: returns NULL on failure. */
+static FILE *
+helios_diag_fopen(const char *name)
+{
+   static bool dir_made = false;
+   if (!dir_made) {
+      CreateDirectoryA("C:\\ProgramData\\Helios", NULL);
+      dir_made = true;
+   }
+   char path[MAX_PATH];
+   snprintf(path, sizeof(path), "C:\\ProgramData\\Helios\\%s", name);
+   return fopen(path, "a");
+}
+
+static void
+helios_diag(const char *fmt, ...)
+{
+   FILE *f = helios_diag_fopen("helios_icd_diag.log");
+   if (!f)
+      return;
+
+   fprintf(f, "%lld pid=%lu ", (long long)time(NULL),
+           (unsigned long)GetCurrentProcessId());
+   va_list ap;
+   va_start(ap, fmt);
+   vfprintf(f, fmt, ap);
+   va_end(ap);
+   fputc('\n', f);
+   fclose(f);
+}
+
+__declspec(dllexport) uint32_t helios_venus_current_ctx_id(void);
+__declspec(dllexport) uint64_t helios_venus_memory_id(VkDeviceMemory memory);
+__declspec(dllexport) uint32_t helios_venus_memory_res_id(VkDeviceMemory memory);
+__declspec(dllexport) uint32_t helios_venus_memory_transfer_resource_ownership(VkDeviceMemory memory);
+
+__declspec(dllexport) uint32_t
+helios_venus_current_ctx_id(void)
+{
+   return helios_current_ctx_id;
+}
+
+__declspec(dllexport) uint64_t
+helios_venus_memory_id(VkDeviceMemory memory)
+{
+   if (memory == VK_NULL_HANDLE)
+      return 0;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   return mem->base.id;
+}
+
+__declspec(dllexport) uint32_t
+helios_venus_memory_res_id(VkDeviceMemory memory)
+{
+   if (memory == VK_NULL_HANDLE)
+      return 0;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   return mem->base_bo ? mem->base_bo->res_id : 0;
+}
+
+__declspec(dllexport) uint32_t
+helios_venus_memory_transfer_resource_ownership(VkDeviceMemory memory)
+{
+   if (memory == VK_NULL_HANDLE)
+      return 0;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   if (!mem->base_bo || !mem->base_bo->res_id)
+      return 0;
+
+   struct helios_bo *bo = (struct helios_bo *)mem->base_bo;
+   bo->resource_released = true;
+   helios_diag("memory_transfer_resource_ownership mem=%p res=%u ctx=%u",
+               (void *)mem, mem->base_bo->res_id, bo->ctx_id);
+   return mem->base_bo->res_id;
+}
+
+static VkResult
+helios_wddm_sync_create(struct vn_renderer *renderer,
+                        uint64_t initial_val,
+                        bool nt_shared,
+                        D3DKMT_HANDLE *out_local,
+                        D3DKMT_HANDLE *out_global,
+                        void **out_cpu_va)
+{
+   struct helios *helios = (struct helios *)renderer;
+
+   if (!helios->device)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create;
+   memset(&create, 0, sizeof(create));
+   create.hDevice = helios->device;
+   /*
+    * WDDM-sync-redesign M1: the adapter is now raised to WDDM 3.2 + GpuMmu (GPU
+    * virtual addressing), so dxgkrnl should accept D3DDDI_MONITORED_FENCE — which
+    * exposes a CPU-readable fence-value VA + a GPU VA, the basis for a real
+    * cross-process completion fence (CPU signal/wait verbs + a host VkSemaphore).
+    * Try a monitored fence first; fall back to the legacy D3DDDI_FENCE (no CPU VA)
+    * if the adapter still rejects it, so the stack keeps working either way.
+    */
+   create.Info.Type = D3DDDI_MONITORED_FENCE;
+   create.Info.Flags.Shared = nt_shared ? 1 : 0;
+   create.Info.Flags.NtSecuritySharing = nt_shared ? 1 : 0;
+   create.Info.MonitoredFence.InitialFenceValue = initial_val;
+
+   NTSTATUS st = D3DKMTCreateSynchronizationObject2(&create);
+   if (st == 0) {
+      *out_local = create.hSyncObject;
+      *out_global = create.Info.SharedHandle;
+      if (out_cpu_va)
+         *out_cpu_va = create.Info.MonitoredFence.FenceValueCPUVirtualAddress;
+      helios_diag(
+         "sync_create ok MONITORED-fence local=0x%x shared=0x%x nt=%u initial=%llu cpuva=%p gpuva=0x%llx",
+         (unsigned)*out_local, (unsigned)*out_global, nt_shared ? 1u : 0u,
+         (unsigned long long)initial_val,
+         create.Info.MonitoredFence.FenceValueCPUVirtualAddress,
+         (unsigned long long)create.Info.MonitoredFence.FenceValueGPUVirtualAddress);
+      return VK_SUCCESS;
+   }
+   helios_diag("sync_create MONITORED rejected status=0x%08x nt=%u; falling back to legacy fence",
+               (unsigned)st, nt_shared ? 1u : 0u);
+
+   memset(&create, 0, sizeof(create));
+   create.hDevice = helios->device;
+   create.Info.Type = D3DDDI_FENCE;
+   create.Info.Flags.Shared = nt_shared ? 1 : 0;
+   create.Info.Flags.NtSecuritySharing = nt_shared ? 1 : 0;
+   create.Info.Fence.FenceValue = initial_val;
+
+   st = D3DKMTCreateSynchronizationObject2(&create);
+   if (st != 0) {
+      helios_diag("sync_create failed status=0x%08x nt=%u initial=%llu dev=0x%x",
+                  (unsigned)st, nt_shared ? 1u : 0u,
+                  (unsigned long long)initial_val, (unsigned)helios->device);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   *out_local = create.hSyncObject;
+   *out_global = create.Info.SharedHandle;
+   if (out_cpu_va)
+      *out_cpu_va = NULL;
+   helios_diag("sync_create ok legacy-fence local=0x%x shared=0x%x nt=%u initial=%llu",
+               (unsigned)*out_local, (unsigned)*out_global, nt_shared ? 1u : 0u,
+               (unsigned long long)initial_val);
+   return VK_SUCCESS;
+}
+
+static VkResult
+helios_wddm_sync_open_kmt(struct vn_renderer *renderer,
+                          D3DKMT_HANDLE global,
+                          D3DKMT_HANDLE *out_local,
+                          void **out_cpu_va)
+{
+   UNUSED struct helios *helios = (struct helios *)renderer;
+
+   D3DKMT_OPENSYNCHRONIZATIONOBJECT open;
+   memset(&open, 0, sizeof(open));
+   open.hSharedHandle = global;
+
+   const NTSTATUS st = D3DKMTOpenSynchronizationObject(&open);
+   if (st != 0) {
+      helios_diag("sync_open_kmt failed status=0x%08x global=0x%x",
+                  (unsigned)st, (unsigned)global);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   *out_local = open.hSyncObject;
+   if (out_cpu_va)
+      *out_cpu_va = NULL;
+   return VK_SUCCESS;
+}
+
+static VkResult
+helios_wddm_sync_open_nt(struct vn_renderer *renderer,
+                         void *nt_handle,
+                         D3DKMT_HANDLE *out_local,
+                         void **out_cpu_va)
+{
+   struct helios *helios = (struct helios *)renderer;
+
+   D3DKMT_OPENSYNCOBJECTFROMNTHANDLE2 open2;
+   memset(&open2, 0, sizeof(open2));
+   open2.hNtHandle = nt_handle;
+   open2.hDevice = helios->device;
+
+   NTSTATUS st = D3DKMTOpenSyncObjectFromNtHandle2(&open2);
+   if (st == 0) {
+      *out_local = open2.hSyncObject;
+      if (out_cpu_va)
+         *out_cpu_va = open2.MonitoredFence.FenceValueCPUVirtualAddress;
+      helios_diag("sync_open_nt2 ok local=0x%x handle=%p dev=0x%x cpu_va=%p gpu_va=0x%llx",
+                  (unsigned)*out_local, nt_handle, (unsigned)helios->device,
+                  open2.MonitoredFence.FenceValueCPUVirtualAddress,
+                  (unsigned long long)open2.MonitoredFence.FenceValueGPUVirtualAddress);
+      return VK_SUCCESS;
+   }
+
+   D3DKMT_OPENSYNCOBJECTFROMNTHANDLE open;
+   memset(&open, 0, sizeof(open));
+   open.hNtHandle = nt_handle;
+   st = D3DKMTOpenSyncObjectFromNtHandle(&open);
+   if (st != 0) {
+      helios_diag("sync_open_nt failed status=0x%08x handle=%p dev=0x%x",
+                  (unsigned)st, nt_handle, (unsigned)helios->device);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   *out_local = open.hSyncObject;
+   if (out_cpu_va)
+      *out_cpu_va = NULL;
+   return VK_SUCCESS;
+}
+
+static VkResult
+helios_wddm_sync_share_nt(struct vn_renderer *renderer,
+                          D3DKMT_HANDLE local,
+                          void **out_handle)
+{
+   UNUSED struct helios *helios = (struct helios *)renderer;
+   HANDLE handle = NULL;
+   D3DKMT_HANDLE object = local;
+   OBJECT_ATTRIBUTES attr;
+   memset(&attr, 0, sizeof(attr));
+   attr.Length = sizeof(attr);
+
+   const NTSTATUS st =
+      D3DKMTShareObjects(1, &object, &attr, GENERIC_ALL, &handle);
+   if (st != 0) {
+      helios_diag("sync_share_nt failed status=0x%08x local=0x%x",
+                  (unsigned)st, (unsigned)local);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   *out_handle = handle;
+   return VK_SUCCESS;
+}
+
+static void
+helios_wddm_sync_destroy(UNUSED struct vn_renderer *renderer,
+                         D3DKMT_HANDLE local)
+{
+   if (!local)
+      return;
+
+   D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy;
+   memset(&destroy, 0, sizeof(destroy));
+   destroy.hSyncObject = local;
+   (void)D3DKMTDestroySynchronizationObject(&destroy);
+}
+
+static VkResult
+helios_wddm_sync_signal(struct vn_renderer *renderer,
+                        D3DKMT_HANDLE local,
+                        uint64_t value)
+{
+   struct helios *helios = (struct helios *)renderer;
+   D3DKMT_HANDLE object = local;
+   UINT64 fence_value = value;
+
+   D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU cpu_signal;
+   memset(&cpu_signal, 0, sizeof(cpu_signal));
+   cpu_signal.hDevice = helios->device;
+   cpu_signal.ObjectCount = 1;
+   cpu_signal.ObjectHandleArray = &object;
+   cpu_signal.FenceValueArray = &fence_value;
+
+   NTSTATUS st = D3DKMTSignalSynchronizationObjectFromCpu(&cpu_signal);
+   if (st == 0)
+      return VK_SUCCESS;
+
+   D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signal;
+   memset(&signal, 0, sizeof(signal));
+   signal.hContext = helios->context;
+   signal.ObjectCount = 1;
+   signal.ObjectHandleArray[0] = object;
+   signal.Fence.FenceValue = fence_value;
+
+   st = D3DKMTSignalSynchronizationObject2(&signal);
+   if (st != 0) {
+      helios_diag("sync_signal failed status=0x%08x local=0x%x value=%llu dev=0x%x",
+                  (unsigned)st, (unsigned)local,
+                  (unsigned long long)value, (unsigned)helios->device);
+      return VK_ERROR_DEVICE_LOST;
+   }
+
+   return VK_SUCCESS;
+}
+
+static DWORD
+helios_timeout_ns_to_ms(uint64_t timeout)
+{
+   const uint64_t ns_per_ms = 1000ull * 1000ull;
+   const uint64_t ms = timeout / ns_per_ms +
+                       ((timeout % ns_per_ms) ? 1ull : 0ull);
+
+   if (ms >= INFINITE)
+      return INFINITE - 1;
+   return (DWORD)ms;
+}
+
+static VkResult
+helios_wddm_sync_wait(struct vn_renderer *renderer,
+                      D3DKMT_HANDLE local,
+                      uint64_t value,
+                      uint64_t timeout)
+{
+   struct helios *helios = (struct helios *)renderer;
+   D3DKMT_HANDLE object = local;
+   UINT64 fence_value = value;
+
+   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU cpu_wait;
+   memset(&cpu_wait, 0, sizeof(cpu_wait));
+   cpu_wait.hDevice = helios->device;
+   cpu_wait.ObjectCount = 1;
+   cpu_wait.ObjectHandleArray = &object;
+   cpu_wait.FenceValueArray = &fence_value;
+
+   if (timeout == UINT64_MAX) {
+      const NTSTATUS cpu_st = D3DKMTWaitForSynchronizationObjectFromCpu(&cpu_wait);
+      if (cpu_st == 0)
+         return VK_SUCCESS;
+
+      D3DKMT_WAITFORSYNCHRONIZATIONOBJECT2 wait2;
+      memset(&wait2, 0, sizeof(wait2));
+      wait2.hContext = helios->context;
+      wait2.ObjectCount = 1;
+      wait2.ObjectHandleArray[0] = object;
+      wait2.Fence.FenceValue = fence_value;
+
+      const NTSTATUS st = D3DKMTWaitForSynchronizationObject2(&wait2);
+      if (st != 0) {
+         helios_diag("sync_wait2 failed status=0x%08x local=0x%x value=%llu dev=0x%x ctx=0x%x",
+                     (unsigned)st, (unsigned)local,
+                     (unsigned long long)value, (unsigned)helios->device,
+                     (unsigned)helios->context);
+         return VK_TIMEOUT;
+      }
+
+      return VK_SUCCESS;
+   }
+
+   HANDLE event = CreateEventW(NULL, TRUE, FALSE, NULL);
+   if (!event)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   cpu_wait.hAsyncEvent = event;
+   const NTSTATUS cpu_st = D3DKMTWaitForSynchronizationObjectFromCpu(&cpu_wait);
+   if (cpu_st != 0) {
+      CloseHandle(event);
+      return VK_TIMEOUT;
+   }
+
+   const DWORD wait_ms = helios_timeout_ns_to_ms(timeout);
+   const DWORD wr = WaitForSingleObject(event, wait_ms);
+   CloseHandle(event);
+
+   return wr == WAIT_OBJECT_0 ? VK_SUCCESS : VK_TIMEOUT;
+}
+
+static void
+helios_trace_shmem(const char *event,
+                   D3DKMT_HANDLE device,
+                   D3DKMT_HANDLE context,
+                   uint32_t ctx_id,
+                   uint32_t res_id,
+                   uint64_t size,
+                   uint64_t user_va)
+{
+   FILE *f = helios_diag_fopen("helios_icd_shmem.log");
+   if (!f)
+      return;
+
+   fprintf(f, "%lld pid=%lu %s dev=0x%x kctx=0x%x ctx=%u res=%u size=%llu va=0x%llx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(), event,
+           (unsigned)device, (unsigned)context,
+           ctx_id, res_id, (unsigned long long)size,
+           (unsigned long long)user_va);
+   fclose(f);
+}
+
+static void
+helios_trace_submit(struct helios *helios,
+                    const void *cs_data,
+                    size_t cs_size,
+                    uint32_t ring_idx,
+                    uint64_t fence_id)
+{
+   FILE *f = helios_diag_fopen("helios_icd_submit.log");
+   if (!f)
+      return;
+
+   const uint32_t *words = (const uint32_t *)cs_data;
+   const uint32_t w0 = cs_size >= 4 ? words[0] : 0;
+   const uint32_t w1 = cs_size >= 8 ? words[1] : 0;
+   const uint32_t w2 = cs_size >= 12 ? words[2] : 0;
+   const uint32_t w3 = cs_size >= 16 ? words[3] : 0;
+   fprintf(f,
+           "%lld pid=%lu submit dev=0x%x kctx=0x%x ctx=%u fence=%llu ring=%u size=%llu words=%08x %08x %08x %08x\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned)helios->device, (unsigned)helios->context, helios->ctx_id,
+           (unsigned long long)fence_id, ring_idx, (unsigned long long)cs_size,
+           w0, w1, w2, w3);
+   fclose(f);
+}
+
+static LONG CALLBACK
+helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
+{
+   if (!ep || !ep->ExceptionRecord || !ep->ContextRecord ||
+       ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+      return EXCEPTION_CONTINUE_SEARCH;
+
+   FILE *f = helios_diag_fopen("helios_icd_av.log");
+   if (!f)
+      return EXCEPTION_CONTINUE_SEARCH;
+
+   const ULONG_PTR fault =
+      ep->ExceptionRecord->NumberParameters >= 2
+         ? ep->ExceptionRecord->ExceptionInformation[1]
+         : 0;
+   CONTEXT *c = ep->ContextRecord;
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=0x%llx fault=0x%llx "
+           "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
+           "rsi=0x%llx rdi=0x%llx r8=0x%llx r9=0x%llx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           (unsigned long long)c->Rip, (unsigned long long)fault,
+           (unsigned long long)c->Rax, (unsigned long long)c->Rbx,
+           (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+           (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+           (unsigned long long)c->R8, (unsigned long long)c->R9);
+   fclose(f);
+   return EXCEPTION_CONTINUE_SEARCH;
+}
 
 static void helios_perf_write(struct helios *helios, bool final);
 static bool helios_ioctl_wait_fence(struct helios *helios,
@@ -366,14 +833,18 @@ helios_ioctl(struct helios *helios,
 static bool
 helios_escape(struct helios *helios, void *buf, uint32_t size)
 {
-   if (!helios->adapter)
+   if (!helios->adapter) {
+      helios_diag("escape skipped: no adapter size=%u", size);
       return false;
+   }
 
    D3DKMT_ESCAPE esc;
    memset(&esc, 0, sizeof(esc));
    esc.hAdapter = helios->adapter; /* KMD escape is adapter-scoped (design §8.3) */
    esc.hDevice = helios->device;   /* pass the device too (some OS builds require it) */
+   esc.hContext = helios->context;
    esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
+   esc.Flags.HardwareAccess = 1;
    esc.pPrivateDriverData = buf;
    esc.PrivateDriverDataSize = size;
 
@@ -381,6 +852,9 @@ helios_escape(struct helios *helios, void *buf, uint32_t size)
    if (st != 0) {
       vn_log(helios->instance, "Helios D3DKMTEscape failed: status 0x%08x",
              (unsigned)st);
+      helios_diag("D3DKMTEscape failed status=0x%08x adapter=0x%x device=0x%x size=%u",
+                  (unsigned)st, (unsigned)helios->adapter,
+                  (unsigned)helios->device, size);
       fprintf(stderr, "HELIOS[gate5a]: D3DKMTEscape status=0x%08x (adapter=0x%x device=0x%x size=%u)\n",
               (unsigned)st, (unsigned)helios->adapter, (unsigned)helios->device, size);
       return false;
@@ -412,6 +886,92 @@ helios_ioctl_ctx_destroy(struct helios *helios, uint32_t ctx_id)
    helios_escape(helios, &req, sizeof(req));
 }
 
+static void
+helios_close_d3dkmt_handles(D3DKMT_HANDLE adapter,
+                            D3DKMT_HANDLE device,
+                            D3DKMT_HANDLE context)
+{
+   if (context) {
+      D3DKMT_DESTROYCONTEXT dc;
+      memset(&dc, 0, sizeof(dc));
+      dc.hContext = context;
+      (void)D3DKMTDestroyContext(&dc);
+   }
+   if (device) {
+      D3DKMT_DESTROYDEVICE dd;
+      memset(&dd, 0, sizeof(dd));
+      dd.hDevice = device;
+      (void)D3DKMTDestroyDevice(&dd);
+   }
+   if (adapter) {
+      D3DKMT_CLOSEADAPTER ca;
+      memset(&ca, 0, sizeof(ca));
+      ca.hAdapter = adapter;
+      (void)D3DKMTCloseAdapter(&ca);
+   }
+}
+
+static bool
+helios_probe_d3dkmt_adapter(struct helios *helios,
+                            D3DKMT_HANDLE adapter,
+                            D3DKMT_HANDLE *out_device,
+                            D3DKMT_HANDLE *out_context)
+{
+   struct vn_instance *instance = helios->instance;
+   D3DKMT_HANDLE old_adapter = helios->adapter;
+   D3DKMT_HANDLE old_device = helios->device;
+   D3DKMT_HANDLE old_context = helios->context;
+
+   *out_device = 0;
+   *out_context = 0;
+
+   D3DKMT_CREATEDEVICE cd;
+   memset(&cd, 0, sizeof(cd));
+   cd.hAdapter = adapter;
+   NTSTATUS st = D3DKMTCreateDevice(&cd);
+   helios_diag("probe D3DKMTCreateDevice adapter=0x%x status=0x%08x hDevice=0x%x",
+               (unsigned)adapter, (unsigned)st, (unsigned)cd.hDevice);
+   if (st != 0) {
+      vn_log(instance, "D3DKMTCreateDevice probe failed: status 0x%08x",
+             (unsigned)st);
+      return false;
+   }
+   *out_device = cd.hDevice;
+
+   D3DKMT_CREATECONTEXT cc;
+   memset(&cc, 0, sizeof(cc));
+   cc.hDevice = cd.hDevice;
+   cc.NodeOrdinal = 0;
+   cc.EngineAffinity = 0;
+   st = D3DKMTCreateContext(&cc);
+   helios_diag("probe D3DKMTCreateContext device=0x%x status=0x%08x hContext=0x%x",
+               (unsigned)cd.hDevice, (unsigned)st, (unsigned)cc.hContext);
+   if (st == 0)
+      *out_context = cc.hContext;
+   else
+      vn_log(instance, "D3DKMTCreateContext probe failed: status 0x%08x",
+             (unsigned)st);
+
+   helios->adapter = adapter;
+   helios->device = *out_device;
+   helios->context = *out_context;
+
+   uint32_t probe_ctx_id = 0;
+   const bool ok = helios_ioctl_ctx_create(helios, VIRTIO_GPU_CAPSET_VENUS,
+                                           &probe_ctx_id) &&
+                   probe_ctx_id != 0;
+   helios_diag("probe CTX_CREATE adapter=0x%x device=0x%x context=0x%x ok=%u ctx_id=%u",
+               (unsigned)adapter, (unsigned)*out_device,
+               (unsigned)*out_context, ok ? 1u : 0u, probe_ctx_id);
+   if (ok)
+      helios_ioctl_ctx_destroy(helios, probe_ctx_id);
+
+   helios->adapter = old_adapter;
+   helios->device = old_device;
+   helios->context = old_context;
+   return ok;
+}
+
 /* SUBMIT_VENUS (METHOD_IN_DIRECT). Caller MUST hold dev_mutex (next_fence_id +
  * ordering). The cs bytes ride lpOutBuffer, which the KMD retrieves via
  * WdfRequestRetrieveOutputBuffer (METHOD_IN_DIRECT read-locks that buffer's MDL)
@@ -437,6 +997,7 @@ helios_ioctl_submit_cs(struct helios *helios,
    hdr.ctx_id = helios->ctx_id;
    hdr.buffer_size = (uint32_t)cs_size;
    hdr.ring_idx = ring_idx;
+   helios_trace_submit(helios, cs_data, cs_size, ring_idx, fence_id);
 
    /* Over D3DKMTEscape the venus stream rides INSIDE the escape buffer, directly
     * after the fixed header (the KMD reads it at buf[sizeof(hdr)..]); there is no
@@ -530,8 +1091,21 @@ helios_ioctl_release_blob(struct helios *helios, uint32_t ctx_id, uint32_t resou
    helios_escape(helios, &req, sizeof(req));
 }
 
+static bool
+helios_ioctl_attach_resource(struct helios *helios, uint32_t ctx_id, uint32_t resource_id)
+{
+   if (!ctx_id || !resource_id)
+      return false;
+
+   struct helios_escape_attach_resource req = { 0 };
+   helios_hdr_init(&req.hdr, HELIOS_ESCAPE_ATTACH_RESOURCE, sizeof(req));
+   req.ctx_id = ctx_id;
+   req.resource_id = resource_id;
+   return helios_escape(helios, &req, sizeof(req));
+}
+
 static void
-helios_sync_retire_locked(struct helios_sync *sync)
+helios_sync_retire_locked(struct vn_renderer *renderer, struct helios_sync *sync)
 {
    uint32_t n = 0;
    while (n < sync->pending_count && sync->pending[n].complete)
@@ -541,8 +1115,11 @@ helios_sync_retire_locked(struct helios_sync *sync)
       return;
 
    const uint64_t val = sync->pending[n - 1].val;
-   if (sync->val < val)
+   if (sync->val < val) {
       sync->val = val;
+      if (sync->wddm_local)
+         (void)helios_wddm_sync_signal(renderer, sync->wddm_local, sync->val);
+   }
 
    sync->pending_count -= n;
    if (sync->pending_count) {
@@ -552,11 +1129,18 @@ helios_sync_retire_locked(struct helios_sync *sync)
 }
 
 static bool
-helios_sync_append_locked(struct helios_sync *sync, uint64_t val, uint64_t fence_id)
+helios_sync_append_locked(struct vn_renderer *renderer,
+                          struct helios_sync *sync,
+                          uint64_t val,
+                          uint64_t fence_id)
 {
    if (!fence_id) {
-      if (sync->val < val)
+      if (sync->val < val) {
          sync->val = val;
+         if (sync->wddm_local)
+            (void)helios_wddm_sync_signal(renderer, sync->wddm_local,
+                                          sync->val);
+      }
       sync->pending_count = 0;
       return true;
    }
@@ -573,13 +1157,15 @@ helios_sync_append_locked(struct helios_sync *sync, uint64_t val, uint64_t fence
 }
 
 static void
-helios_sync_mark_fence_locked(struct helios_sync *sync, uint64_t fence_id)
+helios_sync_mark_fence_locked(struct vn_renderer *renderer,
+                              struct helios_sync *sync,
+                              uint64_t fence_id)
 {
    for (uint32_t i = 0; i < sync->pending_count; i++) {
       if (sync->pending[i].fence_id == fence_id)
          sync->pending[i].complete = true;
    }
-   helios_sync_retire_locked(sync);
+   helios_sync_retire_locked(renderer, sync);
 }
 
 static bool
@@ -706,11 +1292,14 @@ static bool
 helios_open_d3dkmt(struct helios *helios)
 {
    struct vn_instance *instance = helios->instance;
+   helios_diag("helios_open_d3dkmt enter");
 
    D3DKMT_ENUMADAPTERS2 ea;
    memset(&ea, 0, sizeof(ea));
    /* First call with NULL pAdapters returns the adapter count. */
    NTSTATUS st = D3DKMTEnumAdapters2(&ea);
+   helios_diag("D3DKMTEnumAdapters2 count status=0x%08x count=%u",
+               (unsigned)st, (unsigned)ea.NumAdapters);
    if (st != 0 || ea.NumAdapters == 0) {
       vn_log(instance, "D3DKMTEnumAdapters2 count failed: status 0x%08x count %u",
              (unsigned)st, (unsigned)ea.NumAdapters);
@@ -720,13 +1309,17 @@ helios_open_d3dkmt(struct helios *helios)
    if (!ea.pAdapters)
       return false;
    st = D3DKMTEnumAdapters2(&ea);
+   helios_diag("D3DKMTEnumAdapters2 list status=0x%08x count=%u",
+               (unsigned)st, (unsigned)ea.NumAdapters);
    if (st != 0) {
       vn_log(instance, "D3DKMTEnumAdapters2 failed: status 0x%08x", (unsigned)st);
       free(ea.pAdapters);
       return false;
    }
 
-   D3DKMT_HANDLE chosen = 0;
+   D3DKMT_HANDLE chosen_adapter = 0;
+   D3DKMT_HANDLE chosen_device = 0;
+   D3DKMT_HANDLE chosen_context = 0;
    LUID chosen_luid = { 0 };
    for (UINT i = 0; i < ea.NumAdapters; i++) {
       const D3DKMT_HANDLE h = ea.pAdapters[i].hAdapter;
@@ -740,58 +1333,74 @@ helios_open_d3dkmt(struct helios *helios)
       qai.pPrivateDriverData = &reg;
       qai.PrivateDriverDataSize = sizeof(reg);
 
-      const bool match = chosen == 0 &&
-                         D3DKMTQueryAdapterInfo(&qai) == 0 &&
-                         wcsstr(reg.AdapterString, L"Helios") != NULL;
-      if (match) {
-         chosen = h;
-         chosen_luid = ea.pAdapters[i].AdapterLuid;
-      } else {
+      const NTSTATUS qst = D3DKMTQueryAdapterInfo(&qai);
+      const bool query_ok = qst == 0;
+      const bool virtio_match = query_ok &&
+                                wcsstr(reg.AdapterString, L"VIRTIO GPU") != NULL;
+      const bool helios_match = query_ok &&
+                                wcsstr(reg.AdapterString, L"Helios") != NULL;
+      const bool name_match = helios_match || virtio_match;
+      /* The CTX_CREATE probe is the authoritative Helios discriminator: it runs
+       * the Helios-private D3DKMTEscape handshake that only the Helios KMD
+       * answers (foreign adapters cleanly reject it). The registry AdapterString
+       * query is only a hint and is unreliable on some boots — it has been
+       * observed returning STATUS_OBJECT_NAME_NOT_FOUND (0xc0000034) for every
+       * adapter. So probe name-identified candidates first, and fall back to
+       * probing every adapter when the name query failed; never gate discovery
+       * solely on a fragile registry string. */
+      const bool try_candidate = chosen_adapter == 0 && (name_match || !query_ok);
+      helios_diag("adapter[%u] h=0x%x query=0x%08x name='%ls' match=%u virtio=%u helios=%u try=%u luid=%08lx:%08lx",
+                  i, (unsigned)h, (unsigned)qst,
+                  qst == 0 ? reg.AdapterString : L"<query-failed>",
+                  name_match ? 1u : 0u, virtio_match ? 1u : 0u,
+                  helios_match ? 1u : 0u, try_candidate ? 1u : 0u,
+                  (unsigned long)ea.pAdapters[i].AdapterLuid.HighPart,
+                  (unsigned long)ea.pAdapters[i].AdapterLuid.LowPart);
+
+      if (try_candidate) {
+         D3DKMT_HANDLE device = 0;
+         D3DKMT_HANDLE context = 0;
+         if (helios_probe_d3dkmt_adapter(helios, h, &device, &context)) {
+            chosen_adapter = h;
+            chosen_device = device;
+            chosen_context = context;
+            chosen_luid = ea.pAdapters[i].AdapterLuid;
+            helios_diag("adapter[%u] selected after CTX_CREATE probe", i);
+         } else {
+            helios_diag("adapter[%u] rejected by CTX_CREATE probe", i);
+            helios_close_d3dkmt_handles(h, device, context);
+         }
+      }
+
+      if (h != chosen_adapter) {
          /* Release adapters we won't use (D3DKMTEnumAdapters2 opens each one). */
-         D3DKMT_CLOSEADAPTER ca;
-         memset(&ca, 0, sizeof(ca));
-         ca.hAdapter = h;
-         (void)D3DKMTCloseAdapter(&ca);
+         if (try_candidate) {
+            /* Probe rejection already closed the candidate handle set. */
+         } else {
+            D3DKMT_CLOSEADAPTER ca;
+            memset(&ca, 0, sizeof(ca));
+            ca.hAdapter = h;
+            (void)D3DKMTCloseAdapter(&ca);
+         }
+      } else {
+         helios_diag("adapter[%u] keeping selected handle 0x%x", i, (unsigned)h);
       }
    }
    free(ea.pAdapters);
 
-   if (chosen == 0) {
-      vn_log(instance, "no Helios WDDM adapter found via D3DKMTEnumAdapters2");
+   if (chosen_adapter == 0) {
+      vn_log(instance, "no Helios WDDM adapter passed D3DKMT CTX_CREATE probe");
+      helios_diag("no Helios adapter passed CTX_CREATE probe");
       return false;
    }
-   helios->adapter = chosen;
+   helios->adapter = chosen_adapter;
+   helios->device = chosen_device;
+   helios->context = chosen_context;
    helios->adapter_luid = chosen_luid;
    /* Gate 5a bring-up breadcrumb (stderr): adapter opened by LUID. */
    fprintf(stderr, "HELIOS[gate5a]: opened Helios WDDM adapter hAdapter=0x%x luid=%08lx:%08lx\n",
-           (unsigned)chosen, (unsigned long)chosen_luid.HighPart,
+           (unsigned)chosen_adapter, (unsigned long)chosen_luid.HighPart,
            (unsigned long)chosen_luid.LowPart);
-
-   /* Create a device on the adapter (drives DxgkDdiCreateDevice). The escape
-    * control channel is adapter-scoped and works without this, but Stage 2
-    * allocations need it, so log loudly rather than fail Stage 1 on it. */
-   D3DKMT_CREATEDEVICE cd;
-   memset(&cd, 0, sizeof(cd));
-   cd.hAdapter = chosen;
-   st = D3DKMTCreateDevice(&cd);
-   if (st != 0) {
-      vn_log(instance, "D3DKMTCreateDevice failed: status 0x%08x", (unsigned)st);
-      return true;
-   }
-   helios->device = cd.hDevice;
-
-   /* Create a context (drives DxgkDdiCreateContext) for the eventual
-    * D3DKMTRender submit path. Best-effort for Stage 1. */
-   D3DKMT_CREATECONTEXT cc;
-   memset(&cc, 0, sizeof(cc));
-   cc.hDevice = cd.hDevice;
-   cc.NodeOrdinal = 0;
-   cc.EngineAffinity = 0;
-   st = D3DKMTCreateContext(&cc);
-   if (st != 0)
-      vn_log(instance, "D3DKMTCreateContext failed: status 0x%08x", (unsigned)st);
-   else
-      helios->context = cc.hContext;
 
    fprintf(stderr, "HELIOS[gate5a]: D3DKMT device=0x%x context=0x%x\n",
            (unsigned)helios->device, (unsigned)helios->context);
@@ -831,7 +1440,8 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
 
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
-         if (!helios_sync_append_locked(sync, batch->sync_values[j], fence_id)) {
+         if (!helios_sync_append_locked(renderer, sync, batch->sync_values[j],
+                                        fence_id)) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             break;
          }
@@ -859,7 +1469,12 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    mtx_lock(&helios->dev_mutex);
    bool satisfied = !wait->wait_any; /* wait_all starts true, wait_any starts false */
    for (uint32_t i = 0; i < wait->sync_count; i++) {
-      const struct helios_sync *sync = (const struct helios_sync *)wait->syncs[i];
+      struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+      if (sync->wddm_cpu_va) {
+         const uint64_t wddm_val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+         if (sync->val < wddm_val)
+            sync->val = wddm_val;
+      }
       const bool reached = sync->val >= wait->sync_values[i];
       if (wait->wait_any) {
          satisfied = satisfied || reached;
@@ -900,7 +1515,7 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
             break;
          if (!pending->complete &&
              wait_fence_count < wait_fence_capacity &&
-             !helios_wait_fence_list_contains(wait_fences, wait_fence_count,
+            !helios_wait_fence_list_contains(wait_fences, wait_fence_count,
                                               pending->fence_id))
             wait_fences[wait_fence_count++] = pending->fence_id;
       }
@@ -908,15 +1523,55 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
    mtx_unlock(&helios->dev_mutex);
 
    if (!wait_fence_count) {
-      if (helios->perf.enabled)
+      result = VK_SUCCESS;
+      for (uint32_t i = 0; i < wait->sync_count; i++) {
+         D3DKMT_HANDLE wddm_local = 0;
+         struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
+         mtx_lock(&helios->dev_mutex);
+         if (sync->wddm_cpu_va) {
+            const uint64_t wddm_val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+            if (sync->val < wddm_val)
+               sync->val = wddm_val;
+         }
+         if (sync->val >= wait->sync_values[i]) {
+            mtx_unlock(&helios->dev_mutex);
+            continue;
+         }
+         if (!sync->wddm_local) {
+            mtx_unlock(&helios->dev_mutex);
+            result = VK_TIMEOUT;
+            break;
+         }
+         wddm_local = sync->wddm_local;
+         mtx_unlock(&helios->dev_mutex);
+
+         result = helios_wddm_sync_wait(renderer, wddm_local,
+                                        wait->sync_values[i], wait->timeout);
+         if (result != VK_SUCCESS)
+            break;
+         mtx_lock(&helios->dev_mutex);
+         sync = (struct helios_sync *)wait->syncs[i];
+         if (sync->val < wait->sync_values[i])
+            sync->val = wait->sync_values[i];
+         mtx_unlock(&helios->dev_mutex);
+         if (wait->wait_any)
+            break;
+      }
+      if (result != VK_SUCCESS && helios->perf.enabled) {
+         mtx_lock(&helios->dev_mutex);
          helios->perf.wait_timeout++;
+         mtx_unlock(&helios->dev_mutex);
+      }
       if (wait_fences != stack_wait_fences)
          free(wait_fences);
-      return VK_TIMEOUT; /* nothing identifiable to wait on */
+      return result;
    }
 
-   if (helios->perf.enabled)
+   if (helios->perf.enabled) {
+      mtx_lock(&helios->dev_mutex);
       helios->perf.wait_slow++;
+      mtx_unlock(&helios->dev_mutex);
+   }
 
    for (uint32_t i = 0; i < wait_fence_count; i++) {
       if (!helios_ioctl_wait_fence(helios, wait_fences[i], wait->timeout)) {
@@ -930,12 +1585,14 @@ helios_wait(struct vn_renderer *renderer, const struct vn_renderer_wait *wait)
       for (uint32_t i = 0; i < wait->sync_count; i++) {
          struct helios_sync *sync = (struct helios_sync *)wait->syncs[i];
          for (uint32_t j = 0; j < wait_fence_count; j++) {
-            helios_sync_mark_fence_locked(sync, wait_fences[j]);
+            helios_sync_mark_fence_locked(renderer, sync, wait_fences[j]);
          }
       }
       mtx_unlock(&helios->dev_mutex);
    } else if (helios->perf.enabled) {
+      mtx_lock(&helios->dev_mutex);
       helios->perf.wait_timeout++;
+      mtx_unlock(&helios->dev_mutex);
    }
 
    if (wait_fences != stack_wait_fences)
@@ -956,6 +1613,9 @@ helios_shmem_destroy_now(struct vn_renderer *renderer, struct vn_renderer_shmem 
    mtx_lock(&helios->dev_mutex);
    helios_ioctl_release_blob(helios, hshmem->ctx_id, shmem->res_id);
    mtx_unlock(&helios->dev_mutex);
+   helios_trace_shmem("release", helios->device, helios->context,
+                      hshmem->ctx_id, shmem->res_id, shmem->mmap_size,
+                      (uint64_t)(uintptr_t)shmem->mmap_ptr);
 
    free(shmem); /* base is the first member of struct helios_shmem */
 }
@@ -1000,6 +1660,8 @@ helios_shmem_create(struct vn_renderer *renderer, size_t size)
    if (res_id)
       user_va = helios_ioctl_map_blob(helios, res_id, 0, NULL);
    mtx_unlock(&helios->dev_mutex);
+   helios_trace_shmem("create", helios->device, helios->context, helios->ctx_id,
+                      res_id, size, user_va);
 
    if (!res_id || !user_va) {
       vn_log(helios->instance, "shmem create failed (res_id=%u, mapped=%d)", res_id,
@@ -1046,10 +1708,14 @@ helios_bo_create_from_device_memory(
    if (helios->perf.enabled)
       helios->perf.bo_creates++;
 
-   /* Helios has no external-handle / dma-buf sharing; mappable iff host-visible. */
+   /* Match the virtgpu/vtest Venus renderer contract: external memory must make
+    * the HOST3D blob shareable so virglrenderer can materialize a dma-buf for
+    * scanout/import paths. Mappability remains tied to host-visible memory. */
    uint32_t blob_flags = 0;
    if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
       blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE;
+   if (external_handles)
+      blob_flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
 
    mtx_lock(&helios->dev_mutex);
    /* The optional batch orders the host's vkAllocateMemory before the blob binds
@@ -1071,7 +1737,7 @@ helios_bo_create_from_device_memory(
        * batch's vkAllocateMemory has actually completed on the host. */
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
-         helios_sync_append_locked(sync, batch->sync_values[j], 0);
+         helios_sync_append_locked(renderer, sync, batch->sync_values[j], 0);
       }
    }
 
@@ -1112,6 +1778,52 @@ helios_bo_create_from_device_memory(
    bo->ctx_id = helios->ctx_id;
    bo->blob_flags = blob_flags;
    bo->memory_flags = flags;
+
+   *out_bo = &bo->base;
+   return VK_SUCCESS;
+}
+
+static VkResult
+helios_bo_create_from_resource_id(struct vn_renderer *renderer,
+                                  VkDeviceSize size,
+                                  uint32_t res_id,
+                                  VkMemoryPropertyFlags flags,
+                                  struct vn_renderer_bo **out_bo)
+{
+   struct helios *helios = (struct helios *)renderer;
+
+   if (!res_id)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   mtx_lock(&helios->dev_mutex);
+   const bool attached =
+      helios_ioctl_attach_resource(helios, helios->ctx_id, res_id);
+   mtx_unlock(&helios->dev_mutex);
+
+   if (!attached)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct helios_bo *bo = calloc(1, sizeof(*bo));
+   if (!bo)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   bo->base.refcount = VN_REFCOUNT_INIT(1);
+   bo->base.res_id = res_id;
+   bo->base.mmap_size = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? size : 0;
+   bo->ctx_id = helios->ctx_id;
+   bo->memory_flags = flags;
+   bo->resource_released = true;
+
+   {
+      FILE *f = helios_diag_fopen("helios_icd_diag.log");
+      if (f) {
+         fprintf(f, "%lld pid=%lu import_resource ctx=%u res=%u size=%llu flags=0x%x\n",
+                 (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+                 helios->ctx_id, res_id, (unsigned long long)size,
+                 (unsigned)flags);
+         fclose(f);
+      }
+   }
 
    *out_bo = &bo->base;
    return VK_SUCCESS;
@@ -1247,15 +1959,22 @@ helios_sync_create(struct vn_renderer *renderer,
                    uint32_t flags,
                    struct vn_renderer_sync **out_sync)
 {
-   (void)renderer;
-   (void)flags;
-
    struct helios_sync *sync = calloc(1, sizeof(*sync));
    if (!sync)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    sync->base.sync_id = 0; /* unused: Helios does not carry host sync ids on the wire */
    sync->val = initial_val;
+   if (flags & VN_RENDERER_SYNC_SHAREABLE) {
+      VkResult result =
+         helios_wddm_sync_create(renderer, initial_val, true,
+                                 &sync->wddm_local, &sync->wddm_global,
+                                 &sync->wddm_cpu_va);
+      if (result != VK_SUCCESS) {
+         free(sync);
+         return result;
+      }
+   }
 
    *out_sync = &sync->base;
    return VK_SUCCESS;
@@ -1264,8 +1983,18 @@ helios_sync_create(struct vn_renderer *renderer,
 static void
 helios_sync_destroy(struct vn_renderer *renderer, struct vn_renderer_sync *_sync)
 {
-   (void)renderer;
-   free(_sync);
+   struct helios *helios = (struct helios *)renderer;
+   struct helios_sync *sync = (struct helios_sync *)_sync;
+
+   mtx_lock(&helios->dev_mutex);
+   if (sync->wddm_local)
+      helios_wddm_sync_destroy(renderer, sync->wddm_local);
+   sync->wddm_local = 0;
+   sync->wddm_global = 0;
+   sync->wddm_cpu_va = NULL;
+   mtx_unlock(&helios->dev_mutex);
+
+   free(sync);
 }
 
 static VkResult
@@ -1279,6 +2008,8 @@ helios_sync_reset(struct vn_renderer *renderer,
    mtx_lock(&helios->dev_mutex);
    sync->val = initial_val;
    sync->pending_count = 0;
+   if (sync->wddm_local)
+      (void)helios_wddm_sync_signal(renderer, sync->wddm_local, initial_val);
    mtx_unlock(&helios->dev_mutex);
    return VK_SUCCESS;
 }
@@ -1305,7 +2036,7 @@ helios_sync_read(struct vn_renderer *renderer,
    for (uint32_t i = 0; i < fence_count; i++) {
       if (helios_ioctl_wait_fence(helios, fences[i], 0)) {
          mtx_lock(&helios->dev_mutex);
-         helios_sync_mark_fence_locked(sync, fences[i]);
+         helios_sync_mark_fence_locked(renderer, sync, fences[i]);
          mtx_unlock(&helios->dev_mutex);
       } else {
          break;
@@ -1313,6 +2044,11 @@ helios_sync_read(struct vn_renderer *renderer,
    }
 
    mtx_lock(&helios->dev_mutex);
+   if (sync->wddm_cpu_va) {
+      const uint64_t wddm_val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+      if (sync->val < wddm_val)
+         sync->val = wddm_val;
+   }
    *val = sync->val;
    mtx_unlock(&helios->dev_mutex);
    return VK_SUCCESS;
@@ -1329,8 +2065,83 @@ helios_sync_write(struct vn_renderer *renderer,
    mtx_lock(&helios->dev_mutex);
    sync->val = val;
    sync->pending_count = 0;
+   if (sync->wddm_local)
+      (void)helios_wddm_sync_signal(renderer, sync->wddm_local, val);
    mtx_unlock(&helios->dev_mutex);
    return VK_SUCCESS;
+}
+
+VkResult
+vn_renderer_helios_sync_create_from_win32(
+   struct vn_renderer *renderer,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void *handle,
+   struct vn_renderer_sync **out_sync)
+{
+   struct helios_sync *sync = calloc(1, sizeof(*sync));
+   if (!sync)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   VkResult result;
+   switch (handle_type) {
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+      result = helios_wddm_sync_open_nt(renderer, handle, &sync->wddm_local,
+                                        &sync->wddm_cpu_va);
+      break;
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+      sync->wddm_global = HandleToULong(handle);
+      result = helios_wddm_sync_open_kmt(renderer, sync->wddm_global,
+                                         &sync->wddm_local,
+                                         &sync->wddm_cpu_va);
+      break;
+   default:
+      free(sync);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   if (result != VK_SUCCESS) {
+      free(sync);
+      return result;
+   }
+
+   sync->base.sync_id = 0;
+   if (sync->wddm_cpu_va)
+      sync->val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+   *out_sync = &sync->base;
+   return VK_SUCCESS;
+}
+
+VkResult
+vn_renderer_helios_sync_export_win32(
+   struct vn_renderer *renderer,
+   struct vn_renderer_sync *_sync,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void **out_handle)
+{
+   struct helios_sync *sync = (struct helios_sync *)_sync;
+
+   if (!sync->wddm_local) {
+      VkResult result =
+         helios_wddm_sync_create(renderer, sync->val,
+                                 handle_type ==
+                                    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+                                 &sync->wddm_local, &sync->wddm_global,
+                                 &sync->wddm_cpu_va);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   switch (handle_type) {
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+      return helios_wddm_sync_share_nt(renderer, sync->wddm_local, out_handle);
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+      if (!sync->wddm_global)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      *out_handle = ULongToHandle(sync->wddm_global);
+      return VK_SUCCESS;
+   default:
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
 }
 
 /* ── init / teardown ───────────────────────────────────────────────────────── */
@@ -1367,7 +2178,7 @@ helios_init_renderer_info(struct helios *helios)
    info->max_timeline_count = 64;
 
    info->has_dma_buf_import = false;
-   info->has_external_sync = false;
+   info->has_external_sync = true;
    info->has_implicit_fencing = false;
    info->has_guest_vram = false;
 
@@ -1392,6 +2203,8 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 
    if (helios->ctx_id)
       helios_ioctl_ctx_destroy(helios, helios->ctx_id); /* CTX_DESTROY via escape */
+   if (helios_current_ctx_id == helios->ctx_id)
+      helios_current_ctx_id = 0;
 
    /* WDDM D3DKMT teardown (reverse of helios_open_d3dkmt). */
    if (helios->context) {
@@ -1426,6 +2239,7 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 static VkResult
 helios_init(struct helios *helios)
 {
+   helios_diag("helios_init enter");
    mtx_init(&helios->dev_mutex, mtx_plain);
    helios_perf_init(helios);
    if (helios->perf.enabled) {
@@ -1436,21 +2250,26 @@ helios_init(struct helios *helios)
       }
    }
 
-   if (!helios_open_d3dkmt(helios))
+   if (!helios_open_d3dkmt(helios)) {
+      helios_diag("helios_open_d3dkmt failed");
       return VK_ERROR_INITIALIZATION_FAILED;
+   }
 
    /* Create the single venus virtio-gpu context up front so it exists before the
     * first shmem/submit (analog of vtest_vcmd_context_init). */
    if (!helios_ioctl_ctx_create(helios, VIRTIO_GPU_CAPSET_VENUS, &helios->ctx_id) ||
        helios->ctx_id == 0) {
       vn_log(helios->instance, "CTX_CREATE(VENUS) failed or returned ctx_id 0");
+      helios_diag("CTX_CREATE failed ctx_id=%u", helios->ctx_id);
       fprintf(stderr, "HELIOS[gate5a]: CTX_CREATE(VENUS) over D3DKMTEscape FAILED\n");
       return VK_ERROR_INITIALIZATION_FAILED;
    }
+   helios_diag("CTX_CREATE OK ctx_id=%u", helios->ctx_id);
    /* Gate 5a STAGE-1 SUCCESS SIGNAL: the venus context came up over D3DKMTEscape
     * → the KMD's DxgkDdiEscape handled CTX_CREATE against the kmd_render adapter. */
    fprintf(stderr, "HELIOS[gate5a]: CTX_CREATE(VENUS) over D3DKMTEscape OK ctx_id=%u\n",
            helios->ctx_id);
+   helios_current_ctx_id = helios->ctx_id;
 
    vn_renderer_shmem_cache_init(&helios->shmem_cache, &helios->base,
                                 helios_shmem_destroy_now);
@@ -1467,6 +2286,8 @@ helios_init(struct helios *helios)
    helios->base.bo_ops.create_from_device_memory =
       helios_bo_create_from_device_memory;
    helios->base.bo_ops.create_from_dma_buf = NULL;
+   helios->base.bo_ops.create_from_resource_id =
+      helios_bo_create_from_resource_id;
    helios->base.bo_ops.destroy = helios_bo_destroy;
    helios->base.bo_ops.release_resource = helios_bo_release_resource;
    helios->base.bo_ops.export_dma_buf = NULL;

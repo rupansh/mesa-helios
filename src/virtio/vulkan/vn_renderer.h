@@ -162,6 +162,12 @@ struct vn_renderer_bo_ops {
                                    VkMemoryPropertyFlags flags,
                                    struct vn_renderer_bo **out_bo);
 
+   VkResult (*create_from_resource_id)(struct vn_renderer *renderer,
+                                       VkDeviceSize size,
+                                       uint32_t res_id,
+                                       VkMemoryPropertyFlags flags,
+                                       struct vn_renderer_bo **out_bo);
+
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
 
    void (*release_resource)(struct vn_renderer *renderer,
@@ -225,6 +231,22 @@ struct vn_renderer_sync_ops {
                      struct vn_renderer_sync *sync,
                      uint64_t val);
 };
+
+#if defined(_WIN32)
+VkResult
+vn_renderer_helios_sync_create_from_win32(
+   struct vn_renderer *renderer,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void *handle,
+   struct vn_renderer_sync **out_sync);
+
+VkResult
+vn_renderer_helios_sync_export_win32(
+   struct vn_renderer *renderer,
+   struct vn_renderer_sync *sync,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void **out_handle);
+#endif
 
 struct vn_renderer {
    struct vn_renderer_info info;
@@ -366,6 +388,30 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
 
    assert(vn_refcount_is_valid(&bo->refcount));
    assert(bo->res_id);
+   assert(!bo->mmap_size || bo->mmap_size >= size);
+
+   *out_bo = bo;
+   return VK_SUCCESS;
+}
+
+static inline VkResult
+vn_renderer_bo_create_from_resource_id(struct vn_renderer *renderer,
+                                       VkDeviceSize size,
+                                       uint32_t res_id,
+                                       VkMemoryPropertyFlags flags,
+                                       struct vn_renderer_bo **out_bo)
+{
+   if (!renderer->bo_ops.create_from_resource_id)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct vn_renderer_bo *bo;
+   VkResult result = renderer->bo_ops.create_from_resource_id(
+      renderer, size, res_id, flags, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   assert(vn_refcount_is_valid(&bo->refcount));
+   assert(bo->res_id == res_id);
    assert(!bo->mmap_size || bo->mmap_size >= size);
 
    *out_bo = bo;

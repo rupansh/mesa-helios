@@ -21,6 +21,7 @@
 #include "vn_device_memory.h"
 #include "vn_physical_device.h"
 #include "vn_wsi.h"
+#include "util/stack_array.h"
 
 #define IMAGE_REQS_CACHE_MAX_ENTRIES 500
 
@@ -756,8 +757,18 @@ vn_BindImageMemory2(VkDevice device,
          return vn_image_bind_wsi_memory(dev, bindInfoCount, pBindInfos);
    }
 
+   STACK_ARRAY(VkBindImageMemoryInfo, local_infos, bindInfoCount);
+   if (!local_infos)
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   typed_memcpy(local_infos, pBindInfos, bindInfoCount);
+   for (uint32_t i = 0; i < bindInfoCount; i++)
+      local_infos[i].pNext = NULL;
+
    vn_async_vkBindImageMemory2(dev->primary_ring, device, bindInfoCount,
-                               pBindInfos);
+                               local_infos);
+
+   STACK_ARRAY_FINISH(local_infos);
 
    for (uint32_t i = 0; i < bindInfoCount; i++) {
       const VkBindMemoryStatus *bind_status =

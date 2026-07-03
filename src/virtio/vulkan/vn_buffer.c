@@ -16,6 +16,7 @@
 #include "vn_device.h"
 #include "vn_device_memory.h"
 #include "vn_physical_device.h"
+#include "util/stack_array.h"
 
 /* buffer commands */
 
@@ -479,8 +480,18 @@ vn_BindBufferMemory2(VkDevice device,
                      const VkBindBufferMemoryInfo *pBindInfos)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+   STACK_ARRAY(VkBindBufferMemoryInfo, local_infos, bindInfoCount);
+   if (!local_infos)
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   typed_memcpy(local_infos, pBindInfos, bindInfoCount);
+   for (uint32_t i = 0; i < bindInfoCount; i++)
+      local_infos[i].pNext = NULL;
+
    vn_async_vkBindBufferMemory2(dev->primary_ring, device, bindInfoCount,
-                                pBindInfos);
+                                local_infos);
+
+   STACK_ARRAY_FINISH(local_infos);
 
    for (uint32_t i = 0; i < bindInfoCount; i++) {
       const VkBindMemoryStatus *bind_status =

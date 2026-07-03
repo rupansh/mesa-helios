@@ -941,6 +941,15 @@ vn_physical_device_init_queue_family_properties(
    vn_call_vkGetPhysicalDeviceQueueFamilyProperties2(
       ring, vn_physical_device_to_handle(physical_dev), &count, props);
 
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < count; i++) {
+      props[i].queueFamilyProperties.queueFlags &=
+         ~VK_QUEUE_VIDEO_DECODE_BIT_KHR;
+      props[i].queueFamilyProperties.queueFlags &=
+         ~VK_QUEUE_VIDEO_ENCODE_BIT_KHR;
+   }
+#endif
+
 #if defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 34
    /* Starting from Android 14 (Android U), framework HWUI has required a
     * second graphics queue to avoid racing between webview and skiavk.
@@ -1207,6 +1216,13 @@ vn_physical_device_init_external_semaphore_handles(
          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
    }
 
+#if DETECT_OS_WINDOWS
+   if (physical_dev->instance->renderer->info.has_external_sync) {
+      physical_dev->renderer_sync_fd.semaphore_exportable = true;
+      physical_dev->renderer_sync_fd.semaphore_importable = true;
+   }
+#endif
+
    physical_dev->external_binary_semaphore_handles = 0;
    physical_dev->external_timeline_semaphore_handles = 0;
 
@@ -1214,6 +1230,13 @@ vn_physical_device_init_external_semaphore_handles(
 #if !DETECT_OS_WINDOWS
       physical_dev->external_binary_semaphore_handles =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+#else
+      physical_dev->external_binary_semaphore_handles =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+      physical_dev->external_timeline_semaphore_handles =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
 #endif
    }
 }
@@ -1243,6 +1266,13 @@ vn_physical_device_get_native_extensions(
           VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
          exts->KHR_external_semaphore_fd = true;
       }
+#if DETECT_OS_WINDOWS
+      if (physical_dev->external_binary_semaphore_handles &
+          (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+           VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
+         exts->KHR_external_semaphore_win32 = true;
+      }
+#endif
    }
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
@@ -1270,6 +1300,19 @@ vn_physical_device_get_native_extensions(
 #if !DETECT_OS_WINDOWS
       exts->KHR_external_memory_fd = true;
       exts->EXT_external_memory_dma_buf = true;
+#else
+      /* Helios: the fd-based external-memory extensions describe the WIRE
+       * (renderer-side) handle types; no POSIX fd ever crosses into the
+       * guest. Exposing VK_KHR_external_memory_fd here is required so that
+       * (a) the D3D bridge can legally chain VkExternalMemoryImageCreateInfo
+       * / VkExportMemoryAllocateInfo for shared surfaces, and (b) enabling it
+       * makes vn_device_fix_create_info add VK_KHR_external_memory_fd +
+       * VK_EXT_external_memory_dma_buf to the HOST device create — without
+       * which vkr's export-blob path (vkGetMemoryFdKHR) and dma_buf
+       * import-by-resource-id run against a host device that never enabled
+       * those extensions.
+       */
+      exts->KHR_external_memory_fd = true;
 #endif /* !DETECT_OS_WINDOWS */
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
@@ -2880,7 +2923,18 @@ vn_GetPhysicalDeviceImageFormatProperties2(
          external_info->handleType !=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
 
-      /* venus doesn't support legacy tiling for scanout purpose */
+      /* venus doesn't support legacy tiling for scanout purpose.
+       *
+       * Helios: skip this rejection on Windows. It exists for the Linux
+       * dma-buf scanout/interop path (cross-device sharing needs explicit
+       * DRM format modifiers); Helios shared surfaces never leave the host
+       * driver, and the host accepts OPTIMAL-tiling external images (the
+       * NVIDIA 610.x driver now reports dma_buf exportable, which flips
+       * renderer_handle_type to DMA_BUF and previously made this guard
+       * reject EVERY external-image capability query from the D3D bridge
+       * with VK_ERROR_FORMAT_NOT_SUPPORTED while the host says SUCCESS).
+       */
+#if !DETECT_OS_WINDOWS
       if (renderer_handle_type ==
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
           pImageFormatInfo->tiling !=
@@ -2888,6 +2942,7 @@ vn_GetPhysicalDeviceImageFormatProperties2(
          return vn_error(physical_dev->instance,
                          VK_ERROR_FORMAT_NOT_SUPPORTED);
       }
+#endif /* !DETECT_OS_WINDOWS */
 
       if (external_info->handleType != renderer_handle_type) {
          pImageFormatInfo = vn_physical_device_fix_image_format_info(

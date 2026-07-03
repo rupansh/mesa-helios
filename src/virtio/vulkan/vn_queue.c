@@ -350,6 +350,27 @@ vn_set_temp_cmd(struct vn_queue_submission *submit,
 }
 
 static uint64_t
+vn_get_wait_semaphore_counter(struct vn_queue_submission *submit,
+                              uint32_t batch_index,
+                              uint32_t sem_index)
+{
+   switch (submit->batch_type) {
+   case VK_STRUCTURE_TYPE_SUBMIT_INFO: {
+      const struct VkTimelineSemaphoreSubmitInfo *timeline_sem_info =
+         vk_find_struct_const(submit->submit_batches[batch_index].pNext,
+                              TIMELINE_SEMAPHORE_SUBMIT_INFO);
+      return timeline_sem_info->pWaitSemaphoreValues[sem_index];
+   }
+   case VK_STRUCTURE_TYPE_SUBMIT_INFO_2:
+      return submit->submit2_batches[batch_index]
+         .pWaitSemaphoreInfos[sem_index]
+         .value;
+   default:
+      UNREACHABLE("unexpected batch type");
+   }
+}
+
+static uint64_t
 vn_get_signal_semaphore_counter(struct vn_queue_submission *submit,
                                 uint32_t batch_index,
                                 uint32_t sem_index)
@@ -512,8 +533,35 @@ vn_queue_submission_fix_batch_semaphores(struct vn_queue_submission *submit,
       struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
       const struct vn_sync_payload *payload = sem->payload;
 
-      if (payload->type != VN_SYNC_TYPE_IMPORTED_SYNC_FD)
+      if (payload->type != VN_SYNC_TYPE_IMPORTED_SYNC_FD) {
+#if DETECT_OS_WINDOWS
+         if (payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC &&
+             payload->win32_sync) {
+            const uint64_t value =
+               sem->type == VK_SEMAPHORE_TYPE_TIMELINE
+                  ? vn_get_wait_semaphore_counter(submit, batch_index, i)
+                  : 1;
+            const struct vn_renderer_wait wait = {
+               .syncs = &payload->win32_sync,
+               .sync_values = &value,
+               .sync_count = 1,
+               .timeout = UINT64_MAX,
+            };
+            VkResult result = vn_renderer_wait(dev->renderer, &wait);
+            if (result != VK_SUCCESS)
+               return result;
+
+            const VkImportSemaphoreResourceInfoMESA res_info = {
+               .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA,
+               .semaphore = sem_handle,
+               .resourceId = 0,
+            };
+            vn_async_vkImportSemaphoreResourceMESA(dev->primary_ring,
+                                                   dev_handle, &res_info);
+         }
+#endif
          continue;
+      }
 
       if (!vn_semaphore_wait_external(dev, sem))
          return VK_ERROR_DEVICE_LOST;
@@ -1102,6 +1150,44 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
 }
 
 static VkResult
+vn_signal_win32_external_semaphore(struct vn_device *dev,
+                                   struct vn_semaphore *sem,
+                                   uint64_t value)
+{
+#if DETECT_OS_WINDOWS
+   struct vn_sync_payload *payload = sem->payload;
+   if (!payload->win32_sync)
+      return VK_SUCCESS;
+
+   struct vn_renderer_submit_batch batch = {
+      .syncs = &payload->win32_sync,
+      .sync_values = &value,
+      .sync_count = 1,
+      .ring_idx = sem->external_payload.ring_idx,
+   };
+
+   uint32_t local_data[8];
+   struct vn_cs_encoder local_enc =
+      VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+   if (sem->external_payload.ring_seqno_valid) {
+      const uint64_t ring_id = vn_ring_get_id(dev->primary_ring);
+      vn_encode_vkWaitRingSeqnoMESA(&local_enc, 0, ring_id,
+                                    sem->external_payload.ring_seqno);
+      batch.cs_data = local_data;
+      batch.cs_size = vn_cs_encoder_get_len(&local_enc);
+   }
+
+   const struct vn_renderer_submit submit = {
+      .batches = &batch,
+      .batch_count = 1,
+   };
+   return vn_renderer_submit(dev->renderer, &submit);
+#else
+   return VK_SUCCESS;
+#endif
+}
+
+static VkResult
 vn_queue_submit(struct vn_queue_submission *submit)
 {
    struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
@@ -1181,6 +1267,21 @@ vn_queue_submit(struct vn_queue_submission *submit)
             assert(sem->payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
             sem->external_payload = submit->external_payload;
          }
+#if DETECT_OS_WINDOWS
+         if (sem->payload->win32_sync) {
+            sem->external_payload = submit->external_payload;
+            const uint64_t value =
+               sem->type == VK_SEMAPHORE_TYPE_TIMELINE
+                  ? vn_get_signal_semaphore_counter(submit, i, j)
+                  : 1;
+            result =
+               vn_signal_win32_external_semaphore(dev, sem, value);
+            if (result != VK_SUCCESS) {
+               vn_queue_submission_cleanup(submit);
+               return vn_error(instance, result);
+            }
+         }
+#endif
       }
    }
 
@@ -1724,6 +1825,13 @@ vn_sync_payload_release(UNUSED struct vn_device *dev,
    if (payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD && payload->fd >= 0)
       close(payload->fd);
 
+#if DETECT_OS_WINDOWS
+   if (payload->win32_sync) {
+      vn_renderer_sync_destroy(dev->renderer, payload->win32_sync);
+      payload->win32_sync = NULL;
+   }
+#endif
+
    payload->type = VN_SYNC_TYPE_INVALID;
 }
 
@@ -2227,6 +2335,18 @@ vn_semaphore_init_payloads(struct vn_device *dev,
    sem->temporary.type = VN_SYNC_TYPE_INVALID;
    sem->payload = &sem->permanent;
 
+#if DETECT_OS_WINDOWS
+   if (sem->external_handle_types &
+       (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
+      VkResult result = vn_renderer_sync_create(
+         dev->renderer, initial_val, VN_RENDERER_SYNC_SHAREABLE,
+         &sem->permanent.win32_sync);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+#endif
+
    return VK_SUCCESS;
 }
 
@@ -2360,6 +2480,9 @@ vn_CreateSemaphore(VkDevice device,
    const struct VkExportSemaphoreCreateInfo *export_info =
       vk_find_struct_const(pCreateInfo->pNext, EXPORT_SEMAPHORE_CREATE_INFO);
    sem->is_external = export_info && export_info->handleTypes;
+#if DETECT_OS_WINDOWS
+   sem->external_handle_types = export_info ? export_info->handleTypes : 0;
+#endif
 
    VkResult result = vn_semaphore_init_payloads(dev, sem, initial_val, alloc);
    if (result != VK_SUCCESS)
@@ -2574,6 +2697,16 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
       simple_mtx_unlock(&sem->feedback.counter_mtx);
    }
 
+#if DETECT_OS_WINDOWS
+   if (sem->payload->win32_sync) {
+      VkResult result = vn_renderer_sync_write(dev->renderer,
+                                               sem->payload->win32_sync,
+                                               pSignalInfo->value);
+      if (result != VK_SUCCESS)
+         return vn_error(dev->instance, result);
+   }
+#endif
+
    return VK_SUCCESS;
 }
 
@@ -2623,6 +2756,42 @@ vn_WaitSemaphores(VkDevice device,
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
+
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
+      struct vn_semaphore *sem =
+         vn_semaphore_from_handle(pWaitInfo->pSemaphores[i]);
+      struct vn_sync_payload *payload = sem->payload;
+      if (payload->type != VN_SYNC_TYPE_IMPORTED_WIN32_SYNC ||
+          !payload->win32_sync)
+         continue;
+
+      const struct vn_renderer_wait wait = {
+         .wait_any = false,
+         .timeout = timeout,
+         .syncs = &payload->win32_sync,
+         .sync_values = &pWaitInfo->pValues[i],
+         .sync_count = 1,
+      };
+      VkResult result = vn_renderer_wait(dev->renderer, &wait);
+      if (result != VK_SUCCESS)
+         return vn_result(dev->instance, result);
+
+      const VkSemaphoreSignalInfo signal_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+         .semaphore = pWaitInfo->pSemaphores[i],
+         .value = pWaitInfo->pValues[i],
+      };
+      vn_async_vkSignalSemaphore(dev->primary_ring, device, &signal_info);
+      if (sem->feedback.slot) {
+         simple_mtx_lock(&sem->feedback.counter_mtx);
+         sem->feedback.signaled_counter =
+            MAX2(sem->feedback.signaled_counter, pWaitInfo->pValues[i]);
+         sem->feedback.pollable = true;
+         simple_mtx_unlock(&sem->feedback.counter_mtx);
+      }
+   }
+#endif
 
    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    VkResult result = VK_NOT_READY;
@@ -2750,6 +2919,65 @@ vn_GetSemaphoreFdKHR(VkDevice device,
    *pFd = fd;
    return VK_SUCCESS;
 }
+
+#if DETECT_OS_WINDOWS
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_ImportSemaphoreWin32HandleKHR(
+   VkDevice device,
+   const VkImportSemaphoreWin32HandleInfoKHR *pImportSemaphoreWin32HandleInfo)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_semaphore *sem =
+      vn_semaphore_from_handle(pImportSemaphoreWin32HandleInfo->semaphore);
+   struct vn_sync_payload *temp = &sem->temporary;
+   struct vn_renderer_sync *sync = NULL;
+   VkResult result = vn_renderer_helios_sync_create_from_win32(
+      dev->renderer, pImportSemaphoreWin32HandleInfo->handleType,
+      pImportSemaphoreWin32HandleInfo->handle, &sync);
+
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, result);
+
+   vn_sync_payload_release(dev, temp);
+   temp->type = VN_SYNC_TYPE_IMPORTED_WIN32_SYNC;
+   temp->win32_sync = sync;
+   sem->payload = temp;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetSemaphoreWin32HandleKHR(
+   VkDevice device,
+   const VkSemaphoreGetWin32HandleInfoKHR *pGetWin32HandleInfo,
+   HANDLE *pHandle)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_semaphore *sem =
+      vn_semaphore_from_handle(pGetWin32HandleInfo->semaphore);
+   struct vn_sync_payload *payload = sem->payload;
+   void *handle = NULL;
+
+   if (!payload->win32_sync) {
+      VkResult result =
+         vn_renderer_sync_create(dev->renderer, 0, VN_RENDERER_SYNC_SHAREABLE,
+                                 &payload->win32_sync);
+      if (result != VK_SUCCESS)
+         return vn_error(dev->instance, result);
+   }
+
+   VkResult result = vn_renderer_helios_sync_export_win32(
+      dev->renderer, payload->win32_sync, pGetWin32HandleInfo->handleType,
+      &handle);
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, result);
+
+   *pHandle = (HANDLE)handle;
+   return VK_SUCCESS;
+}
+#endif
 
 /* event commands */
 

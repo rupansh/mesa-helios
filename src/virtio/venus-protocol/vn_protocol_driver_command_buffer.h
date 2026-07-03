@@ -1001,6 +1001,9 @@ vn_encode_VkExternalMemoryAcquireUnmodifiedEXT(struct vn_cs_encoder *enc, const 
 static inline size_t
 vn_sizeof_VkBufferMemoryBarrier_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -1022,6 +1025,7 @@ vn_sizeof_VkBufferMemoryBarrier_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -1054,6 +1058,10 @@ vn_sizeof_VkBufferMemoryBarrier(const VkBufferMemoryBarrier *val)
 static inline void
 vn_encode_VkBufferMemoryBarrier_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+    return;
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -1074,6 +1082,7 @@ vn_encode_VkBufferMemoryBarrier_pnext(struct vn_cs_encoder *enc, const void *val
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void
@@ -1103,6 +1112,9 @@ vn_encode_VkBufferMemoryBarrier(struct vn_cs_encoder *enc, const VkBufferMemoryB
 static inline size_t
 vn_sizeof_VkImageMemoryBarrier_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -1132,6 +1144,7 @@ vn_sizeof_VkImageMemoryBarrier_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -1165,6 +1178,10 @@ vn_sizeof_VkImageMemoryBarrier(const VkImageMemoryBarrier *val)
 static inline void
 vn_encode_VkImageMemoryBarrier_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+    return;
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -1193,6 +1210,7 @@ vn_encode_VkImageMemoryBarrier_pnext(struct vn_cs_encoder *enc, const void *val)
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void
@@ -2653,6 +2671,9 @@ vn_encode_VkVertexInputAttributeDescription2EXT(struct vn_cs_encoder *enc, const
 static inline size_t
 vn_sizeof_VkBufferMemoryBarrier2_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -2674,6 +2695,7 @@ vn_sizeof_VkBufferMemoryBarrier2_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -2708,6 +2730,10 @@ vn_sizeof_VkBufferMemoryBarrier2(const VkBufferMemoryBarrier2 *val)
 static inline void
 vn_encode_VkBufferMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+    return;
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -2728,6 +2754,7 @@ vn_encode_VkBufferMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *va
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void
@@ -2759,6 +2786,9 @@ vn_encode_VkBufferMemoryBarrier2(struct vn_cs_encoder *enc, const VkBufferMemory
 static inline size_t
 vn_sizeof_VkImageMemoryBarrier2_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -2788,6 +2818,7 @@ vn_sizeof_VkImageMemoryBarrier2_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -2823,6 +2854,10 @@ vn_sizeof_VkImageMemoryBarrier2(const VkImageMemoryBarrier2 *val)
 static inline void
 vn_encode_VkImageMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+    return;
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -2851,6 +2886,7 @@ vn_encode_VkImageMemoryBarrier2_pnext(struct vn_cs_encoder *enc, const void *val
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void

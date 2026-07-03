@@ -687,6 +687,9 @@ vn_encode_VkBindImagePlaneMemoryInfo(struct vn_cs_encoder *enc, const VkBindImag
 static inline size_t
 vn_sizeof_VkBindImageMemoryInfo_pnext(const void *val)
 {
+    (void)val;
+    return vn_sizeof_simple_pointer(NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
     size_t size = 0;
 
@@ -720,6 +723,7 @@ vn_sizeof_VkBindImageMemoryInfo_pnext(const void *val)
     }
 
     return vn_sizeof_simple_pointer(NULL);
+#endif
 }
 
 static inline size_t
@@ -748,6 +752,9 @@ vn_sizeof_VkBindImageMemoryInfo(const VkBindImageMemoryInfo *val)
 static inline void
 vn_encode_VkBindImageMemoryInfo_pnext(struct vn_cs_encoder *enc, const void *val)
 {
+    (void)val;
+    vn_encode_simple_pointer(enc, NULL);
+#if 0
     const VkBaseInStructure *pnext = val;
 
     while (pnext) {
@@ -780,6 +787,7 @@ vn_encode_VkBindImageMemoryInfo_pnext(struct vn_cs_encoder *enc, const void *val
     }
 
     vn_encode_simple_pointer(enc, NULL);
+#endif
 }
 
 static inline void

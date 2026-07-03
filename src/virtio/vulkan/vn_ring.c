@@ -7,7 +7,11 @@
 
 #if !DETECT_OS_WINDOWS
 #include <sys/resource.h>
+#else
+#include <windows.h>
 #endif
+
+#include <stdio.h>
 
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
@@ -64,6 +68,65 @@ struct vn_ring {
    int64_t last_notify;
    int64_t next_notify;
 };
+
+#if DETECT_OS_WINDOWS
+static void
+helios_ring_diag(const struct vn_ring *ring, const char *msg)
+{
+   FILE *f = fopen("C:\\Windows\\Temp\\helios_icd_diag.log", "a");
+   if (!f)
+      return;
+
+   uint32_t head_value = 0;
+   uint32_t tail_value = 0;
+   uint32_t status_value = 0;
+   if (ring) {
+      if (ring->shared.head)
+         head_value =
+            atomic_load_explicit(ring->shared.head, memory_order_seq_cst);
+      if (ring->shared.tail)
+         tail_value =
+            atomic_load_explicit(ring->shared.tail, memory_order_seq_cst);
+      if (ring->shared.status)
+         status_value =
+            atomic_load_explicit(ring->shared.status, memory_order_seq_cst);
+   }
+
+   fprintf(f,
+           "%lu ring %s ring=%p id=%llu head=%p/%u tail=%p/%u "
+           "status=%p/0x%08x buffer=%p "
+           "cur=%u size=%u mask=0x%x\n",
+           GetTickCount(), msg, (const void *)ring,
+           ring ? (unsigned long long)ring->id : 0,
+           ring ? (const void *)ring->shared.head : NULL, head_value,
+           ring ? (const void *)ring->shared.tail : NULL, tail_value,
+           ring ? (const void *)ring->shared.status : NULL, status_value,
+           ring ? ring->shared.buffer : NULL,
+           ring ? ring->cur : 0,
+           ring ? ring->buffer_size : 0,
+           ring ? ring->buffer_mask : 0);
+   fclose(f);
+}
+
+static bool
+helios_ring_shared_valid(const struct vn_ring *ring)
+{
+   if (!ring || !ring->shared.head || !ring->shared.tail ||
+       !ring->shared.status || !ring->shared.buffer) {
+      helios_ring_diag(ring, "invalid null shared pointers");
+      return false;
+   }
+
+   return true;
+}
+#else
+static bool
+helios_ring_shared_valid(const struct vn_ring *ring)
+{
+   return ring && ring->shared.head && ring->shared.tail &&
+          ring->shared.status && ring->shared.buffer;
+}
+#endif
 
 struct vn_ring_submit {
    uint32_t seqno;
@@ -175,6 +238,9 @@ vn_ring_retire_submits(struct vn_ring *ring, uint32_t seqno)
 bool
 vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno)
 {
+   if (unlikely(!helios_ring_shared_valid(ring)))
+      return true;
+
    return vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno);
 }
 
@@ -200,6 +266,9 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
 void
 vn_ring_wait_all(struct vn_ring *ring)
 {
+   if (unlikely(!helios_ring_shared_valid(ring)))
+      return;
+
    /* load from tail rather than ring->cur for atomicity */
    const uint32_t pending_seqno =
       atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
@@ -442,6 +511,9 @@ vn_ring_submit_internal(struct vn_ring *ring,
                         const struct vn_cs_encoder *cs,
                         uint32_t *seqno)
 {
+   if (unlikely(!helios_ring_shared_valid(ring)))
+      return false;
+
    /* write cs to the ring */
    assert(!vn_cs_encoder_is_empty(cs));
 
@@ -457,8 +529,11 @@ vn_ring_submit_internal(struct vn_ring *ring,
    vn_ring_store_tail(ring);
    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
-      vn_log(NULL, "vn_ring_submit abort on fatal");
-      abort();
+      vn_log(NULL, "vn_ring_submit fatal status; reporting device lost");
+#if DETECT_OS_WINDOWS
+      helios_ring_diag(ring, "fatal status");
+#endif
+      return false;
    }
 
    vn_ring_retire_submits(ring, cur_seqno);
@@ -623,6 +698,9 @@ vn_ring_submit_locked(struct vn_ring *ring,
                       struct vn_renderer_shmem *extra_shmem,
                       uint32_t *ring_seqno)
 {
+   if (unlikely(!helios_ring_shared_valid(ring)))
+      return VK_ERROR_DEVICE_LOST;
+
    const bool direct = vn_ring_submission_can_direct(ring, cs);
    if (!direct && cs->storage_type == VN_CS_ENCODER_STORAGE_POINTER) {
       cs = vn_ring_cs_upload_locked(ring, cs);
@@ -637,9 +715,14 @@ vn_ring_submit_locked(struct vn_ring *ring,
    if (result != VK_SUCCESS)
       return result;
 
-   uint32_t seqno;
+   uint32_t seqno = UINT32_MAX;
    const bool notify =
       vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno);
+   if (unlikely(seqno == UINT32_MAX)) {
+      vn_ring_submission_cleanup(&submit);
+      return VK_ERROR_DEVICE_LOST;
+   }
+
    if (notify) {
       uint32_t notify_ring_data[8];
       struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(

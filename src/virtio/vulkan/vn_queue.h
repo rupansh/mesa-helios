@@ -74,6 +74,11 @@ enum vn_sync_type {
 
    /* payload is an imported sync file */
    VN_SYNC_TYPE_IMPORTED_SYNC_FD,
+
+#if defined(_WIN32)
+   /* payload is an imported WDDM monitored-fence synchronization object */
+   VN_SYNC_TYPE_IMPORTED_WIN32_SYNC,
+#endif
 };
 
 struct vn_sync_payload {
@@ -81,6 +86,10 @@ struct vn_sync_payload {
 
    /* If type is VN_SYNC_TYPE_IMPORTED_SYNC_FD, fd is a sync file. */
    int fd;
+
+#if defined(_WIN32)
+   struct vn_renderer_sync *win32_sync;
+#endif
 };
 
 /* For external fences and external semaphores submitted to be signaled. The
@@ -121,6 +130,10 @@ struct vn_fence {
 
    bool is_external;
    struct vn_sync_payload_external external_payload;
+
+#if DETECT_OS_WINDOWS
+   VkExternalSemaphoreHandleTypeFlags external_handle_types;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_fence,
                                base.vk,
@@ -192,6 +205,10 @@ struct vn_semaphore {
 
    bool is_external;
    struct vn_sync_payload_external external_payload;
+
+#if defined(_WIN32)
+   VkExternalSemaphoreHandleTypeFlags external_handle_types;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_semaphore,
                                base.vk,
