@@ -168,10 +168,18 @@ struct helios_escape_attach_resource {
    uint32_t resource_id;
 };
 
+/* C3/M3.4 async transport: WAIT_FENCE v2 (40 bytes). `fence_id` is the WIRE
+ * fence id the KMD wrote back into the SUBMIT_VENUS escape buffer. The caller
+ * MUST pre-set out_completed = 1: the old synchronous KMD validates the shape
+ * and returns without writing the buffer, and 1 then correctly reports
+ * "complete" (its submits were host-complete by return). The async KMD blocks
+ * (PASSIVE KEVENT) until completion or timeout_ns and writes the verdict. */
 struct helios_escape_wait_fence {
    struct helios_escape_header hdr;
    uint64_t fence_id;
    uint64_t timeout_ns;
+   uint32_t out_completed; /* out: 1 = complete, 0 = timed out */
+   uint32_t _pad;
 };
 
 /* Wire-size guards mirroring protocol/src/escape.rs const _: () asserts. */
@@ -183,7 +191,7 @@ _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size")
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
 _Static_assert(sizeof(struct helios_escape_attach_resource) == 24, "attach_resource size");
-_Static_assert(sizeof(struct helios_escape_wait_fence) == 32, "wait_fence size");
+_Static_assert(sizeof(struct helios_escape_wait_fence) == 40, "wait_fence size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -858,9 +866,16 @@ helios_ioctl(struct helios *helios,
  * driver-private data. The escape buffer is in/out: the KMD's DxgkDdiEscape
  * validates the helios_escape_header and writes any out-fields (e.g. out_ctx_id)
  * back into the same buffer, which the runtime reflects to user mode. Caller
- * MUST hold dev_mutex. Returns false on a D3DKMT failure. */
+ * MUST hold dev_mutex (except WAIT_FENCE — see helios_escape_no_hw). Returns
+ * false on a D3DKMT failure.
+ *
+ * `hardware_access` maps to D3DDDI_ESCAPEFLAGS.HardwareAccess. HardwareAccess=1
+ * escapes serialize EXCLUSIVELY on the dxgkrnl adapter lock — that is the lock
+ * the 2026-07-04 dump caught a WUDFHost device-create Escape queued behind for
+ * 30+ s. A blocking WAIT_FENCE must therefore pass 0 (it touches no hardware —
+ * the KMD parks the thread on a KEVENT) so it never convoys other escapes. */
 static bool
-helios_escape(struct helios *helios, void *buf, uint32_t size)
+helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
 {
    if (!helios->adapter) {
       helios_diag("escape skipped: no adapter size=%u", size);
@@ -873,7 +888,7 @@ helios_escape(struct helios *helios, void *buf, uint32_t size)
    esc.hDevice = helios->device;   /* pass the device too (some OS builds require it) */
    esc.hContext = helios->context;
    esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
-   esc.Flags.HardwareAccess = 1;
+   esc.Flags.HardwareAccess = hardware_access ? 1 : 0;
    esc.pPrivateDriverData = buf;
    esc.PrivateDriverDataSize = size;
 
@@ -889,6 +904,12 @@ helios_escape(struct helios *helios, void *buf, uint32_t size)
       return false;
    }
    return true;
+}
+
+static bool
+helios_escape(struct helios *helios, void *buf, uint32_t size)
+{
+   return helios_escape_ex(helios, buf, size, true);
 }
 
 static bool
@@ -1001,13 +1022,13 @@ helios_probe_d3dkmt_adapter(struct helios *helios,
    return ok;
 }
 
-/* SUBMIT_VENUS (METHOD_IN_DIRECT). Caller MUST hold dev_mutex (next_fence_id +
- * ordering). The cs bytes ride lpOutBuffer, which the KMD retrieves via
- * WdfRequestRetrieveOutputBuffer (METHOD_IN_DIRECT read-locks that buffer's MDL)
- * and only reads — see handle_submit_venus. NON-BLOCKING (KMD Phase 4e): the KMD
- * queues the submission and returns immediately; completion is observed later via
- * WAIT_FENCE. `*out_fence_id` (if non-NULL) receives the assigned fence id so the
- * caller can record it on the batch's syncs for ops.wait. */
+/* SUBMIT_VENUS — ASYNC (C3/M3.4). Caller MUST hold dev_mutex (ordering). The
+ * escape returns at QUEUE time; the KMD assigns a globally-unique WIRE fence id
+ * and writes it back into the escape buffer's fence_id, which `*out_fence_id`
+ * receives so the caller records it on the batch's syncs for ops.wait /
+ * WAIT_FENCE. (Against a legacy synchronous KMD the field comes back unchanged
+ * — our locally-assigned id — and its WAIT_FENCE no-op keeps the old
+ * "submit returned ⇒ done" semantics.) */
 static bool
 helios_ioctl_submit_cs(struct helios *helios,
                        const void *cs_data,
@@ -1040,10 +1061,18 @@ helios_ioctl_submit_cs(struct helios *helios,
    memcpy(buf, &hdr, sizeof(hdr));
    memcpy(buf + sizeof(hdr), cs_data, cs_size);
    const bool ok = helios_escape(helios, buf, (uint32_t)total);
+   uint64_t wire_fence_id = fence_id;
+   if (ok) {
+      /* The KMD wrote the assigned wire fence id back into the header. */
+      struct helios_escape_submit_venus out;
+      memcpy(&out, buf, sizeof(out));
+      if (out.fence_id)
+         wire_fence_id = out.fence_id;
+   }
    free(buf);
 
    if (ok && out_fence_id)
-      *out_fence_id = fence_id;
+      *out_fence_id = wire_fence_id;
    return ok;
 }
 
@@ -1093,6 +1122,14 @@ helios_ioctl_map_blob(struct helios *helios,
    return req.out_user_va;
 }
 
+/* REAL fence wait (C3/M3.4): blocks in the KMD (PASSIVE KEVENT) until the wire
+ * fence completes on the virtio used ring or timeout_ns elapses; timeout_ns==0
+ * is a poll. Returns whether the fence is COMPLETE. Called WITHOUT dev_mutex
+ * (waits must not block submits) and with HardwareAccess=0 (a blocking escape
+ * must never hold dxgkrnl's exclusive adapter lock — the 30 s Escape-convoy
+ * mechanism). out_completed is pre-set to 1 so a legacy synchronous KMD (which
+ * returns without writing the buffer) reads as complete — matching its
+ * "submit returned ⇒ done" semantics. */
 static bool
 helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeout_ns)
 {
@@ -1100,7 +1137,10 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_WAIT_FENCE, sizeof(req));
    req.fence_id = fence_id;
    req.timeout_ns = timeout_ns;
-   return helios_escape(helios, &req, sizeof(req));
+   req.out_completed = 1;
+   if (!helios_escape_ex(helios, &req, sizeof(req), false))
+      return false;
+   return req.out_completed != 0;
 }
 
 static void
@@ -1759,14 +1799,16 @@ helios_bo_create_from_device_memory(
          mtx_unlock(&helios->dev_mutex);
          return VK_ERROR_DEVICE_LOST;
       }
-      /* Optimistically signal the batch's syncs and record its fence id (matches
-       * helios_submit; a sync-only batch must still advance). The subsequent
-       * ALLOC_BLOB(blob_id=mem_id) round-trips synchronously through the KMD, which
-       * quiesces in-flight submits first — so by the time the blob binds, this
-       * batch's vkAllocateMemory has actually completed on the host. */
+      /* Record the batch's syncs against its real wire fence (a sync-only
+       * batch has fence_id 0 and must still advance immediately). The
+       * subsequent ALLOC_BLOB(blob_id=mem_id) is ordered by virglrenderer's
+       * "resource_create_blob waits for mem alloc" host-side wait — the same
+       * mechanism the upstream async virtgpu backend relies on — so the blob
+       * binds only after this batch's vkAllocateMemory executes. */
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
-         helios_sync_append_locked(renderer, sync, batch->sync_values[j], 0);
+         helios_sync_append_locked(renderer, sync, batch->sync_values[j],
+                                   fence_id);
       }
    }
 
