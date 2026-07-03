@@ -65,7 +65,12 @@ vn_ring_unset_status_bits(struct vn_ring *ring, uint32_t mask);
 bool
 vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno);
 
-void
+/* Returns true when seqno retired; false when the ring is FATAL/torn (the
+ * host decoder died — e.g. a CS error killed the context). Callers waiting
+ * for a command reply must treat false as command failure, NOT decode the
+ * (never-written) reply. Fire-and-forget teardown waits may ignore it.
+ */
+bool
 vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno);
 
 void

@@ -244,7 +244,7 @@ vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno)
    return vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno);
 }
 
-void
+bool
 vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
 {
    /* A renderer wait incurs several hops and the renderer might poll
@@ -255,9 +255,31 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
                                           : VN_RELAX_REASON_TLS_RING_SEQNO;
    struct vn_relax_state relax_state = vn_relax_init(ring->instance, reason);
    do {
+      /* Honesty check FIRST: a torn ring makes vn_ring_get_seqno_status()
+       * report "already retired" (a deliberate lie so teardown bookkeeping
+       * cannot hang), which must not be mistaken for a written reply here.
+       *
+       * A FATAL ring never advances: the host decoder died (CS error kills
+       * the whole vkr context). Spinning until vn_relax()'s watchdog
+       * abort()s takes the entire process down (this was the boot-#3 dwm
+       * kill: invalid-res_id import -> CS error -> dead ring -> the sync
+       * vkAllocateMemory stalled here -> abort). Bail out honestly instead;
+       * the caller reports command failure / VK_ERROR_DEVICE_LOST.
+       */
+      if (unlikely(!helios_ring_shared_valid(ring) ||
+                   (vn_ring_load_status(ring) &
+                    VK_RING_STATUS_FATAL_BIT_MESA))) {
+         vn_log(NULL, "vn_ring_wait_seqno: fatal/torn ring; abandoning wait "
+                      "(seqno %u)", seqno);
+#if DETECT_OS_WINDOWS
+         helios_ring_diag(ring, "fatal in wait_seqno");
+#endif
+         vn_relax_fini(&relax_state);
+         return false;
+      }
       if (vn_ring_get_seqno_status(ring, seqno)) {
          vn_relax_fini(&relax_state);
-         return;
+         return true;
       }
       vn_relax(&relax_state);
    } while (true);
@@ -807,7 +829,17 @@ vn_ring_submit_command(struct vn_ring *ring,
          void *reply_ptr = submit->reply_shmem->mmap_ptr + reply_offset;
          submit->reply =
             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
-         vn_ring_wait_seqno(ring, submit->ring_seqno);
+         if (unlikely(!vn_ring_wait_seqno(ring, submit->ring_seqno))) {
+            /* The ring died before this command retired; the reply was never
+             * written. Drop it so vn_ring_get_command_reply() returns NULL
+             * and the generated vn_call_* wrapper returns a clean error
+             * instead of decoding garbage.
+             */
+            vn_renderer_shmem_unref(ring->instance->renderer,
+                                    submit->reply_shmem);
+            submit->reply_shmem = NULL;
+            submit->ring_seqno_valid = false;
+         }
       } else {
          vn_renderer_shmem_unref(ring->instance->renderer,
                                  submit->reply_shmem);

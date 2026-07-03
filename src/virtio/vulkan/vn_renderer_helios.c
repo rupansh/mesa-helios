@@ -339,6 +339,9 @@ __declspec(dllexport) uint32_t helios_venus_current_ctx_id(void);
 __declspec(dllexport) uint64_t helios_venus_memory_id(VkDeviceMemory memory);
 __declspec(dllexport) uint32_t helios_venus_memory_res_id(VkDeviceMemory memory);
 __declspec(dllexport) uint32_t helios_venus_memory_transfer_resource_ownership(VkDeviceMemory memory);
+__declspec(dllexport) bool helios_venus_memory_alloc_info(VkDeviceMemory memory,
+                                                          uint64_t *out_alloc_size,
+                                                          uint32_t *out_memory_type_index);
 
 __declspec(dllexport) uint32_t
 helios_venus_current_ctx_id(void)
@@ -364,6 +367,32 @@ helios_venus_memory_res_id(VkDeviceMemory memory)
 
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
    return mem->base_bo ? mem->base_bo->res_id : 0;
+}
+
+/* C1 allocation identity: the exact vkAllocateMemory parameters of this
+ * memory object, recorded into the WDDM allocation's private-data trailer so
+ * a cross-process opener imports the shared resource with the CREATOR's
+ * allocation size and memory type (vkr's OPAQUE-fd import requires an
+ * exact-size match; the host only accepts the exported handle in the
+ * creator's memory type). Returns false for a null/unbacked memory. */
+__declspec(dllexport) bool
+helios_venus_memory_alloc_info(VkDeviceMemory memory,
+                               uint64_t *out_alloc_size,
+                               uint32_t *out_memory_type_index)
+{
+   if (out_alloc_size)
+      *out_alloc_size = 0;
+   if (out_memory_type_index)
+      *out_memory_type_index = 0;
+   if (memory == VK_NULL_HANDLE)
+      return false;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   if (out_alloc_size)
+      *out_alloc_size = mem->base.vk.size;
+   if (out_memory_type_index)
+      *out_memory_type_index = mem->base.vk.memory_type_index;
+   return true;
 }
 
 __declspec(dllexport) uint32_t
