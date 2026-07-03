@@ -1024,6 +1024,33 @@ vn_GetDeviceImageMemoryRequirements(
 {
    struct vn_device *dev = vn_device_from_handle(device);
 
+   /* Helios: vn_CreateImage injects the renderer external handle type into
+    * LINEAR images (vn_image_fix_create_info), so the requirements reported
+    * HERE must describe the same fixed-up create info — otherwise callers
+    * size and place memory the real (external) image cannot bind: observed
+    * live as undersized dedicated allocations + disallowed memory types
+    * (VUID 02964/01615/01617) from dwm's composition images. The predicate
+    * must match vn_CreateImage's exactly. Mirrors the
+    * vn_GetDeviceBufferMemoryRequirements fix (55e3bda40b7). */
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      dev->physical_device->external_memory.renderer_handle_type;
+   const VkExternalMemoryImageCreateInfo *external_info = vk_find_struct_const(
+      pInfo->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   const bool fix_external =
+      renderer_handle_type &&
+      (external_info
+          ? external_info->handleTypes != renderer_handle_type
+          : (pInfo->pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
+             pInfo->pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED));
+   struct vn_image_create_info local_info;
+   VkDeviceImageMemoryRequirements fixed_info;
+   if (fix_external) {
+      fixed_info = *pInfo;
+      fixed_info.pCreateInfo = vn_image_fix_create_info(
+         pInfo->pCreateInfo, renderer_handle_type, &local_info);
+      pInfo = &fixed_info;
+   }
+
    uint8_t key[BLAKE3_KEY_LEN] = { 0 };
    const bool cacheable =
       vn_image_get_image_reqs_key(dev, pInfo->pCreateInfo, key);
