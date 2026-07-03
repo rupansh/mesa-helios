@@ -561,6 +561,32 @@ vn_GetDeviceBufferMemoryRequirements(
    struct vn_buffer_reqs_cache *cache = &dev->buffer_reqs_cache;
    struct vn_buffer_memory_requirements reqs = { 0 };
 
+   /* Helios: vn_CreateBuffer injects the renderer external handle type into
+    * every buffer create (vn_buffer_fix_create_info — required because vkr
+    * force-exports HOST_VISIBLE memory, VUID-02726). The requirements
+    * reported HERE must describe the same fixed-up create info, or callers
+    * compute memory-type masks the real (external) buffer cannot satisfy:
+    * DXVK sized its global per-chunk buffers off this query's wide mask,
+    * placed buffer chunks in memory types the external buffer cannot bind,
+    * and every such chunk's global-buffer creation failed — leaving
+    * buffer-less allocations whose CPU writes no VkBuffer ever aliases
+    * (dwm's all-zero composition: dynamic vertex/constant data lost). */
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      dev->physical_device->external_memory.renderer_handle_type;
+   const VkExternalMemoryBufferCreateInfo *external_info =
+      vk_find_struct_const(pInfo->pCreateInfo->pNext,
+                           EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+   struct vn_buffer_create_info local_info;
+   VkDeviceBufferMemoryRequirements fixed_info;
+   if (renderer_handle_type &&
+       (!external_info || !external_info->handleTypes ||
+        external_info->handleTypes != renderer_handle_type)) {
+      fixed_info = *pInfo;
+      fixed_info.pCreateInfo = vn_buffer_fix_create_info(
+         pInfo->pCreateInfo, renderer_handle_type, &local_info);
+      pInfo = &fixed_info;
+   }
+
    /* If cacheable and mem requirements found in cache, skip host call */
    struct vn_buffer_reqs_cache_entry *entry =
       vn_buffer_get_cached_memory_requirements(cache, pInfo->pCreateInfo,
