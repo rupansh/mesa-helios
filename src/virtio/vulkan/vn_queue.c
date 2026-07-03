@@ -2549,8 +2549,13 @@ vn_helios_sem_deadline_ns(void)
 {
    static int64_t deadline_ns = -1;
    if (deadline_ns < 0) {
+      /* Default 8s: below IddCx's ~10s held-frame deadline, so a stalled
+       * wait inside the IDD host surfaces as VK_ERROR_DEVICE_LOST (clean
+       * device-removed recovery) BEFORE IddCx terminates WUDFHost — and
+       * still 4x the 2s Windows TDR norm, so legitimate GPU work does not
+       * trip it. */
       const uint64_t ms =
-         debug_get_num_option("VN_HELIOS_SEM_DEADLINE_MS", 30000);
+         debug_get_num_option("VN_HELIOS_SEM_DEADLINE_MS", 8000);
       deadline_ns = (int64_t)ms * 1000000;
    }
    return deadline_ns;
