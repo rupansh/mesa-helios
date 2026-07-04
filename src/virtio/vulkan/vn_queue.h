@@ -199,9 +199,22 @@ struct vn_semaphore {
        * signal op is pending, the renderer context is treated as lost even
        * if it keeps answering counter queries with stale success (the host
        * driver may never report VK_ERROR_DEVICE_LOST after killing the GPU
-       * channel). stall_since_ns == 0 means "not stalled". */
+       * channel). stall_since_ns == 0 means "not stalled".
+       *
+       * stale_strikes counts CONSECUTIVE deadline windows whose synchronous
+       * renderer probe showed zero counter movement; the loss latch requires
+       * VN_HELIOS_SEM_DEADLINE_STRIKES of them. One 8 s stale-success window
+       * is NOT proof of death under the C3/M3.4 async transport — a
+       * validate-slow host under boot/login churn legitimately stalls a
+       * semaphore that long (2026-07-04: the single-window latch killed dwm
+       * at Present #329 on an otherwise healthy host, freezing the desktop
+       * and starting an IddCx WUDFHost kill/recover loop). A genuinely dead
+       * channel (the Xid-109 zombie this deadline exists for) shows zero
+       * movement forever and still latches after strikes x deadline. Reset
+       * whenever the counter moves. */
       int64_t stall_since_ns;
       uint64_t stall_counter;
+      uint32_t stale_strikes;
 
       /* Lock for checking if an async sem wait call is needed based on
        * the current counter value and signaled_counter to ensure async

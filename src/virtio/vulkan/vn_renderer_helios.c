@@ -343,6 +343,28 @@ helios_diag(const char *fmt, ...)
    fclose(f);
 }
 
+/* Non-static diag entry for venus core code (vn_queue.c's forward-progress
+ * deadline): dwm/WUDFHost stderr is invisible, so loss-latch decisions must
+ * land in the ProgramData diag log or they can never be post-mortemed. */
+void vn_renderer_helios_diag_log(const char *fmt, ...);
+
+void
+vn_renderer_helios_diag_log(const char *fmt, ...)
+{
+   FILE *f = helios_diag_fopen("helios_icd_diag.log");
+   if (!f)
+      return;
+
+   fprintf(f, "%lld pid=%lu ", (long long)time(NULL),
+           (unsigned long)GetCurrentProcessId());
+   va_list ap;
+   va_start(ap, fmt);
+   vfprintf(f, fmt, ap);
+   va_end(ap);
+   fputc('\n', f);
+   fclose(f);
+}
+
 __declspec(dllexport) uint32_t helios_venus_current_ctx_id(void);
 __declspec(dllexport) uint64_t helios_venus_memory_id(VkDeviceMemory memory);
 __declspec(dllexport) uint32_t helios_venus_memory_res_id(VkDeviceMemory memory);

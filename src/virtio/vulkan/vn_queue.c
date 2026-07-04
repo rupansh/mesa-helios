@@ -2561,6 +2561,26 @@ vn_helios_sem_deadline_ns(void)
    return deadline_ns;
 }
 
+/* How many CONSECUTIVE stale-success deadline windows it takes to declare the
+ * renderer context lost. Under the C3/M3.4 async transport a single window of
+ * zero movement is legal (validate-slow host + boot/login churn); the Xid-109
+ * zombie this latch exists for shows zero movement FOREVER, so it still
+ * latches after strikes x deadline (default 4 x 8 s = 32 s). */
+static uint32_t
+vn_helios_sem_deadline_strikes(void)
+{
+   static uint32_t strikes = 0;
+   if (!strikes) {
+      strikes =
+         MAX2(1, debug_get_num_option("VN_HELIOS_SEM_DEADLINE_STRIKES", 4));
+   }
+   return strikes;
+}
+
+/* Defined in vn_renderer_helios.c: appends to the ProgramData Helios diag log
+ * (dwm/WUDFHost stderr is invisible — the loss latch must never be silent). */
+void vn_renderer_helios_diag_log(const char *fmt, ...);
+
 static VkResult
 vn_get_semaphore_counter_value(VkDevice dev_handle,
                                VkSemaphore sem_handle,
@@ -2652,6 +2672,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
              sem->feedback.stall_counter != counter) {
             sem->feedback.stall_since_ns = os_time_get_nano();
             sem->feedback.stall_counter = counter;
+            sem->feedback.stale_strikes = 0;
          } else if (vn_helios_sem_deadline_ns() &&
                     os_time_get_nano() - sem->feedback.stall_since_ns >=
                        vn_helios_sem_deadline_ns()) {
@@ -2674,30 +2695,60 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
          uint64_t tmp = 0;
          VkResult result = vn_call_vkGetSemaphoreCounterValue(
             dev->primary_ring, dev_handle, sem_handle, &tmp);
-         if (result == VK_ERROR_DEVICE_LOST ||
-             (deadline_hit && result == VK_SUCCESS && tmp <= counter)) {
-            /* Either the renderer admits the loss, or it keeps answering
-             * with a stale counter past the deadline while a submitted
-             * signal op is pending — the GPU channel is gone and the
-             * renderer will never say so. Fail the wait so the caller runs
-             * its device-removed recovery instead of wedging forever. */
+         if (result == VK_ERROR_DEVICE_LOST) {
+            /* The renderer admits the loss. */
             vn_log(dev->instance,
-                   "HELIOS: semaphore forward-progress deadline exceeded "
-                   "(result=%d slot=%" PRIu64 " renderer=%" PRIu64
-                   ") — treating renderer context as lost",
-                   result, counter, tmp);
+                   "HELIOS: renderer reports DEVICE_LOST on semaphore probe "
+                   "(slot=%" PRIu64 ") — treating renderer context as lost",
+                   counter);
+            vn_renderer_helios_diag_log(
+               "HELIOS sem-probe DEVICE_LOST slot=%llu — context lost",
+               (unsigned long long)counter);
             p_atomic_set(&dev->helios_lost, 1);
             return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
          }
          if (result != VK_SUCCESS)
             return result;
-         if (deadline_hit && tmp > counter) {
+         if (deadline_hit && tmp <= counter) {
+            /* Stale success past the deadline while a submitted signal op is
+             * pending. ONE window is not proof of death (async transport: a
+             * validate-slow host under boot/login churn legitimately stalls
+             * this long — the 2026-07-04 single-window latch killed a healthy
+             * dwm). Strike, restart the window, and only latch after
+             * VN_HELIOS_SEM_DEADLINE_STRIKES consecutive zero-movement
+             * windows — the Xid-109 zombie shows zero movement forever and
+             * still latches at strikes x deadline. */
+            simple_mtx_lock(&sem->feedback.counter_mtx);
+            const uint32_t strikes = ++sem->feedback.stale_strikes;
+            sem->feedback.stall_since_ns = os_time_get_nano();
+            sem->feedback.stall_counter = counter;
+            simple_mtx_unlock(&sem->feedback.counter_mtx);
+            const uint32_t max_strikes = vn_helios_sem_deadline_strikes();
+            vn_log(dev->instance,
+                   "HELIOS: semaphore forward-progress deadline window %u/%u "
+                   "with zero movement (slot=%" PRIu64 " renderer=%" PRIu64
+                   ")%s",
+                   strikes, max_strikes, counter, tmp,
+                   strikes >= max_strikes
+                      ? " — treating renderer context as lost"
+                      : "");
+            vn_renderer_helios_diag_log(
+               "HELIOS sem-deadline strike %u/%u slot=%llu renderer=%llu%s",
+               strikes, max_strikes, (unsigned long long)counter,
+               (unsigned long long)tmp,
+               strikes >= max_strikes ? " — CONTEXT LOST" : "");
+            if (strikes >= max_strikes) {
+               p_atomic_set(&dev->helios_lost, 1);
+               return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+            }
+         } else if (deadline_hit && tmp > counter) {
             /* the renderer progressed but the feedback slot missed it —
              * resync and keep waiting instead of declaring loss */
             simple_mtx_lock(&sem->feedback.counter_mtx);
             sem->feedback.signaled_counter =
                MAX2(sem->feedback.signaled_counter, tmp);
             sem->feedback.stall_since_ns = 0;
+            sem->feedback.stale_strikes = 0;
             simple_mtx_unlock(&sem->feedback.counter_mtx);
             counter = MAX2(counter, tmp);
          }
