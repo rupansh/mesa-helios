@@ -48,6 +48,7 @@
 #include "vn_device_memory.h"
 
 #include "util/cache_ops.h"
+#include "util/u_thread.h" /* retire thread (external-sync GPU-completion signal) */
 
 #include <windows.h>
 #include <setupapi.h>
@@ -229,6 +230,18 @@ struct helios_sync {
    D3DKMT_HANDLE wddm_local;
    D3DKMT_HANDLE wddm_global;
    void *wddm_cpu_va;
+   /* Reference count under dev_mutex: 1 for the vn_renderer_sync owner, +1 per
+    * queued retire-thread entry. The WDDM handles close and the struct frees on
+    * the LAST unref (a queued retire entry may legally outlive ops.destroy). */
+   uint32_t refs;
+};
+
+/* One queued "signal the shared WDDM fence when this wire fence retires" work
+ * item for the retire thread. Holds a reference on `sync`. */
+struct helios_retire_entry {
+   struct helios_retire_entry *next;
+   struct helios_sync *sync;
+   uint64_t fence_id;
 };
 
 enum helios_ioctl_stat {
@@ -300,6 +313,23 @@ struct helios {
 
    uint32_t ctx_id;
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
+
+   /* Retire thread (WS1 #4): a wire fence recorded on a SHARED sync (external
+    * win32 semaphore) must signal the shared WDDM monitored fence when it
+    * retires at host GPU completion — otherwise a cross-process consumer's
+    * monitored-fence wait completes only if the PRODUCER happens to wait on or
+    * read its own semaphore, which dwm's present path never does. The thread
+    * blocks in WAIT_FENCE (PASSIVE, in the KMD) per queued entry, then marks
+    * the fence on the sync (which signals the WDDM fence in retire order).
+    * Started lazily on the first enqueue; joined in helios_destroy. */
+   mtx_t retire_mutex;
+   cnd_t retire_cond;
+   thrd_t retire_thread;
+   bool retire_thread_live;
+   bool retire_stop;
+   struct helios_retire_entry *retire_head;
+   struct helios_retire_entry *retire_tail;
+   uint32_t retire_depth;
 
    struct vn_renderer_shmem_cache shmem_cache;
    struct helios_perf_stats perf;
@@ -1247,13 +1277,28 @@ helios_sync_append_locked(struct vn_renderer *renderer,
                           uint64_t fence_id)
 {
    if (!fence_id) {
-      if (sync->val < val) {
-         sync->val = val;
-         if (sync->wddm_local)
-            (void)helios_wddm_sync_signal(renderer, sync->wddm_local,
-                                          sync->val);
+      /* No wire fence to order on (a sync-only batch). With nothing pending the
+       * value advances immediately. With signal ops still in flight it must
+       * QUEUE BEHIND them instead: the old behavior (advance + clear pendings)
+       * blind-signaled the sync past unretired GPU work — an external consumer
+       * reading the shared WDDM fence would then read stale pixels (the exact
+       * early-signal poison WS1 #4 exists to kill). */
+      if (!sync->pending_count) {
+         if (sync->val < val) {
+            sync->val = val;
+            if (sync->wddm_local)
+               (void)helios_wddm_sync_signal(renderer, sync->wddm_local,
+                                             sync->val);
+         }
+         return true;
       }
-      sync->pending_count = 0;
+      if (sync->pending_count >= HELIOS_SYNC_PENDING_MAX)
+         return false;
+      sync->pending[sync->pending_count++] = (struct helios_sync_pending) {
+         .val = val,
+         .fence_id = 0,
+         .complete = true, /* retires with (not before) its predecessors */
+      };
       return true;
    }
 
@@ -1278,6 +1323,131 @@ helios_sync_mark_fence_locked(struct vn_renderer *renderer,
          sync->pending[i].complete = true;
    }
    helios_sync_retire_locked(renderer, sync);
+}
+
+/* ── external-sync retire thread ───────────────────────────────────────────── */
+
+/* Bounded WAIT_FENCE slices so helios_destroy's join is never stuck behind a
+ * long host wait, with a hard per-fence cap far above any legitimate GPU work.
+ * On cap the WDDM fence is deliberately left UNSIGNALED (loud diag): a consumer
+ * timing out on a real stall beats a consumer reading unfinished pixels. */
+#define HELIOS_RETIRE_SLICE_NS (250ull * 1000 * 1000)
+#define HELIOS_RETIRE_MAX_SLICES 240 /* 60 s */
+
+/* Caller holds dev_mutex. Returns whether the struct must be freed (caller
+ * frees OUTSIDE the lock). */
+static bool
+helios_sync_unref_locked(struct vn_renderer *renderer, struct helios_sync *sync)
+{
+   assert(sync->refs > 0);
+   if (--sync->refs)
+      return false;
+   if (sync->wddm_local)
+      helios_wddm_sync_destroy(renderer, sync->wddm_local);
+   sync->wddm_local = 0;
+   sync->wddm_global = 0;
+   sync->wddm_cpu_va = NULL;
+   return true;
+}
+
+static int
+helios_sync_retire_thread(void *arg)
+{
+   struct helios *helios = arg;
+   struct vn_renderer *renderer = &helios->base;
+
+   u_thread_setname("helios-retire");
+
+   mtx_lock(&helios->retire_mutex);
+   while (true) {
+      while (!helios->retire_stop && !helios->retire_head)
+         cnd_wait(&helios->retire_cond, &helios->retire_mutex);
+      if (helios->retire_stop && !helios->retire_head)
+         break;
+
+      struct helios_retire_entry *entry = helios->retire_head;
+      helios->retire_head = entry->next;
+      if (!helios->retire_head)
+         helios->retire_tail = NULL;
+      helios->retire_depth--;
+      mtx_unlock(&helios->retire_mutex);
+
+      bool complete = false;
+      if (!helios->retire_stop) {
+         uint32_t slices = 0;
+         while (!helios->retire_stop && slices < HELIOS_RETIRE_MAX_SLICES) {
+            if (helios_ioctl_wait_fence(helios, entry->fence_id,
+                                        HELIOS_RETIRE_SLICE_NS)) {
+               complete = true;
+               break;
+            }
+            slices++;
+         }
+         if (!complete && !helios->retire_stop) {
+            helios_diag("retire-thread GIVING UP on wire fence %llu after %u "
+                        "slices — shared sync stays UNSIGNALED (sem=%p)",
+                        (unsigned long long)entry->fence_id,
+                        HELIOS_RETIRE_MAX_SLICES, (void *)entry->sync);
+         }
+      }
+
+      bool free_sync;
+      mtx_lock(&helios->dev_mutex);
+      if (complete)
+         helios_sync_mark_fence_locked(renderer, entry->sync, entry->fence_id);
+      free_sync = helios_sync_unref_locked(renderer, entry->sync);
+      mtx_unlock(&helios->dev_mutex);
+      if (free_sync)
+         free(entry->sync);
+      free(entry);
+
+      mtx_lock(&helios->retire_mutex);
+   }
+   mtx_unlock(&helios->retire_mutex);
+   return 0;
+}
+
+/* Queue "signal the shared WDDM fence when `fence_id` retires" for `sync`.
+ * Caller holds dev_mutex (takes retire_mutex inside; the retire thread never
+ * holds retire_mutex while taking dev_mutex, so the order is deadlock-free).
+ * Takes a reference on `sync`. */
+static bool
+helios_retire_enqueue_locked(struct helios *helios,
+                             struct helios_sync *sync,
+                             uint64_t fence_id)
+{
+   struct helios_retire_entry *entry = malloc(sizeof(*entry));
+   if (!entry)
+      return false;
+   entry->next = NULL;
+   entry->sync = sync;
+   entry->fence_id = fence_id;
+
+   mtx_lock(&helios->retire_mutex);
+   if (!helios->retire_thread_live) {
+      if (u_thread_create(&helios->retire_thread, helios_sync_retire_thread,
+                          helios) != thrd_success) {
+         mtx_unlock(&helios->retire_mutex);
+         free(entry);
+         helios_diag("retire-thread creation FAILED — external sync %p cannot "
+                     "signal at GPU completion", (void *)sync);
+         return false;
+      }
+      helios->retire_thread_live = true;
+   }
+   sync->refs++;
+   if (helios->retire_tail)
+      helios->retire_tail->next = entry;
+   else
+      helios->retire_head = entry;
+   helios->retire_tail = entry;
+   helios->retire_depth++;
+   if (helios->retire_depth > 256 && !(helios->retire_depth & 0x3F))
+      helios_diag("retire queue depth %u — external signals outrunning host "
+                  "completion", helios->retire_depth);
+   cnd_signal(&helios->retire_cond);
+   mtx_unlock(&helios->retire_mutex);
+   return true;
 }
 
 static bool
@@ -1554,6 +1724,14 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
          if (!helios_sync_append_locked(renderer, sync, batch->sync_values[j],
                                         fence_id)) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+         /* A SHARED sync must signal its WDDM fence at wire-fence retirement
+          * without relying on this process ever waiting on it — hand the
+          * (sync, fence) pair to the retire thread. */
+         if (fence_id && sync->wddm_local &&
+             !helios_retire_enqueue_locked(helios, sync, fence_id)) {
             result = VK_ERROR_OUT_OF_HOST_MEMORY;
             break;
          }
@@ -1843,7 +2021,8 @@ helios_bo_create_from_device_memory(
          return VK_ERROR_DEVICE_LOST;
       }
       /* Record the batch's syncs against its real wire fence (a sync-only
-       * batch has fence_id 0 and must still advance immediately). The
+       * batch has fence_id 0 and advances immediately when nothing is
+       * pending, else queues behind the in-flight signal ops). The
        * subsequent ALLOC_BLOB(blob_id=mem_id) is ordered by virglrenderer's
        * "resource_create_blob waits for mem alloc" host-side wait — the same
        * mechanism the upstream async virtgpu backend relies on — so the blob
@@ -1852,6 +2031,8 @@ helios_bo_create_from_device_memory(
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
          helios_sync_append_locked(renderer, sync, batch->sync_values[j],
                                    fence_id);
+         if (fence_id && sync->wddm_local)
+            (void)helios_retire_enqueue_locked(helios, sync, fence_id);
       }
    }
 
@@ -2079,6 +2260,7 @@ helios_sync_create(struct vn_renderer *renderer,
 
    sync->base.sync_id = 0; /* unused: Helios does not carry host sync ids on the wire */
    sync->val = initial_val;
+   sync->refs = 1;
    if (flags & VN_RENDERER_SYNC_SHAREABLE) {
       VkResult result =
          helios_wddm_sync_create(renderer, initial_val, true,
@@ -2100,15 +2282,14 @@ helios_sync_destroy(struct vn_renderer *renderer, struct vn_renderer_sync *_sync
    struct helios *helios = (struct helios *)renderer;
    struct helios_sync *sync = (struct helios_sync *)_sync;
 
+   /* Drop the owner reference; a queued retire entry may still hold one, in
+    * which case the retire thread frees the struct after its WAIT_FENCE. */
    mtx_lock(&helios->dev_mutex);
-   if (sync->wddm_local)
-      helios_wddm_sync_destroy(renderer, sync->wddm_local);
-   sync->wddm_local = 0;
-   sync->wddm_global = 0;
-   sync->wddm_cpu_va = NULL;
+   const bool free_sync = helios_sync_unref_locked(renderer, sync);
    mtx_unlock(&helios->dev_mutex);
 
-   free(sync);
+   if (free_sync)
+      free(sync);
 }
 
 static VkResult
@@ -2196,6 +2377,7 @@ vn_renderer_helios_sync_create_from_win32(
    if (!sync)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+   sync->refs = 1;
    VkResult result;
    switch (handle_type) {
    case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
@@ -2313,6 +2495,18 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    if (helios_perf_at_exit_renderer == helios)
       helios_perf_at_exit_renderer = NULL;
 
+   /* Stop the retire thread BEFORE tearing down the escape channel: it blocks
+    * only in bounded WAIT_FENCE slices and re-checks retire_stop between them,
+    * so the join is prompt. Entries still queued drain WITHOUT marking (the
+    * device is going away); their sync references drop in the worker. */
+   mtx_lock(&helios->retire_mutex);
+   helios->retire_stop = true;
+   const bool join_retire = helios->retire_thread_live;
+   cnd_signal(&helios->retire_cond);
+   mtx_unlock(&helios->retire_mutex);
+   if (join_retire)
+      thrd_join(helios->retire_thread, NULL);
+
    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
 
    if (helios->ctx_id)
@@ -2345,6 +2539,8 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    if (helios->dev != INVALID_HANDLE_VALUE && helios->dev != NULL)
       CloseHandle(helios->dev);
 
+   cnd_destroy(&helios->retire_cond);
+   mtx_destroy(&helios->retire_mutex);
    mtx_destroy(&helios->dev_mutex);
 
    vk_free(alloc, helios);
@@ -2355,6 +2551,8 @@ helios_init(struct helios *helios)
 {
    helios_diag("helios_init enter");
    mtx_init(&helios->dev_mutex, mtx_plain);
+   mtx_init(&helios->retire_mutex, mtx_plain);
+   cnd_init(&helios->retire_cond);
    helios_perf_init(helios);
    if (helios->perf.enabled) {
       helios_perf_at_exit_renderer = helios;
