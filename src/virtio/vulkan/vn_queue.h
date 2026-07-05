@@ -216,6 +216,34 @@ struct vn_semaphore {
       uint64_t stall_counter;
       uint32_t stale_strikes;
 
+      /* Helios strike attribution (diag only; guarded by counter_mtx): the
+       * queue and value of the most recent submitted signal op targeting
+       * this semaphore, recorded at submission prepare, so a sem-deadline
+       * strike names the queue whose work is not completing instead of an
+       * anonymous slot value (18th session: dwm+explorer+WUDFHost strike
+       * ~1/min on a healthy boot; which semaphore/queue was unknown). */
+      uint64_t last_signal_queue_id;
+      uint32_t last_signal_family;
+      uint32_t last_signal_ring_idx;
+      uint64_t last_signal_value;
+      int64_t last_signal_ns;
+
+      /* Start of the current continuous period in which at least one signal
+       * op is pending host-side with no observed counter movement (guarded by
+       * cmd_mtx; 0 = not armed). Armed when the pending list gains an entry,
+       * re-armed (or cleared if the list drained) when progress recycles
+       * pending cmds, restarted on every strike.
+       *
+       * This is what the sem-deadline must measure — NOT wall time since the
+       * counter last moved: a timeline wait legally begins long before its
+       * signal is submitted (wait-before-signal), and an idle desktop parks
+       * such waits for many seconds. 18th-session attribution showed every
+       * observed strike had sig_age_ms <= 14: the deadline was firing on
+       * idle waits the moment the NEXT frame's signal was submitted, which
+       * is how a healthy login-churn boot accumulated 4 windows and tripped
+       * the DEVICE_LOST latch (the 2026-07-05 freeze cascade's first act). */
+      int64_t pending_signal_since_ns;
+
       /* Lock for checking if an async sem wait call is needed based on
        * the current counter value and signaled_counter to ensure async
        * wait order across threads.

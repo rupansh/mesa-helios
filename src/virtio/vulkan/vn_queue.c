@@ -896,6 +896,19 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
       vn_get_signal_semaphore_counter(submit, batch_index, signal_index);
    vn_feedback_set_counter(sfb_cmd->src_slot, counter);
 
+   /* Helios strike attribution: remember which queue last submitted a signal
+    * op for this semaphore (read by the sem-deadline strike log). */
+   {
+      struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
+      simple_mtx_lock(&sem->feedback.counter_mtx);
+      sem->feedback.last_signal_queue_id = queue->base.id;
+      sem->feedback.last_signal_family = queue_vk->queue_family_index;
+      sem->feedback.last_signal_ring_idx = queue->ring_idx;
+      sem->feedback.last_signal_value = counter;
+      sem->feedback.last_signal_ns = os_time_get_nano();
+      simple_mtx_unlock(&sem->feedback.counter_mtx);
+   }
+
    VkCommandBuffer sfb_cmd_handle = VK_NULL_HANDLE;
    for (uint32_t i = 0; i < dev->queue_family_count; i++) {
       if (dev->queue_families[i] == queue_vk->queue_family_index) {
@@ -2380,6 +2393,10 @@ vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem)
       list_move_to(&sfb_cmd->head, &sem->feedback.pending_cmds);
       sem->feedback.free_cmd_count--;
    }
+   /* Helios sem-deadline: a signal op is now pending — arm the
+    * pending-signal clock if it is not already running. */
+   if (!sem->feedback.pending_signal_since_ns)
+      sem->feedback.pending_signal_since_ns = os_time_get_nano();
    simple_mtx_unlock(&sem->feedback.cmd_mtx);
 
    if (!sfb_cmd) {
@@ -2650,6 +2667,12 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                }
             }
          }
+         /* Helios sem-deadline: progress was observed — restart the
+          * pending-signal clock for whatever remains pending, or disarm it
+          * if the list drained. */
+         sem->feedback.pending_signal_since_ns =
+            list_is_empty(&sem->feedback.pending_cmds) ? 0
+                                                       : os_time_get_nano();
          simple_mtx_unlock(&sem->feedback.cmd_mtx);
 
          sem->feedback.signaled_counter = counter;
@@ -2676,11 +2699,23 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
          } else if (vn_helios_sem_deadline_ns() &&
                     os_time_get_nano() - sem->feedback.stall_since_ns >=
                        vn_helios_sem_deadline_ns()) {
+            /* The deadline must measure how long a SUBMITTED signal op has
+             * been pending with zero movement, not how long the counter has
+             * merely sat still: an idle desktop legally parks wait-before-
+             * signal waits for many seconds, and the moment the next frame
+             * submits the signal the old check fired against a
+             * milliseconds-old signal (18th session: every observed strike
+             * had sig_age_ms <= 14 — all false positives; 4 of them during
+             * login churn are what tripped the DEVICE_LOST latch). */
             simple_mtx_lock(&sem->feedback.cmd_mtx);
             const bool signal_submitted =
                !list_is_empty(&sem->feedback.pending_cmds);
+            const int64_t pending_since =
+               sem->feedback.pending_signal_since_ns;
             simple_mtx_unlock(&sem->feedback.cmd_mtx);
-            if (signal_submitted) {
+            if (signal_submitted && pending_since &&
+                os_time_get_nano() - pending_since >=
+                   vn_helios_sem_deadline_ns()) {
                deadline_hit = true;
                check_device_lost = true;
             }
@@ -2722,6 +2757,25 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
             const uint32_t strikes = ++sem->feedback.stale_strikes;
             sem->feedback.stall_since_ns = os_time_get_nano();
             sem->feedback.stall_counter = counter;
+            /* Strike attribution (recorded at submission prepare): which
+             * queue submitted the signal op this wait is starving on. */
+            const uint64_t sig_queue_id = sem->feedback.last_signal_queue_id;
+            const uint32_t sig_family = sem->feedback.last_signal_family;
+            const uint32_t sig_ring = sem->feedback.last_signal_ring_idx;
+            const uint64_t sig_value = sem->feedback.last_signal_value;
+            const int64_t sig_age_ns =
+               sem->feedback.last_signal_ns
+                  ? os_time_get_nano() - sem->feedback.last_signal_ns
+                  : -1;
+            /* Restart the pending-signal clock: each strike must be earned
+             * by a full fresh deadline window of pending-with-no-movement. */
+            simple_mtx_lock(&sem->feedback.cmd_mtx);
+            const int64_t pending_ns =
+               sem->feedback.pending_signal_since_ns
+                  ? os_time_get_nano() - sem->feedback.pending_signal_since_ns
+                  : -1;
+            sem->feedback.pending_signal_since_ns = os_time_get_nano();
+            simple_mtx_unlock(&sem->feedback.cmd_mtx);
             simple_mtx_unlock(&sem->feedback.counter_mtx);
             const uint32_t max_strikes = vn_helios_sem_deadline_strikes();
             vn_log(dev->instance,
@@ -2733,9 +2787,17 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                       ? " — treating renderer context as lost"
                       : "");
             vn_renderer_helios_diag_log(
-               "HELIOS sem-deadline strike %u/%u slot=%llu renderer=%llu%s",
+               "HELIOS sem-deadline strike %u/%u slot=%llu renderer=%llu "
+               "sem=%llu reason=%s sig_queue=%llu family=%u ring=%u "
+               "sig_value=%llu sig_age_ms=%lld pending_ms=%lld%s",
                strikes, max_strikes, (unsigned long long)counter,
                (unsigned long long)tmp,
+               (unsigned long long)sem->base.id,
+               relax_state->reason_str ? relax_state->reason_str : "?",
+               (unsigned long long)sig_queue_id, sig_family, sig_ring,
+               (unsigned long long)sig_value,
+               (long long)(sig_age_ns >= 0 ? sig_age_ns / 1000000 : -1),
+               (long long)(pending_ns >= 0 ? pending_ns / 1000000 : -1),
                strikes >= max_strikes ? " — CONTEXT LOST" : "");
             if (strikes >= max_strikes) {
                p_atomic_set(&dev->helios_lost, 1);
@@ -2749,6 +2811,12 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                MAX2(sem->feedback.signaled_counter, tmp);
             sem->feedback.stall_since_ns = 0;
             sem->feedback.stale_strikes = 0;
+            simple_mtx_lock(&sem->feedback.cmd_mtx);
+            sem->feedback.pending_signal_since_ns =
+               list_is_empty(&sem->feedback.pending_cmds)
+                  ? 0
+                  : os_time_get_nano();
+            simple_mtx_unlock(&sem->feedback.cmd_mtx);
             simple_mtx_unlock(&sem->feedback.counter_mtx);
             counter = MAX2(counter, tmp);
          }
