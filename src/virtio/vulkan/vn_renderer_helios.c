@@ -74,6 +74,14 @@ struct _OBJECT_ATTRIBUTES {
    PVOID SecurityQualityOfService;
 };
 
+/* Minimal UNICODE_STRING (ntdef.h ABI) for OBJECT_ATTRIBUTES.ObjectName —
+ * named WDDM sync sharing (mingw pulls no ntdef/winternl here). */
+struct helios_unicode_string {
+   USHORT Length;
+   USHORT MaximumLength;
+   WCHAR *Buffer;
+};
+
 /* ── Helios IOCTL codes (protocol/src/ioctl.rs) ────────────────────────────── */
 /* Retained only for the not-yet-ported verbs that still route through the
  * fail-clean helios_ioctl() stub (submit/blob/wait). The System-class device
@@ -230,6 +238,10 @@ struct helios_sync {
    D3DKMT_HANDLE wddm_local;
    D3DKMT_HANDLE wddm_global;
    void *wddm_cpu_va;
+   /* NT handle created by D3DKMTShareObjects with an object NAME (export
+    * with VkExportSemaphoreWin32HandleInfoKHR::name). Held open so the name
+    * stays resolvable for consumers; closed on final unref. */
+   void *nt_named_handle;
    /* Reference count under dev_mutex: 1 for the vn_renderer_sync owner, +1 per
     * queued retire-thread entry. The WDDM handles close and the struct frees on
     * the LAST unref (a queued retire entry may legally outlive ops.destroy). */
@@ -496,8 +508,15 @@ helios_wddm_sync_create(struct vn_renderer *renderer,
     * Try a monitored fence first; fall back to the legacy D3DDDI_FENCE (no CPU VA)
     * if the adapter still rejects it, so the stack keeps working either way.
     */
+   /* Monitored fences can ONLY be NT-security-shared: dxgkrnl rejects
+    * Shared=1 without NtSecuritySharing with 0xc000000d (proven live
+    * 2026-07-06), i.e. there is no global/KMT DWORD flavor of a monitored
+    * fence. Cross-process rendezvous without handle duplication therefore
+    * uses NAMED NT sharing (vn_renderer_helios_sync_share_named /
+    * D3DKMTOpenSyncObjectNtHandleFromName). nt_shared=false is kept only
+    * for completeness and fails loudly below. */
    create.Info.Type = D3DDDI_MONITORED_FENCE;
-   create.Info.Flags.Shared = nt_shared ? 1 : 0;
+   create.Info.Flags.Shared = 1;
    create.Info.Flags.NtSecuritySharing = nt_shared ? 1 : 0;
    create.Info.MonitoredFence.InitialFenceValue = initial_val;
 
@@ -515,32 +534,16 @@ helios_wddm_sync_create(struct vn_renderer *renderer,
          (unsigned long long)create.Info.MonitoredFence.FenceValueGPUVirtualAddress);
       return VK_SUCCESS;
    }
-   helios_diag("sync_create MONITORED rejected status=0x%08x nt=%u; falling back to legacy fence",
-               (unsigned)st, nt_shared ? 1u : 0u);
-
-   memset(&create, 0, sizeof(create));
-   create.hDevice = helios->device;
-   create.Info.Type = D3DDDI_FENCE;
-   create.Info.Flags.Shared = nt_shared ? 1 : 0;
-   create.Info.Flags.NtSecuritySharing = nt_shared ? 1 : 0;
-   create.Info.Fence.FenceValue = initial_val;
-
-   st = D3DKMTCreateSynchronizationObject2(&create);
-   if (st != 0) {
-      helios_diag("sync_create failed status=0x%08x nt=%u initial=%llu dev=0x%x",
-                  (unsigned)st, nt_shared ? 1u : 0u,
-                  (unsigned long long)initial_val, (unsigned)helios->device);
-      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-   }
-
-   *out_local = create.hSyncObject;
-   *out_global = create.Info.SharedHandle;
-   if (out_cpu_va)
-      *out_cpu_va = NULL;
-   helios_diag("sync_create ok legacy-fence local=0x%x shared=0x%x nt=%u initial=%llu",
-               (unsigned)*out_local, (unsigned)*out_global, nt_shared ? 1u : 0u,
-               (unsigned long long)initial_val);
-   return VK_SUCCESS;
+   /* NO legacy-D3DDDI_FENCE fallback: the retire thread signals and the
+    * cross-process consumer waits via the FromCpu verbs, which require a
+    * monitored fence. A legacy fence "succeeding" here produces a sync whose
+    * waits hang forever (proven live 2026-07-06: monitored+Shared-without-
+    * NtSecuritySharing is rejected 0xc000000d, the legacy fallback engaged,
+    * and the KMT ring probe wedged in an unbounded kernel wait). Loud
+    * failure over fake success. */
+   helios_diag("sync_create MONITORED rejected status=0x%08x nt=%u dev=0x%x — refusing (no legacy fallback)",
+               (unsigned)st, nt_shared ? 1u : 0u, (unsigned)helios->device);
+   return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
 
 static VkResult
@@ -1344,6 +1347,10 @@ helios_sync_unref_locked(struct vn_renderer *renderer, struct helios_sync *sync)
       return false;
    if (sync->wddm_local)
       helios_wddm_sync_destroy(renderer, sync->wddm_local);
+   if (sync->nt_named_handle) {
+      CloseHandle(sync->nt_named_handle);
+      sync->nt_named_handle = NULL;
+   }
    sync->wddm_local = 0;
    sync->wddm_global = 0;
    sync->wddm_cpu_va = NULL;
@@ -2404,6 +2411,158 @@ vn_renderer_helios_sync_create_from_win32(
    if (sync->wddm_cpu_va)
       sync->val = *(const volatile uint64_t *)sync->wddm_cpu_va;
    *out_sync = &sync->base;
+   return VK_SUCCESS;
+}
+
+/* Translate a Win32-style kernel object name into the NT object-manager path
+ * OBJECT_ATTRIBUTES wants. Only the explicit forms are accepted:
+ *   L"Global\\X"  -> L"\\BaseNamedObjects\\X"   (cross-session; creator needs
+ *                                                SeCreateGlobalPrivilege)
+ *   L"\\...":     -> used verbatim (caller knows the object directory)
+ * Anything else is refused loudly — an unqualified name would silently land
+ * in the creator's per-session directory and never be visible to a session-0
+ * consumer, which is exactly the class of quiet failure this path exists to
+ * avoid. */
+static bool
+helios_nt_object_path(const WCHAR *name, WCHAR *buf, size_t buf_chars,
+                      struct helios_unicode_string *out_us)
+{
+   static const WCHAR global_prefix[] = L"Global\\";
+   const size_t global_prefix_len = ARRAY_SIZE(global_prefix) - 1;
+   size_t len;
+
+   if (!name)
+      return false;
+
+   if (wcsncmp(name, global_prefix, global_prefix_len) == 0) {
+      static const WCHAR bno[] = L"\\BaseNamedObjects\\";
+      const size_t bno_len = ARRAY_SIZE(bno) - 1;
+      const WCHAR *rest = name + global_prefix_len;
+      const size_t rest_len = wcslen(rest);
+      if (!rest_len || bno_len + rest_len + 1 > buf_chars)
+         return false;
+      memcpy(buf, bno, bno_len * sizeof(WCHAR));
+      memcpy(buf + bno_len, rest, (rest_len + 1) * sizeof(WCHAR));
+      len = bno_len + rest_len;
+   } else if (name[0] == L'\\') {
+      len = wcslen(name);
+      if (!len || len + 1 > buf_chars)
+         return false;
+      memcpy(buf, name, (len + 1) * sizeof(WCHAR));
+   } else {
+      return false;
+   }
+
+   out_us->Buffer = buf;
+   out_us->Length = (USHORT)(len * sizeof(WCHAR));
+   out_us->MaximumLength = (USHORT)((len + 1) * sizeof(WCHAR));
+   return true;
+}
+
+VkResult
+vn_renderer_helios_sync_share_named(struct vn_renderer *renderer,
+                                    struct vn_renderer_sync *_sync,
+                                    const void *name,
+                                    const void *security_attributes)
+{
+   struct helios_sync *sync = (struct helios_sync *)_sync;
+   const SECURITY_ATTRIBUTES *sa = security_attributes;
+
+   if (!sync->wddm_local)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   if (sync->nt_named_handle) /* already published once; names are per-object */
+      return VK_SUCCESS;
+
+   WCHAR path[192];
+   struct helios_unicode_string us;
+   if (!helios_nt_object_path((const WCHAR *)name, path,
+                              ARRAY_SIZE(path), &us)) {
+      helios_diag("sync_share_named: refused name (must be Global\\* or an "
+                  "absolute NT path)");
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   OBJECT_ATTRIBUTES attr;
+   memset(&attr, 0, sizeof(attr));
+   attr.Length = sizeof(attr);
+   attr.ObjectName = &us;
+   if (sa && sa->lpSecurityDescriptor)
+      attr.SecurityDescriptor = sa->lpSecurityDescriptor;
+
+   HANDLE handle = NULL;
+   D3DKMT_HANDLE object = sync->wddm_local;
+   const NTSTATUS st =
+      D3DKMTShareObjects(1, &object, &attr, GENERIC_ALL, &handle);
+   if (st != 0) {
+      helios_diag("sync_share_named failed status=0x%08x local=0x%x",
+                  (unsigned)st, (unsigned)sync->wddm_local);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   /* Keep the handle open: the kernel name lives only as long as a handle
+    * referencing it does. Closed on the sync's final unref. */
+   sync->nt_named_handle = handle;
+   helios_diag("sync_share_named ok local=0x%x handle=%p (named NT share)",
+               (unsigned)sync->wddm_local, handle);
+   return VK_SUCCESS;
+}
+
+VkResult
+vn_renderer_helios_sync_create_from_win32_name(struct vn_renderer *renderer,
+                                               const void *name,
+                                               struct vn_renderer_sync **out_sync)
+{
+   WCHAR path[192];
+   struct helios_unicode_string us;
+   if (!helios_nt_object_path((const WCHAR *)name, path,
+                              ARRAY_SIZE(path), &us)) {
+      helios_diag("sync_open_by_name: refused name (must be Global\\* or an "
+                  "absolute NT path)");
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   OBJECT_ATTRIBUTES attr;
+   memset(&attr, 0, sizeof(attr));
+   attr.Length = sizeof(attr);
+   attr.ObjectName = &us;
+
+   D3DKMT_OPENSYNCOBJECTNTHANDLEFROMNAME open_name;
+   memset(&open_name, 0, sizeof(open_name));
+   open_name.dwDesiredAccess = GENERIC_ALL;
+   open_name.pObjAttrib = &attr;
+
+   const NTSTATUS st = D3DKMTOpenSyncObjectNtHandleFromName(&open_name);
+   if (st != 0) {
+      helios_diag("sync_open_by_name failed status=0x%08x", (unsigned)st);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   struct helios_sync *sync = calloc(1, sizeof(*sync));
+   if (!sync) {
+      CloseHandle(open_name.hNtHandle);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   sync->refs = 1;
+   VkResult result = helios_wddm_sync_open_nt(renderer, open_name.hNtHandle,
+                                              &sync->wddm_local,
+                                              &sync->wddm_cpu_va);
+   /* Unlike the imported-NT-handle path (where the caller transfers handle
+    * ownership per the Vulkan spec), this handle is ours: close it once the
+    * D3DKMT local handle references the object. */
+   CloseHandle(open_name.hNtHandle);
+
+   if (result != VK_SUCCESS) {
+      free(sync);
+      return result;
+   }
+
+   sync->base.sync_id = 0;
+   if (sync->wddm_cpu_va)
+      sync->val = *(const volatile uint64_t *)sync->wddm_cpu_va;
+   *out_sync = &sync->base;
+   helios_diag("sync_open_by_name ok local=0x%x val=%llu",
+               (unsigned)sync->wddm_local, (unsigned long long)sync->val);
    return VK_SUCCESS;
 }
 

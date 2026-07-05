@@ -1231,12 +1231,16 @@ vn_physical_device_init_external_semaphore_handles(
       physical_dev->external_binary_semaphore_handles =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
 #else
+      /* NT handles only. The KMT (global-DWORD) flavor is unimplementable
+       * for the WDDM syncs backing these semaphores: dxgkrnl rejects a
+       * monitored fence with Shared=1 and no NtSecuritySharing (0xc000000d,
+       * proven live 2026-07-06), so a KMT export could never return a real
+       * global handle. Cross-process consumers import by NAME instead
+       * (VkImportSemaphoreWin32HandleInfoKHR::name). */
       physical_dev->external_binary_semaphore_handles =
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
       physical_dev->external_timeline_semaphore_handles =
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
 #endif
    }
 }

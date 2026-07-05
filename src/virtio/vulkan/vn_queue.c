@@ -2342,6 +2342,7 @@ static VkResult
 vn_semaphore_init_payloads(struct vn_device *dev,
                            struct vn_semaphore *sem,
                            uint64_t initial_val,
+                           const void *win32_export_info_pnext,
                            const VkAllocationCallbacks *alloc)
 {
    sem->permanent.type = VN_SYNC_TYPE_DEVICE_ONLY;
@@ -2352,11 +2353,30 @@ vn_semaphore_init_payloads(struct vn_device *dev,
    if (sem->external_handle_types &
        (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
+      const VkExportSemaphoreWin32HandleInfoKHR *win32_export_info =
+         win32_export_info_pnext;
       VkResult result = vn_renderer_sync_create(
          dev->renderer, initial_val, VN_RENDERER_SYNC_SHAREABLE,
          &sem->permanent.win32_sync);
       if (result != VK_SUCCESS)
          return result;
+
+      /* VkExportSemaphoreWin32HandleInfoKHR::name — publish the WDDM sync
+       * under a kernel object name so a consumer in another process/session
+       * can import it BY NAME (no handle duplication). Failure is loud and
+       * fatal for the create: a producer that thinks it exported a name
+       * nobody can open is worse than one that knows the export failed. */
+      if (win32_export_info && win32_export_info->name) {
+         result = vn_renderer_helios_sync_share_named(
+            dev->renderer, sem->permanent.win32_sync,
+            win32_export_info->name, win32_export_info->pAttributes);
+         if (result != VK_SUCCESS) {
+            vn_renderer_sync_destroy(dev->renderer,
+                                     sem->permanent.win32_sync);
+            sem->permanent.win32_sync = NULL;
+            return result;
+         }
+      }
    }
 #endif
 
@@ -2497,11 +2517,15 @@ vn_CreateSemaphore(VkDevice device,
    const struct VkExportSemaphoreCreateInfo *export_info =
       vk_find_struct_const(pCreateInfo->pNext, EXPORT_SEMAPHORE_CREATE_INFO);
    sem->is_external = export_info && export_info->handleTypes;
+   const void *win32_export_info = NULL;
 #if DETECT_OS_WINDOWS
    sem->external_handle_types = export_info ? export_info->handleTypes : 0;
+   win32_export_info = vk_find_struct_const(
+      pCreateInfo->pNext, EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR);
 #endif
 
-   VkResult result = vn_semaphore_init_payloads(dev, sem, initial_val, alloc);
+   VkResult result = vn_semaphore_init_payloads(dev, sem, initial_val,
+                                                win32_export_info, alloc);
    if (result != VK_SUCCESS)
       goto out_object_base_fini;
 
@@ -3122,9 +3146,22 @@ vn_ImportSemaphoreWin32HandleKHR(
       vn_semaphore_from_handle(pImportSemaphoreWin32HandleInfo->semaphore);
    struct vn_sync_payload *temp = &sem->temporary;
    struct vn_renderer_sync *sync = NULL;
-   VkResult result = vn_renderer_helios_sync_create_from_win32(
-      dev->renderer, pImportSemaphoreWin32HandleInfo->handleType,
-      pImportSemaphoreWin32HandleInfo->handle, &sync);
+   VkResult result;
+   if (!pImportSemaphoreWin32HandleInfo->handle &&
+       pImportSemaphoreWin32HandleInfo->name) {
+      /* Import BY NAME (exporter used VkExportSemaphoreWin32HandleInfoKHR::
+       * name) — the cross-process rendezvous that needs no handle
+       * duplication; NT handle types only. */
+      if (pImportSemaphoreWin32HandleInfo->handleType !=
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT)
+         return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      result = vn_renderer_helios_sync_create_from_win32_name(
+         dev->renderer, pImportSemaphoreWin32HandleInfo->name, &sync);
+   } else {
+      result = vn_renderer_helios_sync_create_from_win32(
+         dev->renderer, pImportSemaphoreWin32HandleInfo->handleType,
+         pImportSemaphoreWin32HandleInfo->handle, &sync);
+   }
 
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);

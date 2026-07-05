@@ -240,6 +240,28 @@ vn_renderer_helios_sync_create_from_win32(
    void *handle,
    struct vn_renderer_sync **out_sync);
 
+/* Open a NAMED NT-shared WDDM sync (the VkImportSemaphoreWin32HandleInfoKHR
+ * `name` path). `name` is the Win32-style name the exporter used, e.g.
+ * L"Global\\HeliosPresentFence_1234". */
+VkResult
+vn_renderer_helios_sync_create_from_win32_name(
+   struct vn_renderer *renderer,
+   const void *name /* LPCWSTR */,
+   struct vn_renderer_sync **out_sync);
+
+/* Publish an existing NT-shareable sync under a kernel object name (the
+ * VkExportSemaphoreWin32HandleInfoKHR `name` path). `security_attributes` is
+ * an optional LPSECURITY_ATTRIBUTES — the DACL must grant the consumer
+ * principal access when it lives in another session/account (dwm ->
+ * WUDFHost). The NT handle backing the name stays open until the sync is
+ * destroyed. */
+VkResult
+vn_renderer_helios_sync_share_named(
+   struct vn_renderer *renderer,
+   struct vn_renderer_sync *sync,
+   const void *name /* LPCWSTR */,
+   const void *security_attributes /* LPSECURITY_ATTRIBUTES */);
+
 VkResult
 vn_renderer_helios_sync_export_win32(
    struct vn_renderer *renderer,
