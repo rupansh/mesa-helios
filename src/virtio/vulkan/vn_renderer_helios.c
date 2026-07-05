@@ -725,6 +725,21 @@ helios_wddm_sync_wait(struct vn_renderer *renderer,
    return wr == WAIT_OBJECT_0 ? VK_SUCCESS : VK_TIMEOUT;
 }
 
+/* Opt-in gate for the per-op shmem/submit trace logs (HELIOS_SUBMIT_TRACE):
+ * unconditional fopen+fprintf+fclose per submission/shmem-op measurably taxed
+ * the hottest ICD paths (33 MB + 1.9 MB written in one desktop session,
+ * PSC WS2 2026-07-05). Read once per process. */
+static bool
+helios_trace_io_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      char v[8];
+      enabled = GetEnvironmentVariableA("HELIOS_SUBMIT_TRACE", v, sizeof(v)) ? 1 : 0;
+   }
+   return enabled == 1;
+}
+
 static void
 helios_trace_shmem(const char *event,
                    D3DKMT_HANDLE device,
@@ -734,6 +749,9 @@ helios_trace_shmem(const char *event,
                    uint64_t size,
                    uint64_t user_va)
 {
+   if (!helios_trace_io_enabled())
+      return;
+
    FILE *f = helios_diag_fopen("helios_icd_shmem.log");
    if (!f)
       return;
@@ -753,6 +771,9 @@ helios_trace_submit(struct helios *helios,
                     uint32_t ring_idx,
                     uint64_t fence_id)
 {
+   if (!helios_trace_io_enabled())
+      return;
+
    FILE *f = helios_diag_fopen("helios_icd_submit.log");
    if (!f)
       return;
