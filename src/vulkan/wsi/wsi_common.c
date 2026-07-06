@@ -190,33 +190,41 @@ wsi_helios_present_execute(struct wsi_swapchain *swapchain,
 
    uint64_t helios_wait_ns = 0;
    uint64_t helios_invalidate_ns = 0;
+   VkResult result;
 
-   uint64_t helios_start_ns = os_time_get_nano();
-   VkResult result = wsi->WaitForFences(swapchain->device, 1,
-                                        &swapchain->fences[image_index],
-                                        true, ~0ull);
-   helios_wait_ns = os_time_get_nano() - helios_start_ns;
-   if (result != VK_SUCCESS) {
-      mesa_logd("wsi: async sw present WaitForFences(image=%u) failed: %s",
-                image_index, vk_Result_to_str(result));
-      return result;
-   }
+   uint64_t helios_start_ns;
 
-   if (image->cpu_map != NULL) {
+   /* Vehicle-served chains skip the fence wait + invalidate (see the
+    * helios_vehicle_serving field comment). */
+   if (!swapchain->helios_vehicle_serving) {
       helios_start_ns = os_time_get_nano();
-      const VkMappedMemoryRange range = {
-         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-         .memory = image->blit.buffer != VK_NULL_HANDLE ?
-                   image->blit.memory : image->memory,
-         .offset = 0,
-         .size = VK_WHOLE_SIZE,
-      };
-      result = wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
-      helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
+      result = wsi->WaitForFences(swapchain->device, 1,
+                                  &swapchain->fences[image_index],
+                                  true, ~0ull);
+      helios_wait_ns = os_time_get_nano() - helios_start_ns;
       if (result != VK_SUCCESS) {
-         mesa_logd("wsi: async sw present invalidate(image=%u) failed: %s",
+         mesa_logd("wsi: async sw present WaitForFences(image=%u) failed: %s",
                    image_index, vk_Result_to_str(result));
          return result;
+      }
+
+      if (image->cpu_map != NULL) {
+         helios_start_ns = os_time_get_nano();
+         const VkMappedMemoryRange range = {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = image->blit.buffer != VK_NULL_HANDLE ?
+                      image->blit.memory : image->memory,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+         };
+         result =
+            wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
+         helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
+         if (result != VK_SUCCESS) {
+            mesa_logd("wsi: async sw present invalidate(image=%u) failed: %s",
+                      image_index, vk_Result_to_str(result));
+            return result;
+         }
       }
    }
 
@@ -2857,7 +2865,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             continue;
       }
 
-      if (wsi->sw) {
+      if (wsi->sw && !swapchain->helios_vehicle_serving) {
          uint64_t helios_start_ns = os_time_get_nano();
          VkResult wait_result =
             wsi->WaitForFences(vk_device_to_handle(dev),

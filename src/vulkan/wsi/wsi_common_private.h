@@ -297,6 +297,17 @@ struct wsi_swapchain {
       VkSemaphore semaphore;
       uint64_t next_value;
    } helios_present_order;
+
+   /* Helios dcomp present vehicle: true while the vehicle serves this
+    * chain's presents. The sw present prep (frame-fence wait + cpu_map
+    * invalidate) is skipped then — a 4 ms serial cost per present whose
+    * ordering duties are covered elsewhere: the vehicle's copy-time
+    * consumer wait orders the copy against the frame's GPU writes, and the
+    * pre-present throttle still waits fences[i] before reuse. Written and
+    * read on the (single) present worker thread; the one frame that races
+    * a FAILED latch falls back to GDI without the wait — bounded, counted,
+    * self-heals. */
+   bool helios_vehicle_serving;
    /**
     * Timeline for presents completing according to VK_KHR_present_wait.  The
     * present should complete as close as possible (before or after!) to the

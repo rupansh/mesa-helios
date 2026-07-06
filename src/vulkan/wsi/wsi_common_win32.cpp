@@ -98,6 +98,9 @@ static volatile LONG helios_vehicle_fallbacks;      /* presents served sw while
                                                      * requested chain */
 static volatile LONG helios_vehicle_wait_timeouts;  /* wait_last_present bounded
                                                      * timeouts (unit 3) */
+static volatile LONG helios_vehicle_drops;          /* non-FIFO frames dropped
+                                                     * because DXGI would block
+                                                     * (latency queue full) */
 
 static bool
 helios_win32_wsi_direct_map_enabled(void)
@@ -152,7 +155,7 @@ helios_win32_wsi_perf_write(void)
            " getdc_ms=%.3f getdc_avg_us=%.3f"
            " stretch_ms=%.3f stretch_avg_us=%.3f"
            " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
-           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld\n",
+           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld drops=%ld\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
            (double)helios_win32_wsi_perf.copy_ns / 1000000.0,
@@ -170,7 +173,8 @@ helios_win32_wsi_perf_write(void)
            helios_vehicle_ready, helios_vehicle_creates,
            helios_vehicle_create_fails, helios_vehicle_export_miss,
            helios_vehicle_presents, helios_vehicle_present_fails,
-           helios_vehicle_fallbacks, helios_vehicle_wait_timeouts);
+           helios_vehicle_fallbacks, helios_vehicle_wait_timeouts,
+           helios_vehicle_drops);
 
    if (f != stderr)
       fclose(f);
@@ -267,6 +271,13 @@ struct wsi_win32_vehicle {
    ID3D11Device *dev;
    ID3D11DeviceContext *ctx;
    IDXGISwapChain3 *sc;
+   /* Frame-latency waitable (non-FIFO chains): polled with zero timeout
+    * before each present — not signaled means DXGI would block Present()
+    * until the compositor consumes a frame, so the frame is DROPPED
+    * instead (mailbox/immediate semantics; a windowed flip chain is paced
+    * by dwm's ~60 Hz consumption, and blocking there capped Doom at 40 fps
+    * vs the 160 sw baseline — measured 23rd session). */
+   HANDLE frame_latency_waitable;
 
    /* In-process UMD exports (unit 2 of the road-4 design), resolved on the
     * worker from the already-loaded helios_umd module. */
@@ -551,6 +562,10 @@ wsi_win32_vehicle_find_umd_export(const char *name)
 static void
 wsi_win32_vehicle_release_com(struct wsi_win32_vehicle *v)
 {
+   if (v->frame_latency_waitable) {
+      CloseHandle(v->frame_latency_waitable);
+      v->frame_latency_waitable = NULL;
+   }
    if (v->sc) {
       v->sc->Release();
       v->sc = NULL;
@@ -612,6 +627,8 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
 
    {
       stage = "CreateSwapChainForComposition";
+      const bool non_fifo =
+         chain->base.present_mode != VK_PRESENT_MODE_FIFO_KHR;
       DXGI_SWAP_CHAIN_DESC1 desc = {};
       desc.Width = v->width;
       desc.Height = v->height;
@@ -623,6 +640,13 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
       desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
       desc.AlphaMode = v->alpha_mode;
       desc.Flags = v->allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+      /* Non-FIFO: the latency waitable is the DROP mechanism — a windowed
+       * flip chain is consumed at dwm's compose rate, so a blocking
+       * Present() would pace the app to it (Doom 40 fps vs 160 sw,
+       * measured). Polling the waitable with zero timeout turns "would
+       * block" into a counted frame drop instead. */
+      if (non_fifo)
+         desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
       IDXGISwapChain1 *sc1 = NULL;
       hr = rt->factory->CreateSwapChainForComposition(v->dev, &desc, NULL,
@@ -633,6 +657,21 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
       sc1->Release();
       if (FAILED(hr) || !v->sc)
          goto fail;
+
+      if (non_fifo) {
+         stage = "frame latency waitable";
+         IDXGISwapChain2 *sc2 = NULL;
+         hr = v->sc->QueryInterface(IID_PPV_ARGS(&sc2));
+         if (FAILED(hr) || !sc2)
+            goto fail;
+         sc2->SetMaximumFrameLatency(2);
+         v->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
+         sc2->Release();
+         if (!v->frame_latency_waitable) {
+            hr = E_UNEXPECTED;
+            goto fail;
+         }
+      }
    }
 
    /* Per-surface dcomp target/visual (surface-owned; released in
@@ -1639,6 +1678,19 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
    struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
    const struct wsi_device *wsi_dev = chain->base.wsi;
 
+   /* Non-FIFO drop point (BEFORE any side effect — no publish, no TLS
+    * source, no copy): the latency waitable unsignaled means Present()
+    * would block until dwm consumes a frame. IMMEDIATE/MAILBOX semantics
+    * are render-unthrottled + newest-frame-wins, so drop this frame and
+    * recycle the image immediately. Counted; the app renders on. */
+   if (v->frame_latency_waitable &&
+       WaitForSingleObject(v->frame_latency_waitable, 0) == WAIT_TIMEOUT) {
+      InterlockedIncrement(&helios_vehicle_drops);
+      chain->status = VK_SUCCESS;
+      wsi_win32_set_image_idle(chain, image);
+      return true;
+   }
+
    /* The frame image's venus identity, resolved once per image. */
    if (!image->vehicle.resolved) {
       uint32_t resid = 0;
@@ -1778,8 +1830,12 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    const LONG vehicle_state =
       InterlockedCompareExchange(&chain->vehicle.state, 0, 0);
    if (vehicle_state == WSI_VEHICLE_READY) {
+      /* Tells the NEXT present's prep (same worker thread) to skip the
+       * serial frame-fence wait + invalidate; cleared on latch. */
+      chain->base.helios_vehicle_serving = true;
       if (wsi_win32_queue_present_vehicle(chain, image))
          return chain->status;
+      chain->base.helios_vehicle_serving = false;
    } else if (vehicle_state == WSI_VEHICLE_INIT) {
       InterlockedIncrement(&helios_vehicle_fallbacks);
    }
