@@ -214,6 +214,15 @@ struct wsi_image_timing_request {
    VkPresentTimingInfoFlagsEXT flags;
 };
 
+struct wsi_helios_present_job;
+
+/* True unless HELIOS_WSI_ASYNC_PRESENT=0: sw presents run on a per-chain
+ * worker thread (see wsi_swapchain::helios_async below), and sw backends may
+ * allocate extra swapchain images beyond minImageCount so the GPU can run
+ * ahead of the worker's fence-wait + blit. */
+bool
+wsi_helios_async_present_enabled(void);
+
 struct wsi_swapchain {
    struct vk_object_base base;
 
@@ -225,6 +234,27 @@ struct wsi_swapchain {
    VkAllocationCallbacks alloc;
    VkFence* fences;
    VkPresentModeKHR present_mode;
+
+   /* Helios async software-present worker (sw chains only): the inline sw
+    * present path serializes the frame-fence wait (venus: host GPU completion
+    * + wire-fence retire, ~5-6 ms under Doom) + the GDI blit on the app's
+    * present thread, capping fps at 1/(wait+blit). vkQueuePresentKHR instead
+    * enqueues {image, present_id} here and returns; the worker performs the
+    * wait + invalidate + queue_present in FIFO order. Back-pressure is the
+    * existing acquire path: an image stays non-IDLE until its blit lands, so
+    * the app can only run ahead by (image_count - 1) frames. Kill switch:
+    * HELIOS_WSI_ASYNC_PRESENT=0. */
+   struct {
+      bool enabled;
+      thrd_t thread;
+      mtx_t mutex;
+      cnd_t cond;
+      struct wsi_helios_present_job *head;
+      struct wsi_helios_present_job *tail;
+      bool stop;
+      /* first worker-side failure, latched; reported by the NEXT present */
+      VkResult status;
+   } helios_async;
    /**
     * Timeline for presents completing according to VK_KHR_present_wait.  The
     * present should complete as close as possible (before or after!) to the

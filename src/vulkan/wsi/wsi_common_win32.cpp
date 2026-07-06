@@ -1089,7 +1089,29 @@ wsi_win32_surface_create_swapchain(
 
    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
 
-   const unsigned num_images = create_info->minImageCount;
+   /* Helios async present: with the fence-wait + blit on the worker thread,
+    * the swapchain depth is the app's run-ahead budget — at the requested 2-3
+    * images the app stalls in acquire before the GPU can pipeline and the
+    * worker's fence wait degenerates to a full GPU-frame-time serialization
+    * (Doom: 160 fps). Creating MORE images than minImageCount is spec-legal
+    * (apps must query vkGetSwapchainImagesKHR), but PROVEN app-hostile:
+    * idTech sizes its per-image arrays to the count it requested — an
+    * unconditional bump to 5 crashed Doom at renderer init with an unhandled
+    * C++ FatalError (2026-07-06, Crash.00003/00004). Opt-in only:
+    * HELIOS_WSI_EXTRA_IMAGES=N adds N images for engines known to re-query. */
+   unsigned num_images = create_info->minImageCount;
+   if (wsi_device->sw && wsi_helios_async_present_enabled()) {
+      static int extra_images = -1;
+      if (extra_images < 0) {
+         char extra_env[8] = "";
+         GetEnvironmentVariableA("HELIOS_WSI_EXTRA_IMAGES", extra_env,
+                                 sizeof(extra_env));
+         extra_images = (extra_env[0] >= '0' && extra_env[0] <= '9')
+                           ? atoi(extra_env) : 0;
+         extra_images = CLAMP(extra_images, 0, 8);
+      }
+      num_images += (unsigned)extra_images;
+   }
    struct wsi_win32_swapchain *chain;
    size_t size = sizeof(*chain) + num_images * sizeof(chain->images[0]);
 

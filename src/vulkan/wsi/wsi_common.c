@@ -153,6 +153,175 @@ helios_wsi_perf_note_frame(uint64_t wait_ns, uint64_t invalidate_ns,
       helios_wsi_perf_write();
 }
 
+/* Helios async software-present worker — see the field comment in
+ * wsi_common_private.h. One thread + FIFO per sw swapchain; the app's
+ * vkQueuePresentKHR no longer blocks on the frame fence or the GDI blit
+ * (measured 5-6 ms + 0.65 ms per frame under Doom = the 120 fps ceiling).
+ */
+struct wsi_helios_present_job {
+   uint32_t image_index;
+   uint64_t present_id;
+   struct wsi_helios_present_job *next;
+};
+
+bool
+wsi_helios_async_present_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = os_get_option("HELIOS_WSI_ASYNC_PRESENT");
+      cached = !(env && env[0] == '0');
+   }
+   return cached > 0;
+}
+
+/* The moved inline-sw present tail: frame-fence wait, cached-map invalidate,
+ * backend queue_present (the GDI blit). Runs on the worker thread; the
+ * backend marks the image IDLE at the end, which is what un-blocks acquire.
+ */
+static VkResult
+wsi_helios_present_execute(struct wsi_swapchain *swapchain,
+                           uint32_t image_index,
+                           uint64_t present_id)
+{
+   const struct wsi_device *wsi = swapchain->wsi;
+   struct wsi_image *image =
+      swapchain->get_wsi_image(swapchain, image_index);
+
+   uint64_t helios_wait_ns = 0;
+   uint64_t helios_invalidate_ns = 0;
+
+   uint64_t helios_start_ns = os_time_get_nano();
+   VkResult result = wsi->WaitForFences(swapchain->device, 1,
+                                        &swapchain->fences[image_index],
+                                        true, ~0ull);
+   helios_wait_ns = os_time_get_nano() - helios_start_ns;
+   if (result != VK_SUCCESS) {
+      mesa_logd("wsi: async sw present WaitForFences(image=%u) failed: %s",
+                image_index, vk_Result_to_str(result));
+      return result;
+   }
+
+   if (image->cpu_map != NULL) {
+      helios_start_ns = os_time_get_nano();
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = image->blit.buffer != VK_NULL_HANDLE ?
+                   image->blit.memory : image->memory,
+         .offset = 0,
+         .size = VK_WHOLE_SIZE,
+      };
+      result = wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
+      helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
+      if (result != VK_SUCCESS) {
+         mesa_logd("wsi: async sw present invalidate(image=%u) failed: %s",
+                   image_index, vk_Result_to_str(result));
+         return result;
+      }
+   }
+
+   /* The damage region is only consumed by the dxgi backend (never async);
+    * the sw blit is always full-extent, so NULL is exact here. */
+   helios_start_ns = os_time_get_nano();
+   result = swapchain->queue_present(swapchain, image_index, present_id, NULL);
+   uint64_t helios_queue_present_ns = os_time_get_nano() - helios_start_ns;
+
+   helios_wsi_perf_note_frame(helios_wait_ns, helios_invalidate_ns,
+                              helios_queue_present_ns);
+   if (result != VK_SUCCESS)
+      mesa_logd("wsi: async sw queue_present(image=%u) failed: %s",
+                image_index, vk_Result_to_str(result));
+   return result;
+}
+
+static int
+wsi_helios_present_worker(void *arg)
+{
+   struct wsi_swapchain *swapchain = arg;
+
+   mtx_lock(&swapchain->helios_async.mutex);
+   for (;;) {
+      while (!swapchain->helios_async.head && !swapchain->helios_async.stop)
+         cnd_wait(&swapchain->helios_async.cond,
+                  &swapchain->helios_async.mutex);
+
+      struct wsi_helios_present_job *job = swapchain->helios_async.head;
+      if (!job)
+         break; /* stop requested and the queue is fully drained */
+
+      swapchain->helios_async.head = job->next;
+      if (!swapchain->helios_async.head)
+         swapchain->helios_async.tail = NULL;
+      mtx_unlock(&swapchain->helios_async.mutex);
+
+      VkResult result = wsi_helios_present_execute(swapchain,
+                                                   job->image_index,
+                                                   job->present_id);
+      vk_free(&swapchain->alloc, job);
+
+      mtx_lock(&swapchain->helios_async.mutex);
+      if (result != VK_SUCCESS &&
+          swapchain->helios_async.status == VK_SUCCESS)
+         swapchain->helios_async.status = result;
+   }
+   mtx_unlock(&swapchain->helios_async.mutex);
+   return 0;
+}
+
+/* Returns the latched worker status on failure-so-far, VK_SUCCESS when the
+ * job is queued, or VK_ERROR_OUT_OF_HOST_MEMORY (caller may present inline).
+ */
+static VkResult
+wsi_helios_present_enqueue(struct wsi_swapchain *swapchain,
+                           uint32_t image_index,
+                           uint64_t present_id)
+{
+   struct wsi_helios_present_job *job =
+      vk_alloc(&swapchain->alloc, sizeof(*job), 8,
+               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!job)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   job->image_index = image_index;
+   job->present_id = present_id;
+   job->next = NULL;
+
+   mtx_lock(&swapchain->helios_async.mutex);
+   VkResult status = swapchain->helios_async.status;
+   if (status != VK_SUCCESS) {
+      mtx_unlock(&swapchain->helios_async.mutex);
+      vk_free(&swapchain->alloc, job);
+      return status;
+   }
+   if (swapchain->helios_async.tail)
+      swapchain->helios_async.tail->next = job;
+   else
+      swapchain->helios_async.head = job;
+   swapchain->helios_async.tail = job;
+   cnd_signal(&swapchain->helios_async.cond);
+   mtx_unlock(&swapchain->helios_async.mutex);
+   return VK_SUCCESS;
+}
+
+static void
+wsi_helios_present_worker_finish(struct wsi_swapchain *swapchain)
+{
+   if (!swapchain->helios_async.enabled)
+      return;
+
+   mtx_lock(&swapchain->helios_async.mutex);
+   swapchain->helios_async.stop = true;
+   cnd_signal(&swapchain->helios_async.cond);
+   mtx_unlock(&swapchain->helios_async.mutex);
+
+   /* The worker drains every queued present before exiting, so pending blits
+    * land before the chain's fences/images are destroyed. */
+   thrd_join(swapchain->helios_async.thread, NULL);
+   cnd_destroy(&swapchain->helios_async.cond);
+   mtx_destroy(&swapchain->helios_async.mutex);
+   swapchain->helios_async.enabled = false;
+}
+
 static const struct debug_control debug_control[] = {
    { "buffer",       WSI_DEBUG_BUFFER },
    { "sw",           WSI_DEBUG_SW },
@@ -704,6 +873,24 @@ wsi_swapchain_init(const struct wsi_device *wsi,
       chain->present_timing.supported_query_stages = timing_caps.presentStageQueries;
    }
 
+   if (wsi->sw && wsi_helios_async_present_enabled()) {
+      chain->helios_async.status = VK_SUCCESS;
+      if (mtx_init(&chain->helios_async.mutex, mtx_plain) == thrd_success) {
+         if (cnd_init(&chain->helios_async.cond) == thrd_success) {
+            if (thrd_create(&chain->helios_async.thread,
+                            wsi_helios_present_worker, chain) == thrd_success) {
+               chain->helios_async.enabled = true;
+            } else {
+               cnd_destroy(&chain->helios_async.cond);
+               mtx_destroy(&chain->helios_async.mutex);
+            }
+         } else {
+            mtx_destroy(&chain->helios_async.mutex);
+         }
+      }
+      /* !enabled falls back to the inline sw present path — slower, correct */
+   }
+
    return VK_SUCCESS;
 
 fail:
@@ -767,6 +954,10 @@ wsi_swapchain_get_present_mode(struct wsi_device *wsi,
 void
 wsi_swapchain_finish(struct wsi_swapchain *chain)
 {
+   /* Join the async present worker FIRST: it may still hold queued blits
+    * referencing the fences and images destroyed below. */
+   wsi_helios_present_worker_finish(chain);
+
    wsi_destroy_image_info(chain, &chain->image_info);
 
    if (chain->fences) {
@@ -2630,6 +2821,17 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       uint64_t helios_wait_ns = 0;
       uint64_t helios_invalidate_ns = 0;
       uint64_t helios_queue_present_ns = 0;
+
+      if (wsi->sw && swapchain->helios_async.enabled) {
+         /* Hand the frame-fence wait + blit to the per-chain worker; a
+          * worker-side failure latches and is returned by a LATER present
+          * (one-frame-late error reporting, same latch pattern as the win32
+          * chain status). OOM here falls through to the inline path. */
+         results[i] = wsi_helios_present_enqueue(
+            swapchain, image_index, image_signal_infos[i].present_id);
+         if (results[i] != VK_ERROR_OUT_OF_HOST_MEMORY)
+            continue;
+      }
 
       if (wsi->sw) {
          uint64_t helios_start_ns = os_time_get_nano();
