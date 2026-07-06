@@ -2911,6 +2911,40 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
       }
    }
 
+#if DETECT_OS_WINDOWS
+   /* Helios: fold in the WDDM monitored-fence value for win32-backed
+    * semaphores. The producer's own EXPORTED semaphore has no feedback slot
+    * (is_external skips vn_semaphore_feedback_init) and the host round-trip
+    * above never observes the completion: the queue signal is routed
+    * out-of-band onto the helios_sync/WDDM fence (see
+    * vn_signal_win32_external_semaphore), which ONLY the retire thread
+    * advances. Importers read that fence through the IMPORTED_WIN32_SYNC
+    * wait path; without this fold the producer's own process is the one
+    * observer that stays blind — proven live (25th session flip-kwait):
+    * vkcube's dxvk present-fence waiter read 0 forever while the copy had
+    * completed and every cross-process consumer saw the value. Also serves
+    * imported semaphores whose counter is queried before any wait. */
+   struct vn_sync_payload *cur_payload = sem->payload;
+   if (cur_payload->win32_sync) {
+      uint64_t sync_val = 0;
+      if (vn_renderer_sync_read(dev->renderer, cur_payload->win32_sync,
+                                &sync_val) == VK_SUCCESS &&
+          sync_val > *out_value) {
+         static bool logged_rescue = false;
+         if (!logged_rescue) {
+            logged_rescue = true;
+            vn_renderer_helios_diag_log(
+               "HELIOS win32-sem self-read served by WDDM fence: sem=%llu "
+               "wddm=%llu host/slot=%llu (first rescue this process)",
+               (unsigned long long)sem->base.id,
+               (unsigned long long)sync_val,
+               (unsigned long long)*out_value);
+         }
+         *out_value = sync_val;
+      }
+   }
+#endif
+
    return VK_SUCCESS;
 }
 
@@ -3017,8 +3051,20 @@ vn_WaitSemaphores(VkDevice device,
       struct vn_semaphore *sem =
          vn_semaphore_from_handle(pWaitInfo->pSemaphores[i]);
       struct vn_sync_payload *payload = sem->payload;
-      if (payload->type != VN_SYNC_TYPE_IMPORTED_WIN32_SYNC ||
-          !payload->win32_sync)
+      /* Any win32-sync-backed semaphore waits on the WDDM fence here:
+       * IMPORTED consumers (the WS1 #4 path) AND the producer's own
+       * EXPORTED semaphore. The exported case is load-bearing (25th-session
+       * flip-kwait wedge): is_external skips the feedback slot and the host
+       * counter never observably advances — the completion lands ONLY on
+       * the helios_sync/WDDM fence via the retire thread, so the generic
+       * relax loop below would poll a value that never comes (vkcube's
+       * present-fence waiter stalled at 0 forever, proven live).
+       * vn_renderer_wait rides pending wire-fence events, so this is an
+       * event wait, not a poll. Like the original imported-only path,
+       * win32-backed semaphores are waited serially with wait-all
+       * semantics regardless of VK_SEMAPHORE_WAIT_ANY_BIT (pre-existing
+       * contract; no mixed wait-any user exists on this stack). */
+      if (!payload->win32_sync)
          continue;
 
       const struct vn_renderer_wait wait = {
@@ -3032,28 +3078,38 @@ vn_WaitSemaphores(VkDevice device,
       if (result != VK_SUCCESS)
          return vn_result(dev->instance, result);
 
-      /* Host-side counter sync. vkr resolves vkSignalSemaphore only for
-       * >= 1.2 devices or with KHR_timeline_semaphore enabled at create,
-       * and vkr_dispatch_vkSignalSemaphore calls the proc with NO null
-       * check — on any other device this call is an ip=0 host-worker
-       * segfault: host-silent, and the guest wedges on the EPERM'd fence
-       * create that follows (proven live, 24th session). Skip it there —
-       * the feedback update below keeps guest-side waits coherent. */
-      if (dev->helios_host_timeline_procs) {
-         const VkSemaphoreSignalInfo signal_info = {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
-            .semaphore = pWaitInfo->pSemaphores[i],
-            .value = pWaitInfo->pValues[i],
-         };
-         vn_async_vkSignalSemaphore(dev->primary_ring, device, &signal_info);
-      } else {
-         static bool logged_once = false;
-         if (!logged_once) {
-            logged_once = true;
-            vn_log(dev->instance,
-                   "HELIOS: skipping host semaphore counter sync — renderer "
-                   "device lacks timeline entrypoints (< 1.2, no "
-                   "KHR_timeline_semaphore)");
+      /* Host-side counter sync — IMPORTED semaphores only: their host
+       * object never sees the exporter's GPU signal, so mirror the waited
+       * value. vkr resolves vkSignalSemaphore only for >= 1.2 devices or
+       * with KHR_timeline_semaphore enabled at create, and
+       * vkr_dispatch_vkSignalSemaphore calls the proc with NO null check —
+       * on any other device this call is an ip=0 host-worker segfault:
+       * host-silent, and the guest wedges on the EPERM'd fence create that
+       * follows (proven live, 24th session). Skip it there — the feedback
+       * update below keeps guest-side waits coherent. The EXPORTED
+       * producer semaphore must NOT be CPU-signaled here at all: its host
+       * object carries the queue submission's own pending signal op
+       * (vkSignalSemaphore to a pending value is a spec violation), and
+       * its in-process reads are served by the WDDM-fence fold in
+       * vn_get_semaphore_counter_value. */
+      if (payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC) {
+         if (dev->helios_host_timeline_procs) {
+            const VkSemaphoreSignalInfo signal_info = {
+               .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+               .semaphore = pWaitInfo->pSemaphores[i],
+               .value = pWaitInfo->pValues[i],
+            };
+            vn_async_vkSignalSemaphore(dev->primary_ring, device,
+                                       &signal_info);
+         } else {
+            static bool logged_once = false;
+            if (!logged_once) {
+               logged_once = true;
+               vn_log(dev->instance,
+                      "HELIOS: skipping host semaphore counter sync — "
+                      "renderer device lacks timeline entrypoints (< 1.2, "
+                      "no KHR_timeline_semaphore)");
+            }
          }
       }
       if (sem->feedback.slot) {
