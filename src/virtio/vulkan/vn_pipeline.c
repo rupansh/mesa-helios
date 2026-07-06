@@ -20,6 +20,40 @@
 #include "vn_physical_device.h"
 #include "vn_render_pass.h"
 
+#if DETECT_OS_WINDOWS
+/* DEFECT-0b (host "failed to look up object … type 19 (pipeline layout)" in
+ * vkCreateGraphicsPipelines) targeted trace: (ring, seqno, object id) for
+ * every pipeline-layout create/destroy and pipeline create, so the NEXT
+ * occurrence answers which side lost the layout — was the create ever
+ * submitted, on which ring, and did the wait_all barrier's awaited seqno
+ * cover it. Opt-in via the VN_HELIOS_PIPELINE_TRACE env var (per-process);
+ * a single cached-bool check when off. Lines land in the ProgramData ICD
+ * diag log (helios_icd_diag.log).
+ */
+#include <stdlib.h>
+
+void vn_renderer_helios_diag_log(const char *fmt, ...);
+
+static bool
+helios_pipeline_trace_enabled(void)
+{
+   static int cached = -1;
+   if (unlikely(cached < 0))
+      cached = getenv("VN_HELIOS_PIPELINE_TRACE") != NULL;
+   return cached > 0;
+}
+
+#define HELIOS_PIPELINE_TRACE(...)                                          \
+   do {                                                                     \
+      if (unlikely(helios_pipeline_trace_enabled()))                        \
+         vn_renderer_helios_diag_log(__VA_ARGS__);                          \
+   } while (0)
+#else
+#define HELIOS_PIPELINE_TRACE(...)                                          \
+   do {                                                                     \
+   } while (0)
+#endif
+
 /**
  * Fields in the VkGraphicsPipelineCreateInfo pNext chain that we must track
  * to determine which fields are valid and which must be erased.
@@ -302,6 +336,10 @@ vn_pipeline_layout_destroy(struct vn_device *dev,
       vn_descriptor_set_layout_unref(
          dev, pipeline_layout->push_descriptor_set_layout);
    }
+   HELIOS_PIPELINE_TRACE("PL-TRACE destroy layout id=%" PRIu64
+                         " primary_tail=%u",
+                         pipeline_layout->base.id,
+                         vn_ring_current_seqno(dev->primary_ring));
    vn_async_vkDestroyPipelineLayout(
       dev->primary_ring, vn_device_to_handle(dev),
       vn_pipeline_layout_to_handle(pipeline_layout), NULL);
@@ -372,6 +410,11 @@ vn_CreatePipelineLayout(VkDevice device,
    VkPipelineLayout layout_handle = vn_pipeline_layout_to_handle(layout);
    vn_async_vkCreatePipelineLayout(dev->primary_ring, device, pCreateInfo,
                                    NULL, &layout_handle);
+
+   HELIOS_PIPELINE_TRACE("PL-TRACE create layout id=%" PRIu64
+                         " primary_tail=%u",
+                         layout->base.id,
+                         vn_ring_current_seqno(dev->primary_ring));
 
    *pPipelineLayout = layout_handle;
 
@@ -476,6 +519,8 @@ vn_get_target_ring(struct vn_device *dev)
        *   object it depends on. Treat different sync mode separately.
        */
       vn_ring_wait_all(dev->primary_ring);
+      HELIOS_PIPELINE_TRACE("PL-TRACE barrier waited primary_tail=%u",
+                            vn_ring_current_seqno(dev->primary_ring));
    }
    return ring;
 }
@@ -1736,6 +1781,22 @@ vn_CreateGraphicsPipelines(VkDevice device,
       STACK_ARRAY_FINISH(fix_descs);
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
+
+#if DETECT_OS_WINDOWS
+   if (unlikely(helios_pipeline_trace_enabled())) {
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         struct vn_pipeline_layout *layout =
+            vn_pipeline_layout_from_handle(pCreateInfos[i].layout);
+         HELIOS_PIPELINE_TRACE(
+            "PL-TRACE create_gfx[%u/%u] layout_id=%" PRIu64
+            " ring=%s sync=%d primary_tail=%u",
+            i, createInfoCount, layout ? layout->base.id : 0,
+            target_ring == dev->primary_ring ? "primary" : "tls",
+            want_sync || target_ring != dev->primary_ring,
+            vn_ring_current_seqno(dev->primary_ring));
+      }
+   }
+#endif
 
    if (want_sync || target_ring != dev->primary_ring) {
       if (target_ring == dev->primary_ring) {

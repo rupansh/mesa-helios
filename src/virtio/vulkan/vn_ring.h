@@ -76,6 +76,12 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno);
 void
 vn_ring_wait_all(struct vn_ring *ring);
 
+/* Diagnostic (defect-0b pipeline trace): the ring's submitted-up-to seqno at
+ * call time; 0 on a torn ring.
+ */
+uint32_t
+vn_ring_current_seqno(const struct vn_ring *ring);
+
 struct vn_ring_submit_command {
    /* empty command implies errors */
    struct vn_cs_encoder command;

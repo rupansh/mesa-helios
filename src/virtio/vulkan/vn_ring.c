@@ -70,13 +70,24 @@ struct vn_ring {
 };
 
 #if DETECT_OS_WINDOWS
+/* ProgramData diag sink (vn_renderer_helios.c) — C:\Windows\Temp is not
+ * writable from the restricted IddCx host process, so ring diags written
+ * there silently vanished for WUDFHost (defect-0b audit, 2026-07-06). */
+void vn_renderer_helios_diag_log(const char *fmt, ...);
+
+/* Log on a power-of-two decay (1st, 2nd, 4th, ... occurrence). A dead ring
+ * keeps taking submissions — the flat per-submit diag produced 62k identical
+ * lines in 13 s on the 21st-session death boot, burying the one line that
+ * mattered. */
+static bool
+helios_diag_should_log(uint32_t n)
+{
+   return (n & (n - 1)) == 0;
+}
+
 static void
 helios_ring_diag(const struct vn_ring *ring, const char *msg)
 {
-   FILE *f = fopen("C:\\Windows\\Temp\\helios_icd_diag.log", "a");
-   if (!f)
-      return;
-
    uint32_t head_value = 0;
    uint32_t tail_value = 0;
    uint32_t status_value = 0;
@@ -92,20 +103,14 @@ helios_ring_diag(const struct vn_ring *ring, const char *msg)
             atomic_load_explicit(ring->shared.status, memory_order_seq_cst);
    }
 
-   fprintf(f,
-           "%lu ring %s ring=%p id=%llu head=%p/%u tail=%p/%u "
-           "status=%p/0x%08x buffer=%p "
-           "cur=%u size=%u mask=0x%x\n",
-           GetTickCount(), msg, (const void *)ring,
-           ring ? (unsigned long long)ring->id : 0,
-           ring ? (const void *)ring->shared.head : NULL, head_value,
-           ring ? (const void *)ring->shared.tail : NULL, tail_value,
-           ring ? (const void *)ring->shared.status : NULL, status_value,
-           ring ? ring->shared.buffer : NULL,
-           ring ? ring->cur : 0,
-           ring ? ring->buffer_size : 0,
-           ring ? ring->buffer_mask : 0);
-   fclose(f);
+   vn_renderer_helios_diag_log(
+      "tick=%lu ring %s ring=%p id=%llu head=%u tail=%u "
+      "status=0x%08x cur=%u size=%u",
+      GetTickCount(), msg, (const void *)ring,
+      ring ? (unsigned long long)ring->id : 0,
+      head_value, tail_value, status_value,
+      ring ? ring->cur : 0,
+      ring ? ring->buffer_size : 0);
 }
 
 static bool
@@ -125,6 +130,13 @@ helios_ring_shared_valid(const struct vn_ring *ring)
 {
    return ring && ring->shared.head && ring->shared.tail &&
           ring->shared.status && ring->shared.buffer;
+}
+
+static void
+helios_ring_diag(const struct vn_ring *ring, const char *msg)
+{
+   (void)ring;
+   (void)msg;
 }
 #endif
 
@@ -272,7 +284,14 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
          vn_log(NULL, "vn_ring_wait_seqno: fatal/torn ring; abandoning wait "
                       "(seqno %u)", seqno);
 #if DETECT_OS_WINDOWS
-         helios_ring_diag(ring, "fatal in wait_seqno");
+         {
+            static atomic_uint abandon_count;
+            const uint32_t n =
+               atomic_fetch_add_explicit(&abandon_count, 1,
+                                         memory_order_relaxed) + 1;
+            if (helios_diag_should_log(n))
+               helios_ring_diag(ring, "fatal in wait_seqno");
+         }
 #endif
          vn_relax_fini(&relax_state);
          return false;
@@ -288,13 +307,40 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
 void
 vn_ring_wait_all(struct vn_ring *ring)
 {
-   if (unlikely(!helios_ring_shared_valid(ring)))
+   /* DEFECT-0b INSTRUMENTATION: vn_ring_wait_all is the ONLY cross-ring
+    * ordering barrier (vn_get_target_ring waits on the primary ring before a
+    * TLS ring submits a pipeline create that references primary-ring objects
+    * — the host-side "failed to look up object … (pipeline layout)" class).
+    * A skipped or abandoned barrier here on an otherwise-healthy process is
+    * the smoking gun for that defect; both paths must be LOUD and land in
+    * the ProgramData diag log. Audit note (2026-07-06): across all boots on
+    * record the skip path below never fired and the abandon path fired only
+    * AFTER the host had already latched FATAL — consequences, not causes.
+    */
+   if (unlikely(!helios_ring_shared_valid(ring))) {
+      helios_ring_diag(ring, "BARRIER SKIPPED in wait_all (torn ring)");
       return;
+   }
 
    /* load from tail rather than ring->cur for atomicity */
    const uint32_t pending_seqno =
       atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
-   vn_ring_wait_seqno(ring, pending_seqno);
+   if (unlikely(!vn_ring_wait_seqno(ring, pending_seqno))) {
+      helios_ring_diag(ring, "BARRIER ABANDONED in wait_all (fatal ring)");
+   }
+}
+
+uint32_t
+vn_ring_current_seqno(const struct vn_ring *ring)
+{
+   /* diagnostic helper (defect-0b pipeline trace): the ring's submitted-up-to
+    * seqno at call time; 0 on a torn ring. Relaxed — same contract as the
+    * wait_all tail load.
+    */
+   if (unlikely(!helios_ring_shared_valid(ring)))
+      return 0;
+
+   return atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
 }
 
 static bool
@@ -553,7 +599,14 @@ vn_ring_submit_internal(struct vn_ring *ring,
    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
       vn_log(NULL, "vn_ring_submit fatal status; reporting device lost");
 #if DETECT_OS_WINDOWS
-      helios_ring_diag(ring, "fatal status");
+      {
+         static atomic_uint fatal_submit_count;
+         const uint32_t n =
+            atomic_fetch_add_explicit(&fatal_submit_count, 1,
+                                      memory_order_relaxed) + 1;
+         if (helios_diag_should_log(n))
+            helios_ring_diag(ring, "fatal status");
+      }
 #endif
       return false;
    }
