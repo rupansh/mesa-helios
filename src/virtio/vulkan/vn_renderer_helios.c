@@ -287,6 +287,12 @@ struct helios_perf_stats {
    uint64_t submit_empty_batches;
    uint64_t submit_syncs;
    uint64_t submit_cs_bytes;
+   /* helios_submit sub-phases (24th session, the 2.9 ms win32-signal
+    * renderer submit): dev_mutex acquisition wait vs the SUBMIT_VENUS
+    * escape itself vs sync bookkeeping. QPC ticks. */
+   int64_t submit_mutex_ticks;
+   int64_t submit_escape_ticks;
+   int64_t submit_sync_ticks;
    uint64_t wait_calls;
    uint64_t wait_fast;
    uint64_t wait_slow;
@@ -1366,8 +1372,15 @@ helios_sync_mark_fence_locked(struct vn_renderer *renderer,
  * long host wait, with a hard per-fence cap far above any legitimate GPU work.
  * On cap the WDDM fence is deliberately left UNSIGNALED (loud diag): a consumer
  * timing out on a real stall beats a consumer reading unfinished pixels. */
-#define HELIOS_RETIRE_SLICE_NS (250ull * 1000 * 1000)
-#define HELIOS_RETIRE_MAX_SLICES 240 /* 60 s */
+/* Slice length trades give-up granularity against escape-park duration: a
+ * parked WAIT_FENCE escape serializes against this process's SUBMIT_VENUS
+ * escapes at the dxgkrnl escape layer (measured 24th session: Doom's
+ * win32-signal submit escape averaged 2.9 ms behind the ICD1 retire
+ * thread's 250 ms parks; dwm/sw-path submits without parked waits run at
+ * 3-5 µs). Short slices bound the convoy; the retire deadline stays
+ * slices × slice = 60 s. */
+#define HELIOS_RETIRE_SLICE_NS (2ull * 1000 * 1000)
+#define HELIOS_RETIRE_MAX_SLICES 30000 /* 60 s */
 
 /* Caller holds dev_mutex. Returns whether the struct must be freed (caller
  * frees OUTSIDE the lock). */
@@ -1549,6 +1562,16 @@ helios_perf_write(struct helios *helios, bool final)
            (unsigned long long)helios->perf.submit_empty_batches,
            (unsigned long long)helios->perf.submit_syncs,
            (unsigned long long)helios->perf.submit_cs_bytes);
+   if (helios->perf.submit_calls) {
+      fprintf(f,
+              "submit_phases mutex_avg_us=%.3f escape_avg_us=%.3f sync_avg_us=%.3f\n",
+              helios_perf_ms(helios, helios->perf.submit_mutex_ticks) * 1000.0 /
+                 (double)helios->perf.submit_calls,
+              helios_perf_ms(helios, helios->perf.submit_escape_ticks) * 1000.0 /
+                 (double)helios->perf.submit_calls,
+              helios_perf_ms(helios, helios->perf.submit_sync_ticks) * 1000.0 /
+                 (double)helios->perf.submit_calls);
+   }
    fprintf(f, "wait_calls=%llu fast=%llu slow=%llu timeout=%llu\n",
            (unsigned long long)helios->perf.wait_calls,
            (unsigned long long)helios->perf.wait_fast,
@@ -1735,14 +1758,21 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
 {
    struct helios *helios = (struct helios *)renderer;
    VkResult result = VK_SUCCESS;
+   const bool perf = helios->perf.enabled;
+   LARGE_INTEGER t0 = { 0 }, t1 = { 0 }, t2 = { 0 };
 
+   if (perf)
+      QueryPerformanceCounter(&t0);
    mtx_lock(&helios->dev_mutex);
-   if (helios->perf.enabled)
+   if (perf) {
+      QueryPerformanceCounter(&t1);
+      helios->perf.submit_mutex_ticks += t1.QuadPart - t0.QuadPart;
       helios->perf.submit_calls++;
+   }
    for (uint32_t i = 0; i < submit->batch_count; i++) {
       const struct vn_renderer_submit_batch *batch = &submit->batches[i];
 
-      if (helios->perf.enabled) {
+      if (perf) {
          helios->perf.submit_batches++;
          helios->perf.submit_syncs += batch->sync_count;
          helios->perf.submit_cs_bytes += batch->cs_size;
@@ -1752,13 +1782,23 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
 
       uint64_t fence_id = 0;
       if (batch->cs_size) {
-         if (!helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
-                                     batch->ring_idx, &fence_id)) {
+         if (perf)
+            QueryPerformanceCounter(&t1);
+         const bool ok = helios_ioctl_submit_cs(
+            helios, batch->cs_data, batch->cs_size, batch->ring_idx,
+            &fence_id);
+         if (perf) {
+            QueryPerformanceCounter(&t2);
+            helios->perf.submit_escape_ticks += t2.QuadPart - t1.QuadPart;
+         }
+         if (!ok) {
             result = VK_ERROR_DEVICE_LOST;
             break;
          }
       }
 
+      if (perf)
+         QueryPerformanceCounter(&t1);
       for (uint32_t j = 0; j < batch->sync_count; j++) {
          struct helios_sync *sync = (struct helios_sync *)batch->syncs[j];
          if (!helios_sync_append_locked(renderer, sync, batch->sync_values[j],
@@ -1775,10 +1815,21 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
             break;
          }
       }
+      if (perf) {
+         QueryPerformanceCounter(&t2);
+         helios->perf.submit_sync_ticks += t2.QuadPart - t1.QuadPart;
+      }
       if (result != VK_SUCCESS)
          break;
    }
+   /* Periodic summary: atexit never runs under taskkill /F, so the phase
+    * telemetry must land during the run. Bounded: one multi-line append
+    * per 512 renderer submits. */
+   const bool write_summary =
+      perf && (helios->perf.submit_calls & 511) == 0;
    mtx_unlock(&helios->dev_mutex);
+   if (write_summary)
+      helios_perf_write(helios, false);
 
    return result;
 }

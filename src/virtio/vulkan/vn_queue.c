@@ -44,6 +44,14 @@ struct helios_queue_submit2_perf {
    uint64_t cache_flush_ns;
    uint64_t submit_ns;
    uint64_t wsi_fence_wait_ns;
+   /* Sub-phases of submit_ns (24th session, the 2.5 ms pre-present submit):
+    * prepare = vn_queue_submission_prepare_submit (feedback cmd setup),
+    * ring = the encoded vkQueueSubmit(2) on the primary ring (includes any
+    * ring-space wait), win32 = the extra renderer submission that signals
+    * win32-exported semaphores (the WS1 #4 producer sync). */
+   uint64_t submit_prepare_ns;
+   uint64_t submit_ring_ns;
+   uint64_t submit_win32_ns;
 };
 
 static struct helios_queue_submit2_perf helios_queue_submit2_perf;
@@ -98,6 +106,7 @@ helios_queue_submit2_perf_write(void)
            " wsi_flush_ms=%.3f wsi_flush_avg_us=%.3f"
            " cache_flush_ms=%.3f cache_flush_avg_us=%.3f"
            " submit_ms=%.3f submit_avg_us=%.3f"
+           " [prep_avg_us=%.3f ring_avg_us=%.3f win32_avg_us=%.3f]"
            " wsi_fence_wait_ms=%.3f wsi_fence_wait_avg_us=%.3f\n",
            helios_queue_submit2_perf.calls,
            helios_queue_submit2_perf.tls_ns / 1000000.0,
@@ -108,6 +117,9 @@ helios_queue_submit2_perf_write(void)
            HELIOS_AVG_US(helios_queue_submit2_perf.cache_flush_ns),
            helios_queue_submit2_perf.submit_ns / 1000000.0,
            HELIOS_AVG_US(helios_queue_submit2_perf.submit_ns),
+           HELIOS_AVG_US(helios_queue_submit2_perf.submit_prepare_ns),
+           HELIOS_AVG_US(helios_queue_submit2_perf.submit_ring_ns),
+           HELIOS_AVG_US(helios_queue_submit2_perf.submit_win32_ns),
            helios_queue_submit2_perf.wsi_fence_wait_ns / 1000000.0,
            HELIOS_AVG_US(helios_queue_submit2_perf.wsi_fence_wait_ns));
 
@@ -139,6 +151,22 @@ helios_queue_submit2_perf_note(uint64_t tls_ns,
           helios_queue_submit2_perf.interval ==
        0)
       helios_queue_submit2_perf_write();
+}
+
+/* Accumulated from vn_queue_submit (single-writer per app thread in
+ * practice; telemetry precision, not correctness). */
+static void
+helios_queue_submit2_perf_note_phases(uint64_t prepare_ns,
+                                      uint64_t ring_ns,
+                                      uint64_t win32_ns)
+{
+   helios_queue_submit2_perf_init();
+   if (!helios_queue_submit2_perf.enabled)
+      return;
+
+   helios_queue_submit2_perf.submit_prepare_ns += prepare_ns;
+   helios_queue_submit2_perf.submit_ring_ns += ring_ns;
+   helios_queue_submit2_perf.submit_win32_ns += win32_ns;
 }
 
 struct vn_submit_info_pnext_fix {
@@ -1207,6 +1235,10 @@ vn_queue_submit(struct vn_queue_submission *submit)
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
    struct vn_instance *instance = dev->instance;
    VkResult result;
+   uint64_t phase_prepare_ns = 0;
+   uint64_t phase_ring_ns = 0;
+   uint64_t phase_win32_ns = 0;
+   uint64_t phase_t0;
 
    /* To ensure external components waiting on the correct fence payload,
     * below sync primitives must be installed after the submission:
@@ -1217,7 +1249,9 @@ vn_queue_submit(struct vn_queue_submission *submit)
     * - fence is an external fence
     * - has an external signal semaphore
     */
+   phase_t0 = os_time_get_nano();
    result = vn_queue_submission_prepare_submit(submit);
+   phase_prepare_ns = os_time_get_nano() - phase_t0;
    if (result != VK_SUCCESS)
       return vn_error(instance, result);
 
@@ -1225,6 +1259,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
    if (!submit->batch_count && submit->fence_handle == VK_NULL_HANDLE)
       return VK_SUCCESS;
 
+   phase_t0 = os_time_get_nano();
    if (VN_PERF(NO_ASYNC_QUEUE_SUBMIT)) {
       if (submit->batch_type == VK_STRUCTURE_TYPE_SUBMIT_INFO_2) {
          result = vn_call_vkQueueSubmit2(
@@ -1258,6 +1293,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
       submit->external_payload.ring_seqno_valid = true;
       submit->external_payload.ring_seqno = ring_submit.ring_seqno;
    }
+   phase_ring_ns = os_time_get_nano() - phase_t0;
 
    /* If external fence, track the submission's ring_idx to facilitate
     * sync_file export.
@@ -1271,6 +1307,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
       fence->external_payload = submit->external_payload;
    }
 
+   phase_t0 = os_time_get_nano();
    for (uint32_t i = 0; i < submit->batch_count; i++) {
       const uint32_t signal_count = vn_get_signal_semaphore_count(submit, i);
       for (uint32_t j = 0; j < signal_count; j++) {
@@ -1297,8 +1334,12 @@ vn_queue_submit(struct vn_queue_submission *submit)
 #endif
       }
    }
+   phase_win32_ns = os_time_get_nano() - phase_t0;
 
    vn_queue_submission_cleanup(submit);
+
+   helios_queue_submit2_perf_note_phases(phase_prepare_ns, phase_ring_ns,
+                                         phase_win32_ns);
 
    return VK_SUCCESS;
 }
