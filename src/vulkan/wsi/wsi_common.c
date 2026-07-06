@@ -303,7 +303,7 @@ wsi_helios_present_enqueue(struct wsi_swapchain *swapchain,
    return VK_SUCCESS;
 }
 
-static void
+void
 wsi_helios_present_worker_finish(struct wsi_swapchain *swapchain)
 {
    if (!swapchain->helios_async.enabled)
@@ -975,6 +975,9 @@ wsi_swapchain_finish(struct wsi_swapchain *chain)
    chain->wsi->DestroySemaphore(chain->device, chain->dma_buf_semaphore,
                                 &chain->alloc);
    chain->wsi->DestroySemaphore(chain->device, chain->present_id_timeline,
+                                &chain->alloc);
+   chain->wsi->DestroySemaphore(chain->device,
+                                chain->helios_present_order.semaphore,
                                 &chain->alloc);
 
    if (chain->cmd_pools) {
@@ -2378,7 +2381,8 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
 struct wsi_image_signal_info {
    uint64_t present_id;
    uint32_t semaphore_count;
-   VkSemaphoreSubmitInfo semaphore_infos[2];
+   /* 3: explicit_sync/dma_buf + present_id_timeline + helios_present_order */
+   VkSemaphoreSubmitInfo semaphore_infos[3];
    uint32_t fence_count;
    VkFence fences[2];
 };
@@ -2599,6 +2603,26 @@ wsi_common_queue_present(const struct wsi_device *wsi,
             wsi_image_signal_info_add_semaphore(&image_signal_infos[i],
                                                 sem_info);
          }
+      }
+
+      /* Helios dcomp present vehicle: signal the present-order timeline with
+       * this present's value. The signal rides the pre-present submit (after
+       * the app's wait semaphores => after the frame's rendering) and the
+       * venus retire thread fires the exported NT semaphore at host GPU
+       * completion — the vehicle's copy-time consumer wait pairs with the
+       * (resid -> value) publish the win32 backend makes for this present. */
+      if (swapchain->helios_present_order.semaphore != VK_NULL_HANDLE) {
+         const uint64_t helios_value =
+            ++swapchain->helios_present_order.next_value;
+         image->helios_present_value = helios_value;
+         const VkSemaphoreSubmitInfo sem_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = swapchain->helios_present_order.semaphore,
+            .value = helios_value,
+            .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+         };
+         wsi_image_signal_info_add_semaphore(&image_signal_infos[i],
+                                             sem_info);
       }
 
       /* The present fence guards all client-allocated resources and GPU
@@ -3172,13 +3196,25 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
       .image = image->image,
       .buffer = VK_NULL_HANDLE,
    };
-   const VkMemoryAllocateInfo memory_info = {
+   VkMemoryAllocateInfo memory_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &memory_dedicated_info,
       .allocationSize = reqs.size,
       .memoryTypeIndex =
          info->select_image_memory_type(wsi, reqs.memoryTypeBits),
    };
+
+   /* Helios dcomp present vehicle: export the frame image's dedicated
+    * memory so its venus blob is USE_SHAREABLE (importable by resid from
+    * the vehicle's DXVK context). */
+   VkExportMemoryAllocateInfo helios_image_export_info;
+   if (info->helios_image_export_handle_types) {
+      helios_image_export_info = (VkExportMemoryAllocateInfo) {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+         .handleTypes = info->helios_image_export_handle_types,
+      };
+      __vk_append_struct(&memory_info, &helios_image_export_info);
+   }
 
    result = wsi->AllocateMemory(chain->device, &memory_info,
                                 &chain->alloc, &image->memory);
@@ -3605,10 +3641,29 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
    if (params->alloc_shm && chain->blit.type != WSI_SWAPCHAIN_NO_BLIT)
       handle_types = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
 
+   /* Helios dcomp present vehicle: the frame images must be shareable venus
+    * blobs so the vehicle's DXVK context can alias-import them by resid —
+    * external image info on the VkImage here, VkExportMemoryAllocateInfo on
+    * the image's dedicated memory in wsi_create_buffer_blit_context (the
+    * export handle types are what flip the blob to USE_SHAREABLE). The blit
+    * BUFFER (the sw fallback's cpu_map) stays private. OPAQUE_FD is venus's
+    * renderer-side handle type on this transport. */
+   VkExternalMemoryHandleTypeFlags helios_image_export = 0;
+#ifdef _WIN32
+   if (wsi_helios_vehicle_enabled() &&
+       chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT) {
+      helios_image_export = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+      assert(handle_types == 0);
+      handle_types = helios_image_export;
+   }
+#endif
+
    VkResult result = wsi_configure_image(chain, pCreateInfo,
                                          handle_types, info);
    if (result != VK_SUCCESS)
       return result;
+
+   info->helios_image_export_handle_types = helios_image_export;
 
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
       wsi_configure_buffer_image(chain, pCreateInfo,

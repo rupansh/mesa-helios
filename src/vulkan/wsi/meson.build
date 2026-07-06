@@ -28,6 +28,7 @@ endif
 
 if with_platform_windows
   files_vulkan_wsi += files('wsi_common_win32.cpp')
+  files_vulkan_wsi += files('wsi_helios_present_sync.c')
   platform_deps += dep_dxheaders
 else
   files_vulkan_wsi += files('wsi_common_headless.c')

@@ -40,6 +40,7 @@
 #include "vk_util.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
+#include "wsi_helios_present_sync.h"
 
 #define D3D12_IGNORE_SDK_LAYERS
 #include <dxgi1_4.h>
@@ -276,6 +277,12 @@ struct wsi_win32_vehicle {
     * (mirrors the dxgi path's current_swapchain switch): until then the sw
     * GDI blits keep painting the hwnd, so content flows from frame 1. */
    bool content_bound;
+
+   /* Discriminator of this chain's named present-order fence
+    * (Global\HeliosPresentFence_<pid>_<fence_id>; ICD id space = high bit
+    * set — the UMD's own producer counter lives in another DLL and a name
+    * collision fails the second create, proven live). */
+   uint32_t fence_id;
 };
 
 static bool
@@ -289,6 +296,33 @@ wsi_win32_vehicle_enabled(void)
                value[0] && value[0] != '0';
    }
    return cached > 0;
+}
+
+/* Shared with wsi_common.c (image-export decision at configure time). */
+bool
+wsi_helios_vehicle_enabled(void)
+{
+   return wsi_win32_vehicle_enabled();
+}
+
+/* Bound (µs) for the post-Present wait on the vehicle's frame copy before
+ * the frame image is recycled (helios_umd_wait_last_present). 32 ms default
+ * matches the consumer-side present-wait bound; 0 disables (racy, A/B
+ * lever only). */
+static uint32_t
+wsi_win32_vehicle_wait_us(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      char value[16] = "";
+      int parsed = 32000;
+      if (GetEnvironmentVariableA("HELIOS_WSI_VEHICLE_WAIT_US", value,
+                                  sizeof(value)) &&
+          value[0])
+         parsed = atoi(value);
+      cached = parsed < 0 ? 0 : parsed;
+   }
+   return (uint32_t)cached;
 }
 
 /* dwm/steam stderr is invisible; vehicle state changes must land in the
@@ -441,6 +475,16 @@ struct wsi_win32_image {
       int bmp_row_pitch;
       void *ppvBits;
    } sw;
+   /* Dcomp vehicle: the frame image's venus identity (resid + creator's
+    * exact allocation size/type — the vehicle's typed import needs both),
+    * resolved once at first vehicle present. resolved && resid == 0 means
+    * the memory is not a shareable blob — the chain latches FAILED. */
+   struct {
+      bool resolved;
+      uint32_t resid;
+      uint64_t alloc_size;
+      uint32_t mem_type;
+   } vehicle;
 };
 
 struct wsi_win32_surface {
@@ -733,6 +777,56 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
       /* OPAQUE and INHERIT: composition swapchains take IGNORE. */
       v->alpha_mode = DXGI_ALPHA_MODE_IGNORE;
       break;
+   }
+
+   /* Present-order timeline semaphore, exported under a kernel name — the
+    * WS1 #4 producer chain: wsi_common_queue_present signals it on every
+    * pre-present submit, the ICD retire thread fires the NT semaphore at
+    * host GPU completion, and the vehicle's copy-time consumer wait imports
+    * it by name from the published (resid -> pid, fence_id, value) slot.
+    * Created synchronously (a cheap venus call, no D3D involved); failure
+    * latches the chain to the sw path. */
+   {
+      v->fence_id = wsi_helios_present_sync_alloc_fence_id();
+      WCHAR sem_name[96];
+      _snwprintf(sem_name, ARRAY_SIZE(sem_name),
+                 L"Global\\HeliosPresentFence_%lu_%u",
+                 (unsigned long)GetCurrentProcessId(), v->fence_id);
+      const VkSemaphoreTypeCreateInfo type_info = {
+         VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+         NULL,
+         VK_SEMAPHORE_TYPE_TIMELINE,
+         0,
+      };
+      const VkExportSemaphoreCreateInfo export_info = {
+         VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+         &type_info,
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      };
+      const VkExportSemaphoreWin32HandleInfoKHR win32_info = {
+         VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+         &export_info,
+         NULL, /* default DACL: consumer is this same process/user */
+         GENERIC_ALL,
+         sem_name,
+      };
+      const VkSemaphoreCreateInfo sem_info = {
+         VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+         &win32_info,
+         0,
+      };
+      VkResult sem_res = chain->base.wsi->CreateSemaphore(
+         chain->base.device, &sem_info, &chain->base.alloc,
+         &chain->base.helios_present_order.semaphore);
+      if (sem_res != VK_SUCCESS) {
+         chain->base.helios_present_order.semaphore = VK_NULL_HANDLE;
+         helios_wsi_vehicle_diag(
+            "REFUSED chain=%p named present-order semaphore create failed (%d)",
+            (void *)chain, (int)sem_res);
+         InterlockedIncrement(&helios_vehicle_create_fails);
+         v->state = WSI_VEHICLE_FAILED;
+         return;
+      }
    }
 
    if (mtx_init(&v->mutex, mtx_plain) != thrd_success) {
@@ -1275,8 +1369,12 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    struct wsi_win32_swapchain *chain =
       (struct wsi_win32_swapchain *) drv_chain;
 
-   /* First: the vehicle worker dereferences the chain — stop and join it
-    * before anything else is torn down. */
+   /* Teardown order matters: (1) drain the async present worker — its
+    * queue_present path drives the vehicle swapchain (and, for plain sw
+    * chains, the images finished below); idempotent, wsi_swapchain_finish
+    * calls it again harmlessly. (2) Stop and join the vehicle worker — it
+    * dereferences the chain and owns the COM release. */
+   wsi_helios_present_worker_finish(&chain->base);
    wsi_win32_vehicle_finish(chain);
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
@@ -1475,6 +1573,146 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
    return VK_SUCCESS;
 }
 
+static void
+wsi_win32_vehicle_latch_present_fail(struct wsi_win32_swapchain *chain)
+{
+   InterlockedIncrement(&helios_vehicle_present_fails);
+   InterlockedIncrement(&helios_vehicle_fallbacks);
+   InterlockedExchange(&chain->vehicle.state, WSI_VEHICLE_FAILED);
+}
+
+/* Present the frame through the dcomp vehicle. Runs on the async present
+ * worker (or inline when HELIOS_WSI_ASYNC_PRESENT=0) — the frame fence was
+ * already waited by the caller, so the vehicle's copy-time consumer wait
+ * fast-paths. Returns true when the present was minted; false latches
+ * FAILED and the caller falls through to the sw GDI path, which still has
+ * fresh bytes (v1 keeps the pre-present image->buffer blit precisely so
+ * this per-frame fallback is seamless — measure before removing it). */
+static bool
+wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
+                                struct wsi_win32_image *image)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+   struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
+   const struct wsi_device *wsi_dev = chain->base.wsi;
+
+   /* The frame image's venus identity, resolved once per image. */
+   if (!image->vehicle.resolved) {
+      uint32_t resid = 0;
+      uint64_t alloc_size = 0;
+      uint32_t mem_type = 0;
+      if (wsi_dev->win32.get_helios_resource_identity)
+         resid = wsi_dev->win32.get_helios_resource_identity(
+            chain->base.device, image->base.memory, &alloc_size, &mem_type);
+      image->vehicle.resid = resid;
+      image->vehicle.alloc_size = alloc_size;
+      image->vehicle.mem_type = mem_type;
+      image->vehicle.resolved = true;
+      if (!resid)
+         helios_wsi_vehicle_diag(
+            "present FAILED chain=%p image=%p: no shareable venus resid "
+            "(identity hook %p)",
+            (void *)chain, (void *)image,
+            (void *)wsi_dev->win32.get_helios_resource_identity);
+   }
+   if (!image->vehicle.resid) {
+      wsi_win32_vehicle_latch_present_fail(chain);
+      return false;
+   }
+
+   /* This present's order value (stamped by wsi_common_queue_present when
+    * it attached the timeline signal to the pre-present submit). */
+   const uint64_t value = image->base.helios_present_value;
+
+   /* Publish BEFORE Present: the vehicle's copy reads the slot when the
+    * copy is recorded on its CS thread. */
+   if (!wsi_helios_present_sync_publish(image->vehicle.resid,
+                                        (uint32_t)GetCurrentProcessId(),
+                                        v->fence_id, value)) {
+      helios_wsi_vehicle_diag(
+         "present FAILED chain=%p: present-sync publish refused (resid=%u)",
+         (void *)chain, image->vehicle.resid);
+      wsi_win32_vehicle_latch_present_fail(chain);
+      return false;
+   }
+
+   if (v->set_source(image->vehicle.resid, value, chain->extent.width,
+                     chain->extent.height, (uint32_t)v->format,
+                     image->vehicle.alloc_size, image->vehicle.mem_type) < 0) {
+      helios_wsi_vehicle_diag(
+         "present FAILED chain=%p: set_present_source refused (resid=%u)",
+         (void *)chain, image->vehicle.resid);
+      wsi_win32_vehicle_latch_present_fail(chain);
+      return false;
+   }
+
+   /* Present-mode map: fifo -> Present(1); immediate -> Present(0, tearing);
+    * mailbox (and anything else) -> Present(0). */
+   UINT interval = 0;
+   UINT flags = 0;
+   switch (chain->base.present_mode) {
+   case VK_PRESENT_MODE_FIFO_KHR:
+      interval = 1;
+      break;
+   case VK_PRESENT_MODE_IMMEDIATE_KHR:
+      flags = v->allow_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0;
+      break;
+   default:
+      break;
+   }
+
+   const HRESULT hr = v->sc->Present(interval, flags);
+   if (FAILED(hr)) {
+      helios_wsi_vehicle_diag("present FAILED chain=%p: Present hr=0x%08lx",
+                              (void *)chain, (unsigned long)hr);
+      wsi_win32_vehicle_latch_present_fail(chain);
+      /* A dead window is a swapchain-fatal condition, not just a vehicle
+       * one — surface loss must reach the app (unit 4 lifecycle). */
+      if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+         chain->status = VK_ERROR_SURFACE_LOST_KHR;
+      return false;
+   }
+
+   /* First successful present: bind the swapchain to the surface's visual
+    * (deferred from init so the window never shows an empty composition
+    * swapchain; the sw GDI blits painted it until now). */
+   if (chain->surface->current_swapchain != chain) {
+      HRESULT chr = S_OK;
+      mtx_lock(&rt->mutex);
+      if (chain->surface->visual) {
+         chr = chain->surface->visual->SetContent(v->sc);
+         if (SUCCEEDED(chr))
+            chr = rt->dcomp->Commit();
+         if (SUCCEEDED(chr))
+            chain->surface->current_swapchain = chain;
+      } else {
+         chr = E_UNEXPECTED;
+      }
+      mtx_unlock(&rt->mutex);
+      if (FAILED(chr)) {
+         helios_wsi_vehicle_diag(
+            "present FAILED chain=%p: SetContent/Commit hr=0x%08lx",
+            (void *)chain, (unsigned long)chr);
+         wsi_win32_vehicle_latch_present_fail(chain);
+         return false;
+      }
+      helios_wsi_vehicle_diag("LIVE chain=%p: visual content bound (%ux%u)",
+                              (void *)chain, chain->extent.width,
+                              chain->extent.height);
+   }
+
+   /* Bounded wait for the vehicle's frame copy to complete before the image
+    * becomes acquirable again — the copy reads it, and re-rendering first is
+    * exactly the 21st-session torn-copy class. Timeout: proceed loudly. */
+   if (v->wait_present(wsi_win32_vehicle_wait_us()) != 0)
+      InterlockedIncrement(&helios_vehicle_wait_timeouts);
+
+   InterlockedIncrement(&helios_vehicle_presents);
+   chain->status = VK_SUCCESS;
+   wsi_win32_set_image_idle(chain, image);
+   return true;
+}
+
 static VkResult
 wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                         uint32_t image_index,
@@ -1489,6 +1727,19 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    if (chain->dxgi)
       return wsi_win32_queue_present_dxgi(chain, image, damage);
+
+   /* Dcomp vehicle: READY chains present through the vehicle; INIT/FAILED
+    * fall through to the sw path (counted as fallbacks while INIT). A
+    * vehicle-present failure latches FAILED and ALSO falls through, so the
+    * very frame that hit the failure still lands via GDI. */
+   const LONG vehicle_state =
+      InterlockedCompareExchange(&chain->vehicle.state, 0, 0);
+   if (vehicle_state == WSI_VEHICLE_READY) {
+      if (wsi_win32_queue_present_vehicle(chain, image))
+         return chain->status;
+   } else if (vehicle_state == WSI_VEHICLE_INIT) {
+      InterlockedIncrement(&helios_vehicle_fallbacks);
+   }
 
    const uint32_t src_row_pitch = image->base.row_pitches[0];
    const bool can_present_cpu_map_directly =
