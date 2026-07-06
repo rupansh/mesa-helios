@@ -1070,10 +1070,48 @@ helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_
    return true;
 }
 
+/* HardwareAccess for the default escape wrapper — now 0 (26th session).
+ *
+ * HardwareAccess=1 makes DxgkEscape take the dxgkrnl adapter CORE resource
+ * EXCLUSIVE via DXGADAPTER::AcquireCoreResourceExclusive, which FIRST runs
+ * DXGPROCESS::FlushAllDevice -> DXGDEVICE::FlushScheduler ->
+ * dxgmms2!VidSchWaitForCompletionEvent — i.e. it WAITS FOR EVERY CONTEXT
+ * QUEUE OF THE PROCESS TO DRAIN while holding the core resource. With the
+ * kernel flip-wait parking a context queue on a monitored fence whose
+ * signal comes from user mode, that is a guaranteed process-wide deadlock:
+ * the escape holds the core resource and waits for the queue; every
+ * D3DKMTSignalSynchronizationObjectFromCpu (dxvk fence waiter, flip-kwait
+ * watchdog, the ICD retire thread) convoys SHARED behind it; the queue can
+ * never drain (MEMORY.DMP 2026-07-07, !locks: one escape thread owning 3
+ * ERESOURCEs exclusive, contention 26, VidSchWaitForCompletionEvent 3m13s;
+ * same lock held a WUDFHost device-create escape 30+ s, 2026-07-04).
+ *
+ * Every Helios escape is software: the KMD stages the stream and rings the
+ * virtio doorbell in its own BAR under its own spinlock — nothing needs
+ * dxgkrnl's exclusive adapter serialization, and WAIT_FENCE + the
+ * fence-event escapes have shipped with HardwareAccess=0 since the
+ * 24th/25th sessions. `HELIOS_ESCAPE_HW=1` (env, read once) restores the
+ * old exclusive behavior as a no-rebuild kill switch. */
+static bool
+helios_escape_hw_forced(void)
+{
+   static int forced = -1;
+   if (forced < 0) {
+      char value[8];
+      forced = GetEnvironmentVariableA("HELIOS_ESCAPE_HW", value,
+                                       sizeof(value)) &&
+               value[0] && value[0] != '0';
+      if (forced)
+         helios_diag("escape: HELIOS_ESCAPE_HW=1 — exclusive-lock escapes "
+                     "restored (flip-kwait deadlock class re-armed)");
+   }
+   return forced > 0;
+}
+
 static bool
 helios_escape(struct helios *helios, void *buf, uint32_t size)
 {
-   return helios_escape_ex(helios, buf, size, true);
+   return helios_escape_ex(helios, buf, size, helios_escape_hw_forced());
 }
 
 static bool
