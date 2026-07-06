@@ -638,7 +638,11 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
    /* Per-surface dcomp target/visual (surface-owned; released in
     * wsi_win32_surface_destroy — all chains are gone by then). Serialized
     * against other chains' workers on the runtime mutex. Content binding is
-    * deferred to the first vehicle present. */
+    * deferred to the first vehicle present. topmost=FALSE matches the
+    * proven probe and the upstream dzn path; verified live 23rd session
+    * (windowed vkcube composes; a maximized chain gets promoted to direct/
+    * independent flip — correct on the display, but ABSENT from GDI-based
+    * paintcaps: eyeball vehicle windows through Looking Glass). */
    {
       stage = "dcomp target/visual";
       wsi_win32_surface *surface = chain->surface;
@@ -854,6 +858,10 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
    }
    v->thread_started = true;
 }
+
+/* Defined with the present path below; needed by swapchain destroy. */
+static void
+wsi_win32_vehicle_unbind_content(struct wsi_win32_swapchain *chain);
 
 /* Destroy-side teardown: signal stop, join (the worker releases the COM
  * stack on its own thread), then destroy the sync primitives. Must run
@@ -1388,16 +1396,8 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
     * until the new vehicle goes READY. (3) Stop and join the vehicle
     * worker — it dereferences the chain and owns the COM release. */
    wsi_helios_present_worker_finish(&chain->base);
-   if (chain->surface->current_swapchain == chain && !chain->dxgi) {
-      struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
-      mtx_lock(&rt->mutex);
-      if (chain->surface->visual && rt->dcomp) {
-         chain->surface->visual->SetContent(NULL);
-         rt->dcomp->Commit();
-      }
-      chain->surface->current_swapchain = NULL;
-      mtx_unlock(&rt->mutex);
-   }
+   if (!chain->dxgi)
+      wsi_win32_vehicle_unbind_content(chain);
    wsi_win32_vehicle_finish(chain);
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
@@ -1596,12 +1596,32 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
    return VK_SUCCESS;
 }
 
+/* Unbind the surface visual's content when THIS chain is bound. Required
+ * whenever presents latch back to the GDI path: the topmost dcomp visual
+ * otherwise occludes every GDI blit with the last vehicle frame. */
+static void
+wsi_win32_vehicle_unbind_content(struct wsi_win32_swapchain *chain)
+{
+   struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
+
+   mtx_lock(&rt->mutex);
+   if (chain->surface->current_swapchain == chain) {
+      if (chain->surface->visual && rt->dcomp) {
+         chain->surface->visual->SetContent(NULL);
+         rt->dcomp->Commit();
+      }
+      chain->surface->current_swapchain = NULL;
+   }
+   mtx_unlock(&rt->mutex);
+}
+
 static void
 wsi_win32_vehicle_latch_present_fail(struct wsi_win32_swapchain *chain)
 {
    InterlockedIncrement(&helios_vehicle_present_fails);
    InterlockedIncrement(&helios_vehicle_fallbacks);
    InterlockedExchange(&chain->vehicle.state, WSI_VEHICLE_FAILED);
+   wsi_win32_vehicle_unbind_content(chain);
 }
 
 /* Present the frame through the dcomp vehicle. Runs on the async present
