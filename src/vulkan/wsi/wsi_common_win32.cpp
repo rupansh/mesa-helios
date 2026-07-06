@@ -1154,8 +1154,18 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
    const VkPresentModeKHR *array;
    size_t array_size;
    if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
-      array = present_modes_gdi;
-      array_size = ARRAY_SIZE(present_modes_gdi);
+      /* Dcomp vehicle chains map all three modes onto DXGI flip presents
+       * (fifo -> Present(1), immediate -> Present(0)+tearing, mailbox ->
+       * Present(0)). A chain whose vehicle fails latches to the sw path,
+       * where non-FIFO degrades to the unpaced GDI blit — same behavior
+       * FIFO has there today (the sw path never paced anything). */
+      if (wsi_win32_vehicle_enabled()) {
+         array = present_modes_dxgi;
+         array_size = ARRAY_SIZE(present_modes_dxgi);
+      } else {
+         array = present_modes_gdi;
+         array_size = ARRAY_SIZE(present_modes_gdi);
+      }
    } else {
       array = present_modes_dxgi;
       array_size = ARRAY_SIZE(present_modes_dxgi);
@@ -1372,9 +1382,22 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    /* Teardown order matters: (1) drain the async present worker — its
     * queue_present path drives the vehicle swapchain (and, for plain sw
     * chains, the images finished below); idempotent, wsi_swapchain_finish
-    * calls it again harmlessly. (2) Stop and join the vehicle worker — it
-    * dereferences the chain and owns the COM release. */
+    * calls it again harmlessly. (2) Unbind the surface visual if this
+    * chain's vehicle swapchain is its content — otherwise a resize-recreate
+    * shows this chain's last frame frozen over the new chain's GDI presents
+    * until the new vehicle goes READY. (3) Stop and join the vehicle
+    * worker — it dereferences the chain and owns the COM release. */
    wsi_helios_present_worker_finish(&chain->base);
+   if (chain->surface->current_swapchain == chain && !chain->dxgi) {
+      struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
+      mtx_lock(&rt->mutex);
+      if (chain->surface->visual && rt->dcomp) {
+         chain->surface->visual->SetContent(NULL);
+         rt->dcomp->Commit();
+      }
+      chain->surface->current_swapchain = NULL;
+      mtx_unlock(&rt->mutex);
+   }
    wsi_win32_vehicle_finish(chain);
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
