@@ -24,9 +24,11 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdarg.h> /* helios_wsi_vehicle_diag */
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h> /* helios_wsi_vehicle_diag timestamps */
 
 #include "util/cnd_monotonic.h"
 #include "util/os_time.h"
@@ -44,6 +46,7 @@
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
+#include <d3d11.h> /* Helios dcomp present vehicle (road 4) */
 #include <dcomp.h>
 
 #if defined(__GNUC__)
@@ -79,6 +82,21 @@ struct helios_win32_wsi_perf {
 static struct helios_win32_wsi_perf helios_win32_wsi_perf;
 static bool helios_win32_wsi_direct_map_initialized;
 static bool helios_win32_wsi_direct_map;
+
+/* Helios dcomp present vehicle — loud process-wide counters, reported in the
+ * HELIOS_WSI_PERF line and in the failure diag lines. Every skipped/refused
+ * vehicle path moves one. (The vehicle itself is defined further down.) */
+static volatile LONG helios_vehicle_creates;        /* worker attempts */
+static volatile LONG helios_vehicle_ready;          /* READY latches */
+static volatile LONG helios_vehicle_create_fails;   /* FAILED latches (init) */
+static volatile LONG helios_vehicle_export_miss;    /* UMD exports unresolved */
+static volatile LONG helios_vehicle_presents;       /* vehicle Present() OK */
+static volatile LONG helios_vehicle_present_fails;  /* Present()/copy errors */
+static volatile LONG helios_vehicle_fallbacks;      /* presents served sw while
+                                                     * INIT/FAILED on a vehicle-
+                                                     * requested chain */
+static volatile LONG helios_vehicle_wait_timeouts;  /* wait_last_present bounded
+                                                     * timeouts (unit 3) */
 
 static bool
 helios_win32_wsi_direct_map_enabled(void)
@@ -131,7 +149,9 @@ helios_win32_wsi_perf_write(void)
            "Helios WSI win32 frames=%" PRIu64 " direct=%" PRIu64
            " copy_ms=%.3f copy_avg_us=%.3f"
            " getdc_ms=%.3f getdc_avg_us=%.3f"
-           " stretch_ms=%.3f stretch_avg_us=%.3f\n",
+           " stretch_ms=%.3f stretch_avg_us=%.3f"
+           " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
+           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
            (double)helios_win32_wsi_perf.copy_ns / 1000000.0,
@@ -145,7 +165,11 @@ helios_win32_wsi_perf_write(void)
            (double)helios_win32_wsi_perf.stretch_ns / 1000000.0,
            helios_win32_wsi_perf.frames ?
               (double)helios_win32_wsi_perf.stretch_ns / 1000.0 /
-              (double)helios_win32_wsi_perf.frames : 0.0);
+              (double)helios_win32_wsi_perf.frames : 0.0,
+           helios_vehicle_ready, helios_vehicle_creates,
+           helios_vehicle_create_fails, helios_vehicle_export_miss,
+           helios_vehicle_presents, helios_vehicle_present_fails,
+           helios_vehicle_fallbacks, helios_vehicle_wait_timeouts);
 
    if (f != stderr)
       fclose(f);
@@ -168,6 +192,234 @@ helios_win32_wsi_perf_note_frame(bool direct, uint64_t copy_ns,
 
    if (helios_win32_wsi_perf.frames % helios_win32_wsi_perf.interval == 0)
       helios_win32_wsi_perf_write();
+}
+
+/* ---------------------------------------------------------------------------
+ * Helios dcomp present vehicle (WS2 road 4, 23rd session).
+ *
+ * A D3D11 device on OUR adapter + CreateSwapChainForComposition(FLIP_*) +
+ * DirectComposition binding to the app's HWND gives Vulkan swapchains a real
+ * hardware flip-model present: DXGI/dcomp mint the win32k present tokens the
+ * ICD cannot mint itself (see ROADMAP WS2 — every redirected-token model is
+ * runtime-private), while the pixels move GPU-side (the vehicle's DXVK
+ * imports the ICD frame by resid and copies it into the backbuffer; unit 2).
+ * Mechanism proven live by tools/dcomp_present_probe.cpp (1023 flip presents,
+ * dwm composed).
+ *
+ * Lifecycle contract (the residual-risk containment):
+ *  - ALL vehicle work — LoadLibrary d3d11/dxgi/dcomp, D3D11CreateDevice,
+ *    factory, composition swapchain, dcomp target/visual — runs on a
+ *    DEDICATED worker thread kicked off at vkCreateSwapchainKHR, outside
+ *    every ICD instance/device/ring lock. The libraries load lazily there,
+ *    never at DllMain.
+ *  - Until the vehicle is READY, presents flow through the existing async
+ *    sw worker; the swap-in is visible only in counters.
+ *  - Any failure latches WSI_VEHICLE_FAILED for that swapchain (loud counter
+ *    + one diag line); the sw path keeps serving it. No retry within a
+ *    swapchain's lifetime — a recreate (resize) starts a fresh attempt.
+ *  - The worker also RELEASES the vehicle COM objects: after READY it parks
+ *    on a condvar; swapchain destroy signals stop and joins. The nested
+ *    D3D11→helios_umd→DXVK→ICD2 teardown therefore never runs on an ICD1
+ *    thread. The dcomp target/visual are per-SURFACE (owned/released by the
+ *    surface, like the in-tree dxgi path); the dcomp device + DXGI factory
+ *    are process-lifetime.
+ *  - Kill switch: HELIOS_WSI_DCOMP_PRESENT (default OFF for bring-up).
+ *
+ * ICD singleton audit for the nested ICD2 stack (23rd session): TLS rings
+ * are keyed per instance, gate5a adapter handles / retire thread / diag
+ * handles are per-renderer; the one ambiguous global (last-writer-wins
+ * helios_current_ctx_id) got an instance-scoped export the UMD bridge uses.
+ */
+
+typedef int32_t (*helios_umd_set_present_source_fn)(
+   uint32_t resid, uint64_t fence_value, uint32_t width, uint32_t height,
+   uint32_t dxgi_format, uint64_t alloc_size, uint32_t memory_type_index);
+typedef int32_t (*helios_umd_wait_last_present_fn)(uint32_t timeout_us);
+
+enum wsi_win32_vehicle_state {
+   WSI_VEHICLE_OFF = 0, /* knob off / not applicable to this chain */
+   WSI_VEHICLE_INIT,    /* worker building the D3D11/dcomp stack */
+   WSI_VEHICLE_READY,   /* vehicle presents may be routed */
+   WSI_VEHICLE_FAILED,  /* latched off; the sw path serves this chain */
+};
+
+struct wsi_win32_vehicle {
+   volatile LONG state; /* enum wsi_win32_vehicle_state */
+
+   thrd_t thread;
+   bool thread_started;
+   mtx_t mutex; /* guards stop + cond (valid iff thread_started) */
+   cnd_t cond;
+   bool stop;
+
+   /* Immutable snapshot of the swapchain create parameters for the worker
+    * (create_info does not outlive vkCreateSwapchainKHR). */
+   HWND hwnd;
+   uint32_t width;
+   uint32_t height;
+   DXGI_FORMAT format;
+   DXGI_ALPHA_MODE alpha_mode;
+   uint32_t buffer_count;
+   bool allow_tearing;
+
+   /* Created AND released on the worker thread. */
+   ID3D11Device *dev;
+   ID3D11DeviceContext *ctx;
+   IDXGISwapChain3 *sc;
+
+   /* In-process UMD exports (unit 2 of the road-4 design), resolved on the
+    * worker from the already-loaded helios_umd module. */
+   helios_umd_set_present_source_fn set_source;
+   helios_umd_wait_last_present_fn wait_present;
+
+   /* SetContent+Commit are deferred to the first successful vehicle present
+    * (mirrors the dxgi path's current_swapchain switch): until then the sw
+    * GDI blits keep painting the hwnd, so content flows from frame 1. */
+   bool content_bound;
+};
+
+static bool
+wsi_win32_vehicle_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      char value[8] = "";
+      cached = GetEnvironmentVariableA("HELIOS_WSI_DCOMP_PRESENT", value,
+                                       sizeof(value)) &&
+               value[0] && value[0] != '0';
+   }
+   return cached > 0;
+}
+
+/* dwm/steam stderr is invisible; vehicle state changes must land in the
+ * ProgramData ICD diag log (same file + line shape as vn_renderer_helios.c's
+ * helios_diag; duplicated here because wsi_common must not link against the
+ * venus renderer directly). Best effort. */
+static void
+helios_wsi_vehicle_diag(const char *fmt, ...)
+{
+   CreateDirectoryA("C:\\ProgramData\\Helios", NULL);
+   FILE *f = fopen("C:\\ProgramData\\Helios\\helios_icd_diag.log", "a");
+   if (!f)
+      return;
+   fprintf(f, "%lld pid=%lu wsi-vehicle: ", (long long)time(NULL),
+           (unsigned long)GetCurrentProcessId());
+   va_list ap;
+   va_start(ap, fmt);
+   vfprintf(f, fmt, ap);
+   va_end(ap);
+   fputc('\n', f);
+   fclose(f);
+}
+
+/* Process-lifetime vehicle runtime: the d3d11/dxgi/dcomp modules, the DXGI
+ * factory and the (rendering-device-less) dcomp device. Built lazily on a
+ * vehicle worker thread — never at DllMain, never on an app thread. The
+ * mutex also serializes per-surface dcomp target/visual creation. */
+struct wsi_win32_vehicle_runtime {
+   mtx_t mutex;
+   bool init_attempted;
+   bool usable;
+   PFN_D3D11_CREATE_DEVICE create_device;
+   IDXGIFactory4 *factory;
+   IDCompositionDevice *dcomp;
+
+   wsi_win32_vehicle_runtime()
+   {
+      mtx_init(&mutex, mtx_plain);
+      init_attempted = false;
+      usable = false;
+      create_device = NULL;
+      factory = NULL;
+      dcomp = NULL;
+   }
+};
+
+static struct wsi_win32_vehicle_runtime *
+wsi_win32_vehicle_runtime_get(void)
+{
+   /* C++11 magic static: thread-safe construction, process lifetime. */
+   static wsi_win32_vehicle_runtime rt;
+   return &rt;
+}
+
+/* Caller holds rt->mutex. One attempt per process; failure is permanent
+ * (missing system DLLs will not appear later). */
+static bool
+wsi_win32_vehicle_runtime_init_locked(struct wsi_win32_vehicle_runtime *rt)
+{
+   if (rt->init_attempted)
+      return rt->usable;
+   rt->init_attempted = true;
+
+   HMODULE d3d11_mod = LoadLibraryA("d3d11.dll");
+   HMODULE dxgi_mod = LoadLibraryA("dxgi.dll");
+   HMODULE dcomp_mod = LoadLibraryA("dcomp.dll");
+   if (!d3d11_mod || !dxgi_mod || !dcomp_mod) {
+      helios_wsi_vehicle_diag("runtime FAILED: LoadLibrary d3d11=%p dxgi=%p dcomp=%p",
+                              (void *)d3d11_mod, (void *)dxgi_mod, (void *)dcomp_mod);
+      return false;
+   }
+
+   rt->create_device =
+      (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11_mod, "D3D11CreateDevice");
+
+   typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY2)(UINT, REFIID, void **);
+   PFN_CREATE_DXGI_FACTORY2 create_factory2 =
+      (PFN_CREATE_DXGI_FACTORY2)GetProcAddress(dxgi_mod, "CreateDXGIFactory2");
+
+   typedef HRESULT(STDAPICALLTYPE *PFN_DCOMP_CREATE_DEVICE)(IDXGIDevice *,
+                                                            REFIID, void **);
+   PFN_DCOMP_CREATE_DEVICE dcomp_create =
+      (PFN_DCOMP_CREATE_DEVICE)GetProcAddress(dcomp_mod,
+                                              "DCompositionCreateDevice");
+
+   if (!rt->create_device || !create_factory2 || !dcomp_create) {
+      helios_wsi_vehicle_diag("runtime FAILED: exports d3d11=%p factory2=%p dcomp=%p",
+                              (void *)rt->create_device, (void *)create_factory2,
+                              (void *)dcomp_create);
+      return false;
+   }
+
+   HRESULT hr = create_factory2(0, IID_PPV_ARGS(&rt->factory));
+   if (FAILED(hr) || !rt->factory) {
+      helios_wsi_vehicle_diag("runtime FAILED: CreateDXGIFactory2 hr=0x%08lx",
+                              (unsigned long)hr);
+      return false;
+   }
+
+   /* dcomp needs NO rendering device (dzn-proven; NULL = system compositor
+    * device) — this is what makes the whole road viable. */
+   hr = dcomp_create(NULL, IID_PPV_ARGS(&rt->dcomp));
+   if (FAILED(hr) || !rt->dcomp) {
+      helios_wsi_vehicle_diag("runtime FAILED: DCompositionCreateDevice hr=0x%08lx",
+                              (unsigned long)hr);
+      rt->factory->Release();
+      rt->factory = NULL;
+      return false;
+   }
+
+   rt->usable = true;
+   return true;
+}
+
+/* Vulkan surface format -> vehicle backbuffer format. Flip-model swapchains
+ * refuse SRGB formats; UNORM + raw bytes matches what the sw path presents
+ * today (the bits are sRGB-encoded either way, dwm treats composition
+ * surfaces as sRGB content). Unsupported -> DXGI_FORMAT_UNKNOWN = the chain
+ * latches FAILED (counted), sw path serves it. */
+static DXGI_FORMAT
+wsi_win32_vehicle_dxgi_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+   default:
+      return DXGI_FORMAT_UNKNOWN;
+   }
 }
 
 enum wsi_win32_image_state {
@@ -218,8 +470,319 @@ struct wsi_win32_swapchain {
    VkExtent2D                 extent;
    HWND wnd;
    HDC chain_dc;
+   struct wsi_win32_vehicle   vehicle;
    struct wsi_win32_image     images[0];
 };
+
+/* Resolve an in-process helios_umd export. The UMD module name is versioned
+ * (helios_umd_<hash>.dll), so walk the loaded modules instead of naming it;
+ * it is guaranteed loaded by the time this runs — the vehicle's
+ * D3D11CreateDevice on the Helios adapter loaded it. (Same pattern as the
+ * UMD bridge's find_export_in_loaded_modules for the ICD exports.) */
+static void *
+wsi_win32_vehicle_find_umd_export(const char *name)
+{
+   typedef BOOL(WINAPI * PFN_ENUM_PROCESS_MODULES)(HANDLE, HMODULE *, DWORD,
+                                                   LPDWORD);
+   PFN_ENUM_PROCESS_MODULES enum_modules =
+      (PFN_ENUM_PROCESS_MODULES)GetProcAddress(
+         GetModuleHandleA("kernel32.dll"), "K32EnumProcessModules");
+   if (!enum_modules)
+      return NULL;
+
+   HMODULE modules[1024];
+   DWORD needed = 0;
+   if (!enum_modules(GetCurrentProcess(), modules, sizeof(modules), &needed))
+      return NULL;
+
+   DWORD count = MIN2(needed / sizeof(HMODULE), ARRAY_SIZE(modules));
+   for (DWORD i = 0; i < count; i++) {
+      void *fn = (void *)GetProcAddress(modules[i], name);
+      if (fn)
+         return fn;
+   }
+   return NULL;
+}
+
+static void
+wsi_win32_vehicle_release_com(struct wsi_win32_vehicle *v)
+{
+   if (v->sc) {
+      v->sc->Release();
+      v->sc = NULL;
+   }
+   if (v->ctx) {
+      v->ctx->Release();
+      v->ctx = NULL;
+   }
+   if (v->dev) {
+      v->dev->Release();
+      v->dev = NULL;
+   }
+}
+
+static bool
+wsi_win32_vehicle_stop_requested(struct wsi_win32_vehicle *v)
+{
+   mtx_lock(&v->mutex);
+   bool stop = v->stop;
+   mtx_unlock(&v->mutex);
+   return stop;
+}
+
+/* Build the vehicle on the worker thread. Returns true when READY; on
+ * failure everything partially created is released and FAILED is latched
+ * (loud). Checks the stop flag between the expensive steps so destroy during
+ * init cancels promptly. */
+static bool
+wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+   struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
+   const char *stage = "runtime";
+   HRESULT hr = S_OK;
+
+   mtx_lock(&rt->mutex);
+   bool rt_ok = wsi_win32_vehicle_runtime_init_locked(rt);
+   mtx_unlock(&rt->mutex);
+   if (!rt_ok)
+      goto fail;
+
+   if (wsi_win32_vehicle_stop_requested(v))
+      goto stopped;
+
+   {
+      stage = "D3D11CreateDevice";
+      D3D_FEATURE_LEVEL fl = (D3D_FEATURE_LEVEL)0;
+      /* Default adapter = the Helios render adapter (the only one). BGRA
+       * support is required for B8G8R8A8 swapchains (probe-proven recipe). */
+      hr = rt->create_device(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                             D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                             D3D11_SDK_VERSION, &v->dev, &fl, &v->ctx);
+      if (FAILED(hr) || !v->dev || !v->ctx)
+         goto fail;
+   }
+
+   if (wsi_win32_vehicle_stop_requested(v))
+      goto stopped;
+
+   {
+      stage = "CreateSwapChainForComposition";
+      DXGI_SWAP_CHAIN_DESC1 desc = {};
+      desc.Width = v->width;
+      desc.Height = v->height;
+      desc.Format = v->format;
+      desc.SampleDesc.Count = 1;
+      desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      desc.BufferCount = v->buffer_count;
+      desc.Scaling = DXGI_SCALING_STRETCH;
+      desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+      desc.AlphaMode = v->alpha_mode;
+      desc.Flags = v->allow_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+
+      IDXGISwapChain1 *sc1 = NULL;
+      hr = rt->factory->CreateSwapChainForComposition(v->dev, &desc, NULL,
+                                                      &sc1);
+      if (FAILED(hr) || !sc1)
+         goto fail;
+      hr = sc1->QueryInterface(IID_PPV_ARGS(&v->sc));
+      sc1->Release();
+      if (FAILED(hr) || !v->sc)
+         goto fail;
+   }
+
+   /* Per-surface dcomp target/visual (surface-owned; released in
+    * wsi_win32_surface_destroy — all chains are gone by then). Serialized
+    * against other chains' workers on the runtime mutex. Content binding is
+    * deferred to the first vehicle present. */
+   {
+      stage = "dcomp target/visual";
+      wsi_win32_surface *surface = chain->surface;
+      mtx_lock(&rt->mutex);
+      if (!surface->target)
+         hr = rt->dcomp->CreateTargetForHwnd(v->hwnd, FALSE, &surface->target);
+      if (SUCCEEDED(hr) && surface->target && !surface->visual) {
+         hr = rt->dcomp->CreateVisual(&surface->visual);
+         if (SUCCEEDED(hr) && surface->visual)
+            hr = surface->target->SetRoot(surface->visual);
+      }
+      mtx_unlock(&rt->mutex);
+      if (FAILED(hr) || !surface->target || !surface->visual)
+         goto fail;
+   }
+
+   /* The UMD exports land with road-4 unit 2; their absence is a distinct
+    * loud failure so an ICD/UMD deploy skew reads unambiguously. */
+   {
+      stage = "helios_umd exports";
+      v->set_source = (helios_umd_set_present_source_fn)
+         wsi_win32_vehicle_find_umd_export("helios_umd_set_present_source");
+      v->wait_present = (helios_umd_wait_last_present_fn)
+         wsi_win32_vehicle_find_umd_export("helios_umd_wait_last_present");
+      if (!v->set_source || !v->wait_present) {
+         InterlockedIncrement(&helios_vehicle_export_miss);
+         hr = E_NOINTERFACE;
+         goto fail;
+      }
+   }
+
+   {
+      /* Adapter identity for the READY diag line — the vehicle MUST be on the
+       * Helios adapter; a WARP/other-adapter device would silently change the
+       * whole data path. */
+      WCHAR desc_str[128] = L"?";
+      IDXGIDevice *dxgi_dev = NULL;
+      if (SUCCEEDED(v->dev->QueryInterface(IID_PPV_ARGS(&dxgi_dev)))) {
+         IDXGIAdapter *adapter = NULL;
+         if (SUCCEEDED(dxgi_dev->GetAdapter(&adapter))) {
+            DXGI_ADAPTER_DESC ad = {};
+            if (SUCCEEDED(adapter->GetDesc(&ad)))
+               memcpy(desc_str, ad.Description, sizeof(desc_str));
+            adapter->Release();
+         }
+         dxgi_dev->Release();
+      }
+      helios_wsi_vehicle_diag(
+         "READY chain=%p hwnd=%p %ux%u fmt=%u buffers=%u tearing=%d adapter=%ls",
+         (void *)chain, (void *)v->hwnd, v->width, v->height, (unsigned)v->format,
+         v->buffer_count, v->allow_tearing ? 1 : 0, desc_str);
+   }
+
+   InterlockedIncrement(&helios_vehicle_ready);
+   InterlockedExchange(&v->state, WSI_VEHICLE_READY);
+   return true;
+
+fail:
+   helios_wsi_vehicle_diag("FAILED chain=%p stage='%s' hr=0x%08lx %ux%u fmt=%u",
+                           (void *)chain, stage, (unsigned long)hr, v->width,
+                           v->height, (unsigned)v->format);
+   InterlockedIncrement(&helios_vehicle_create_fails);
+   wsi_win32_vehicle_release_com(v);
+   InterlockedExchange(&v->state, WSI_VEHICLE_FAILED);
+   return false;
+
+stopped:
+   wsi_win32_vehicle_release_com(v);
+   InterlockedExchange(&v->state, WSI_VEHICLE_FAILED);
+   return false;
+}
+
+static int
+wsi_win32_vehicle_thread(void *arg)
+{
+   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)arg;
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+
+   u_thread_setname("helios-vehicle");
+   InterlockedIncrement(&helios_vehicle_creates);
+
+   if (wsi_win32_vehicle_build(chain)) {
+      /* Park until destroy: the COM release (and the nested DXVK->ICD2
+       * teardown it triggers) must run on THIS thread, never on an ICD1
+       * teardown path. */
+      mtx_lock(&v->mutex);
+      while (!v->stop)
+         cnd_wait(&v->cond, &v->mutex);
+      mtx_unlock(&v->mutex);
+
+      wsi_win32_vehicle_release_com(v);
+   }
+   return 0;
+}
+
+/* Kick the vehicle worker at swapchain create. Never blocks; never touches
+ * D3D on this thread. Any refusal latches FAILED with a counter + diag line
+ * and the chain stays on the sw path. */
+static void
+wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
+                        const VkSwapchainCreateInfoKHR *create_info)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+
+   v->state = WSI_VEHICLE_OFF;
+   if (!wsi_win32_vehicle_enabled() || chain->dxgi)
+      return;
+
+   DXGI_FORMAT format = wsi_win32_vehicle_dxgi_format(create_info->imageFormat);
+   if (format == DXGI_FORMAT_UNKNOWN) {
+      helios_wsi_vehicle_diag("REFUSED chain=%p unsupported VkFormat %u",
+                              (void *)chain, (unsigned)create_info->imageFormat);
+      InterlockedIncrement(&helios_vehicle_create_fails);
+      v->state = WSI_VEHICLE_FAILED;
+      return;
+   }
+
+   VkIcdSurfaceWin32 *win32_surface = (VkIcdSurfaceWin32 *)create_info->surface;
+   v->hwnd = win32_surface->hwnd;
+   v->width = MAX2(create_info->imageExtent.width, 1u);
+   v->height = MAX2(create_info->imageExtent.height, 1u);
+   v->format = format;
+   /* BufferCount >= 3: flip-model needs headroom so Present never blocks on
+    * the compositor holding a buffer (design note, road 4). */
+   v->buffer_count = MAX2(3u, create_info->minImageCount);
+   v->allow_tearing =
+      chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR;
+   switch (create_info->compositeAlpha) {
+   case VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR:
+      v->alpha_mode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+      break;
+   case VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR:
+      v->alpha_mode = DXGI_ALPHA_MODE_STRAIGHT;
+      break;
+   default:
+      /* OPAQUE and INHERIT: composition swapchains take IGNORE. */
+      v->alpha_mode = DXGI_ALPHA_MODE_IGNORE;
+      break;
+   }
+
+   if (mtx_init(&v->mutex, mtx_plain) != thrd_success) {
+      InterlockedIncrement(&helios_vehicle_create_fails);
+      v->state = WSI_VEHICLE_FAILED;
+      return;
+   }
+   if (cnd_init(&v->cond) != thrd_success) {
+      mtx_destroy(&v->mutex);
+      InterlockedIncrement(&helios_vehicle_create_fails);
+      v->state = WSI_VEHICLE_FAILED;
+      return;
+   }
+
+   v->state = WSI_VEHICLE_INIT;
+   if (thrd_create(&v->thread, wsi_win32_vehicle_thread, chain) !=
+       thrd_success) {
+      helios_wsi_vehicle_diag("REFUSED chain=%p thrd_create failed",
+                              (void *)chain);
+      InterlockedIncrement(&helios_vehicle_create_fails);
+      cnd_destroy(&v->cond);
+      mtx_destroy(&v->mutex);
+      v->state = WSI_VEHICLE_FAILED;
+      return;
+   }
+   v->thread_started = true;
+}
+
+/* Destroy-side teardown: signal stop, join (the worker releases the COM
+ * stack on its own thread), then destroy the sync primitives. Must run
+ * BEFORE the chain memory is freed — the worker dereferences the chain. */
+static void
+wsi_win32_vehicle_finish(struct wsi_win32_swapchain *chain)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+
+   if (!v->thread_started)
+      return;
+
+   mtx_lock(&v->mutex);
+   v->stop = true;
+   cnd_signal(&v->cond);
+   mtx_unlock(&v->mutex);
+
+   thrd_join(v->thread, NULL);
+
+   cnd_destroy(&v->cond);
+   mtx_destroy(&v->mutex);
+   v->thread_started = false;
+}
 
 VKAPI_ATTR VkBool32 VKAPI_CALL
 wsi_GetPhysicalDeviceWin32PresentationSupportKHR(VkPhysicalDevice physicalDevice,
@@ -712,6 +1275,10 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    struct wsi_win32_swapchain *chain =
       (struct wsi_win32_swapchain *) drv_chain;
 
+   /* First: the vehicle worker dereferences the chain — stop and join it
+    * before anything else is torn down. */
+   wsi_win32_vehicle_finish(chain);
+
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
 
@@ -1187,6 +1754,11 @@ wsi_win32_surface_create_swapchain(
 
       chain->base.image_count++;
    }
+
+   /* Helios dcomp present vehicle: kick the dedicated worker (no D3D work on
+    * this thread). Until it latches READY, presents flow through the sw
+    * path exactly as before. */
+   wsi_win32_vehicle_start(chain, create_info);
 
    *swapchain_out = &chain->base;
 
