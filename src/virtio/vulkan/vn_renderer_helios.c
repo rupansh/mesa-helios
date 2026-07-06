@@ -46,6 +46,7 @@
 
 #include "vn_renderer_internal.h"
 #include "vn_device_memory.h"
+#include "vn_instance.h" /* helios_venus_instance_ctx_id (instance-scoped export) */
 
 #include "util/cache_ops.h"
 #include "util/u_thread.h" /* retire thread (external-sync GPU-completion signal) */
@@ -347,6 +348,17 @@ struct helios {
    struct helios_perf_stats perf;
 };
 
+/* Process-global state, audited 2026-07-06 (23rd session) for the two-live-
+ * VkInstance shape the dcomp present vehicle introduces (a Vulkan app's own
+ * instance + the vehicle's DXVK->ICD stack in the SAME process):
+ *  - helios_perf_at_exit_renderer/_registered: perf-dump-only; last
+ *    perf-enabled renderer wins the atexit dump. Harmless (HELIOS_PERF off by
+ *    default), left as-is.
+ *  - helios_current_ctx_id: last-writer-wins across instances, and destroy
+ *    only clears it when it still matches the dying renderer. Ambiguous with
+ *    two instances — bridge callers must use the handle-based
+ *    helios_venus_instance_ctx_id() below; the process-global form stays for
+ *    single-instance probes only. */
 static struct helios *helios_perf_at_exit_renderer;
 static bool helios_perf_at_exit_registered;
 static uint32_t helios_current_ctx_id;
@@ -408,6 +420,7 @@ vn_renderer_helios_diag_log(const char *fmt, ...)
 }
 
 __declspec(dllexport) uint32_t helios_venus_current_ctx_id(void);
+__declspec(dllexport) uint32_t helios_venus_instance_ctx_id(VkInstance instance);
 __declspec(dllexport) uint64_t helios_venus_memory_id(VkDeviceMemory memory);
 __declspec(dllexport) uint32_t helios_venus_memory_res_id(VkDeviceMemory memory);
 __declspec(dllexport) uint32_t helios_venus_memory_transfer_resource_ownership(VkDeviceMemory memory);
@@ -419,6 +432,25 @@ __declspec(dllexport) uint32_t
 helios_venus_current_ctx_id(void)
 {
    return helios_current_ctx_id;
+}
+
+/* Instance-scoped venus context id. The process-global form above is
+ * last-writer-wins: with the dcomp present vehicle a game process holds TWO
+ * live instances (its own + the vehicle's DXVK stack), and a concurrent
+ * instance create (overlays do this) can slip between a bridge's device init
+ * and its ctx-id read. A caller that owns a VkInstance (the UMD bridge does)
+ * must resolve through it. Returns 0 for a null instance/renderer. */
+__declspec(dllexport) uint32_t
+helios_venus_instance_ctx_id(VkInstance instance)
+{
+   if (instance == VK_NULL_HANDLE)
+      return 0;
+
+   struct vn_instance *inst = vn_instance_from_handle(instance);
+   if (!inst || !inst->renderer)
+      return 0;
+
+   return ((struct helios *)inst->renderer)->ctx_id;
 }
 
 __declspec(dllexport) uint64_t
