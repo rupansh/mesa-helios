@@ -47,6 +47,16 @@ struct vn_device {
 
    bool has_sync2;
 
+   /* Helios: the renderer-side device can dispatch timeline-semaphore
+    * entrypoints (vkSignalSemaphore / vkGetSemaphoreCounterValue). vkr
+    * resolves these procs only for >= 1.2 devices or when
+    * KHR_timeline_semaphore was enabled at create, and dispatches them
+    * with NO null check — emitting one on any other device is a host
+    * render-worker SEGFAULT (ip=0), which is host-silent and wedges the
+    * guest on the EPERM'd fence create that follows (proven live,
+    * 24th session, vkcube = Vulkan 1.0 app + wsi acquire gate). */
+   bool helios_host_timeline_procs;
+
    /* Helios: latched when a forward-progress deadline concluded the renderer
     * context is dead (host GPU channel loss the renderer never reports —
     * e.g. NVIDIA Xid 109 kills the channel while counter queries keep

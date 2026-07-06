@@ -2991,12 +2991,30 @@ vn_WaitSemaphores(VkDevice device,
       if (result != VK_SUCCESS)
          return vn_result(dev->instance, result);
 
-      const VkSemaphoreSignalInfo signal_info = {
-         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
-         .semaphore = pWaitInfo->pSemaphores[i],
-         .value = pWaitInfo->pValues[i],
-      };
-      vn_async_vkSignalSemaphore(dev->primary_ring, device, &signal_info);
+      /* Host-side counter sync. vkr resolves vkSignalSemaphore only for
+       * >= 1.2 devices or with KHR_timeline_semaphore enabled at create,
+       * and vkr_dispatch_vkSignalSemaphore calls the proc with NO null
+       * check — on any other device this call is an ip=0 host-worker
+       * segfault: host-silent, and the guest wedges on the EPERM'd fence
+       * create that follows (proven live, 24th session). Skip it there —
+       * the feedback update below keeps guest-side waits coherent. */
+      if (dev->helios_host_timeline_procs) {
+         const VkSemaphoreSignalInfo signal_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            .semaphore = pWaitInfo->pSemaphores[i],
+            .value = pWaitInfo->pValues[i],
+         };
+         vn_async_vkSignalSemaphore(dev->primary_ring, device, &signal_info);
+      } else {
+         static bool logged_once = false;
+         if (!logged_once) {
+            logged_once = true;
+            vn_log(dev->instance,
+                   "HELIOS: skipping host semaphore counter sync — renderer "
+                   "device lacks timeline entrypoints (< 1.2, no "
+                   "KHR_timeline_semaphore)");
+         }
+      }
       if (sem->feedback.slot) {
          simple_mtx_lock(&sem->feedback.counter_mtx);
          sem->feedback.signaled_counter =

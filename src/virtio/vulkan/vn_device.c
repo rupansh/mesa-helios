@@ -332,6 +332,22 @@ vn_device_fix_create_info(const struct vn_device *dev,
       extra_exts[extra_count++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
    }
 
+   /* Helios: the WSI layer signals/waits internal timeline semaphores (the
+    * present-order fence, the dcomp-vehicle acquire gate). vkr resolves
+    * vkSignalSemaphore/vkGetSemaphoreCounterValue for the renderer device
+    * only when the device is >= 1.2 or KHR_timeline_semaphore was enabled
+    * at create, and dispatches them with NO null check — on a Vulkan
+    * 1.0/1.1 app the first such call is an ip=0 render-worker segfault
+    * (host-silent; the guest then wedges on the EPERM'd fence create that
+    * follows). Enable the extension for the renderer device whenever WSI
+    * rides a < 1.2 renderer instance. Mirrored by
+    * vn_device_init's helios_host_timeline_procs. */
+   if (has_wsi && !app_exts->KHR_timeline_semaphore &&
+       renderer_exts->KHR_timeline_semaphore &&
+       physical_dev->instance->renderer_api_version < VK_API_VERSION_1_2) {
+      extra_exts[extra_count++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+   }
+
 #if DETECT_OS_WINDOWS
    if (app_exts->KHR_external_semaphore_win32) {
       /* This is implemented by the Windows Venus frontend with D3DKMT sync
@@ -495,6 +511,24 @@ vn_device_init(struct vn_device *dev,
    dev->device_mask = 1;
    dev->renderer = instance->renderer;
    dev->primary_ring = instance->ring.ring;
+
+   /* Mirrors vn_device_fix_create_info's KHR_timeline_semaphore append: the
+    * renderer device can dispatch vkSignalSemaphore & co. iff it is >= 1.2
+    * or the extension made it into the final create list (app-enabled, or
+    * appended for WSI). Emitting one otherwise segfaults the host worker
+    * (see vn_device.h field comment). */
+   {
+      const struct vk_device_extension_table *app_exts =
+         &dev->base.vk.enabled_extensions;
+      const bool has_wsi_exts =
+         app_exts->KHR_swapchain || app_exts->ANDROID_native_buffer ||
+         app_exts->ANDROID_external_memory_android_hardware_buffer;
+      dev->helios_host_timeline_procs =
+         instance->renderer_api_version >= VK_API_VERSION_1_2 ||
+         app_exts->KHR_timeline_semaphore ||
+         (has_wsi_exts &&
+          physical_dev->renderer_extensions.KHR_timeline_semaphore);
+   }
 
    create_info =
       vn_device_fix_create_info(dev, create_info, alloc, &local_create_info);
