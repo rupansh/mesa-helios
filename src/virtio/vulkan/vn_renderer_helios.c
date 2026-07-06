@@ -108,6 +108,17 @@ struct helios_unicode_string {
 #define HELIOS_ESCAPE_WAIT_FENCE   0x0006u
 #define HELIOS_ESCAPE_RELEASE_BLOB 0x0008u
 #define HELIOS_ESCAPE_ATTACH_RESOURCE 0x0009u
+#define HELIOS_ESCAPE_REGISTER_FENCE_EVENT   0x000Bu
+#define HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT 0x000Cu
+
+/* helios_escape_fence_event.out_state values (protocol/src/escape.rs). */
+#define HELIOS_FENCE_EVENT_REGISTERED       0u
+#define HELIOS_FENCE_EVENT_ALREADY_COMPLETE 1u
+#define HELIOS_FENCE_EVENT_PROBE_ACK        2u
+#define HELIOS_FENCE_EVENT_CANCELLED        3u
+#define HELIOS_FENCE_EVENT_NOT_FOUND        4u
+/* Local sentinel: the escape itself failed (never a wire value). */
+#define HELIOS_FENCE_EVENT_ESCAPE_FAILED    ~0u
 
 #define HELIOS_MAP_CACHE_CACHED    0x00000001u
 #define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
@@ -192,6 +203,23 @@ struct helios_escape_wait_fence {
    uint32_t _pad;
 };
 
+/* KMD 22.22.54+ usermode fence events (PSC WS2): REGISTER parks an event
+ * handle for one-shot KeSetEvent at wire-fence retirement; the wait happens in
+ * USERMODE (WaitForSingleObject), so no thread ever parks inside a blocking
+ * escape and the dxgkrnl escape layer never convoys this process's
+ * SUBMIT_VENUS escapes behind a wait (measured 24th session: 2.9 ms → µs).
+ * UNREGISTER cancels after a usermode timeout; NOT_FOUND + a signaled event =
+ * the retirement raced the timeout (complete); NOT_FOUND + unsignaled = the
+ * registration was purged (transport teardown) — failure, never fake success.
+ * REGISTER with fence_id == 0 && event_handle == 0 is the capability probe. */
+struct helios_escape_fence_event {
+   struct helios_escape_header hdr;
+   uint64_t fence_id;     /* in: wire fence id */
+   uint64_t event_handle; /* in: usermode event HANDLE, zero-extended */
+   uint32_t out_state;    /* out: HELIOS_FENCE_EVENT_* */
+   uint32_t _pad;
+};
+
 /* Wire-size guards mirroring protocol/src/escape.rs const _: () asserts. */
 _Static_assert(sizeof(struct helios_escape_header) == 16, "hdr size");
 _Static_assert(sizeof(struct helios_escape_ctx_create) == 24, "ctx_create size");
@@ -202,6 +230,7 @@ _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
 _Static_assert(sizeof(struct helios_escape_attach_resource) == 24, "attach_resource size");
 _Static_assert(sizeof(struct helios_escape_wait_fence) == 40, "wait_fence size");
+_Static_assert(sizeof(struct helios_escape_fence_event) == 40, "fence_event size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -349,10 +378,31 @@ struct helios {
    struct helios_retire_entry *retire_head;
    struct helios_retire_entry *retire_tail;
    uint32_t retire_depth;
+   /* Manual-reset event SET by helios_destroy alongside retire_stop, so the
+    * retire thread's event-path fence wait (WaitForMultipleObjects) unparks
+    * promptly for the join. NULL when unavailable (fallback slice waits
+    * re-check retire_stop each slice and need no event). */
+   HANDLE retire_stop_event;
+
+   /* KMD 22.22.54+ usermode fence events (REGISTER_FENCE_EVENT probe ack at
+    * init). When false every wire-fence wait uses the blocking WAIT_FENCE
+    * escape (correct, but parked escapes convoy this process's submits). */
+   bool fence_events_supported;
 
    struct vn_renderer_shmem_cache shmem_cache;
    struct helios_perf_stats perf;
 };
+
+/* Process-wide fence-event wait telemetry (printed by helios_perf_write; kept
+ * as interlocked statics because the wait path deliberately holds NO lock). */
+static volatile LONG helios_fence_event_waits;     /* event-path parks */
+static volatile LONG helios_fence_event_immediate; /* ALREADY_COMPLETE */
+static volatile LONG helios_fence_event_raced;     /* signal raced the timeout */
+static volatile LONG helios_fence_event_timeouts;  /* deadline give-ups */
+static volatile LONG helios_fence_event_fallbacks; /* event path refused →
+                                                    * blocking-escape wait */
+static volatile LONG helios_fence_event_lost;      /* NOT_FOUND + unsignaled
+                                                    * (teardown purge) — loud */
 
 /* Process-global state, audited 2026-07-06 (23rd session) for the two-live-
  * VkInstance shape the dcomp present vehicle introduces (a Vulkan app's own
@@ -1236,16 +1286,21 @@ helios_ioctl_map_blob(struct helios *helios,
    return req.out_user_va;
 }
 
-/* REAL fence wait (C3/M3.4): blocks in the KMD (PASSIVE KEVENT) until the wire
- * fence completes on the virtio used ring or timeout_ns elapses; timeout_ns==0
- * is a poll. Returns whether the fence is COMPLETE. Called WITHOUT dev_mutex
- * (waits must not block submits) and with HardwareAccess=0 (a blocking escape
- * must never hold dxgkrnl's exclusive adapter lock — the 30 s Escape-convoy
- * mechanism). out_completed is pre-set to 1 so a legacy synchronous KMD (which
- * returns without writing the buffer) reads as complete — matching its
- * "submit returned ⇒ done" semantics. */
+/* Blocking fence wait (C3/M3.4): blocks in the KMD (PASSIVE KEVENT) until the
+ * wire fence completes on the virtio used ring or timeout_ns elapses;
+ * timeout_ns==0 is a poll. Returns whether the fence is COMPLETE. Called
+ * WITHOUT dev_mutex (waits must not block submits) and with HardwareAccess=0
+ * (a blocking escape must never hold dxgkrnl's exclusive adapter lock — the
+ * 30 s Escape-convoy mechanism). out_completed is pre-set to 1 so a legacy
+ * synchronous KMD (which returns without writing the buffer) reads as complete
+ * — matching its "submit returned ⇒ done" semantics.
+ *
+ * CONVOY WARNING (measured 24th session): even with HardwareAccess=0, a thread
+ * PARKED inside this escape serializes the process's other escapes (submits)
+ * at the dxgkrnl escape layer. This is therefore only the poll path + the
+ * fallback for KMDs without fence events / refused registrations. */
 static bool
-helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeout_ns)
+helios_wait_fence_blocking(struct helios *helios, uint64_t fence_id, uint64_t timeout_ns)
 {
    struct helios_escape_wait_fence req = { 0 };
    helios_hdr_init(&req.hdr, HELIOS_ESCAPE_WAIT_FENCE, sizeof(req));
@@ -1255,6 +1310,190 @@ helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeo
    if (!helios_escape_ex(helios, &req, sizeof(req), false))
       return false;
    return req.out_completed != 0;
+}
+
+/* ── usermode fence-event waits (KMD 22.22.54+, PSC WS2) ──────────────────────
+ * register-event → WaitForSingleObject → cancel. The KMD's retirement DPC
+ * KeSetEvents the registered event, so fence observation is interrupt-latency
+ * (µs) instead of escape-park + slice-poll latency (ms), and NO thread ever
+ * parks inside an escape — the escape-park submit convoy class is dead. */
+
+/* Cap a single usermode event wait; mirrors the KMD's WAIT_FENCE_MAX_MS bound
+ * so an event whose registration can never signal (transport death) parks a
+ * thread no longer than the blocking path would have. */
+#define HELIOS_EVENT_WAIT_MAX_NS (120ull * 1000 * 1000 * 1000)
+
+/* One manual-reset event per waiting thread, created on demand, closed by the
+ * tss destructor at thread exit. Reset before every registration (one-shot
+ * KMD semantics leave it signaled after each completed wait). */
+static once_flag helios_fence_event_tss_once = ONCE_FLAG_INIT;
+static tss_t helios_fence_event_tss;
+static bool helios_fence_event_tss_ok;
+
+static void
+helios_fence_event_tss_dtor(void *ev)
+{
+   if (ev)
+      CloseHandle((HANDLE)ev);
+}
+
+static void
+helios_fence_event_tss_init(void)
+{
+   helios_fence_event_tss_ok =
+      tss_create(&helios_fence_event_tss, helios_fence_event_tss_dtor) ==
+      thrd_success;
+}
+
+static HANDLE
+helios_fence_event_get(void)
+{
+   call_once(&helios_fence_event_tss_once, helios_fence_event_tss_init);
+   if (!helios_fence_event_tss_ok)
+      return NULL;
+   HANDLE ev = (HANDLE)tss_get(helios_fence_event_tss);
+   if (!ev) {
+      ev = CreateEventW(NULL, /*bManualReset*/ TRUE, FALSE, NULL);
+      if (ev && tss_set(helios_fence_event_tss, ev) != thrd_success) {
+         CloseHandle(ev);
+         ev = NULL;
+      }
+   }
+   return ev;
+}
+
+/* One REGISTER/UNREGISTER_FENCE_EVENT escape (non-blocking, HardwareAccess=0,
+ * no dev_mutex — touches no context state). Returns the KMD's out_state, or
+ * HELIOS_FENCE_EVENT_ESCAPE_FAILED if the escape itself failed. */
+static uint32_t
+helios_escape_fence_event(struct helios *helios,
+                          uint32_t cmd_type,
+                          uint64_t fence_id,
+                          HANDLE event)
+{
+   struct helios_escape_fence_event req = { 0 };
+   helios_hdr_init(&req.hdr, cmd_type, sizeof(req));
+   req.fence_id = fence_id;
+   req.event_handle = (uint64_t)(uintptr_t)event;
+   req.out_state = HELIOS_FENCE_EVENT_ESCAPE_FAILED;
+   if (!helios_escape_ex(helios, &req, sizeof(req), false))
+      return HELIOS_FENCE_EVENT_ESCAPE_FAILED;
+   return req.out_state;
+}
+
+/* Cancel a registration after a usermode timeout. Returns whether the fence
+ * is COMPLETE (the retirement raced our timeout). Distinguishes the three
+ * legal shapes loudly; a lost registration (purged unsignaled at transport
+ * teardown) reports INCOMPLETE — the caller's own deadline semantics apply. */
+static bool
+helios_fence_event_cancel(struct helios *helios, uint64_t fence_id, HANDLE ev)
+{
+   const uint32_t un = helios_escape_fence_event(
+      helios, HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT, fence_id, ev);
+   if (un == HELIOS_FENCE_EVENT_CANCELLED)
+      return false; /* removed before signaling — a real timeout */
+   if (un == HELIOS_FENCE_EVENT_NOT_FOUND) {
+      if (WaitForSingleObject(ev, 0) == WAIT_OBJECT_0) {
+         InterlockedIncrement(&helios_fence_event_raced);
+         return true; /* the drain consumed it: signal raced the timeout */
+      }
+      InterlockedIncrement(&helios_fence_event_lost);
+      helios_diag("fence-event registration LOST for wire fence %llu "
+                  "(not found + unsignaled — transport teardown?)",
+                  (unsigned long long)fence_id);
+      return false;
+   }
+   /* The unregister escape failed. On a live transport this cannot happen
+    * (the verb only takes the device lock); a dead transport never signals
+    * (teardown derefs without signaling), so a later reuse of the per-thread
+    * event cannot be woken by this stale registration. */
+   InterlockedIncrement(&helios_fence_event_lost);
+   helios_diag("fence-event UNREGISTER escape failed for wire fence %llu",
+               (unsigned long long)fence_id);
+   return false;
+}
+
+/* Event-path fence wait: register → WaitForSingleObject → cancel on timeout.
+ * Falls back to the blocking escape wait if the event machinery is refused
+ * (table full, no event, escape failure) — correct either way, counted. */
+static bool
+helios_event_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeout_ns)
+{
+   HANDLE ev = helios_fence_event_get();
+   if (!ev || !ResetEvent(ev)) {
+      InterlockedIncrement(&helios_fence_event_fallbacks);
+      return helios_wait_fence_blocking(helios, fence_id, timeout_ns);
+   }
+
+   const uint32_t state = helios_escape_fence_event(
+      helios, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, fence_id, ev);
+   if (state == HELIOS_FENCE_EVENT_ALREADY_COMPLETE) {
+      InterlockedIncrement(&helios_fence_event_immediate);
+      return true;
+   }
+   if (state != HELIOS_FENCE_EVENT_REGISTERED) {
+      /* Refused (table full / invalid / escape failure): blocking fallback. */
+      InterlockedIncrement(&helios_fence_event_fallbacks);
+      return helios_wait_fence_blocking(helios, fence_id, timeout_ns);
+   }
+
+   InterlockedIncrement(&helios_fence_event_waits);
+   const uint64_t bounded_ns =
+      timeout_ns < HELIOS_EVENT_WAIT_MAX_NS ? timeout_ns : HELIOS_EVENT_WAIT_MAX_NS;
+   if (WaitForSingleObject(ev, helios_timeout_ns_to_ms(bounded_ns)) ==
+       WAIT_OBJECT_0)
+      return true;
+
+   if (helios_fence_event_cancel(helios, fence_id, ev))
+      return true;
+   InterlockedIncrement(&helios_fence_event_timeouts);
+   return false;
+}
+
+/* Wire-fence wait dispatcher. Polls (timeout_ns == 0) stay on the escape —
+ * they never park, so they cannot convoy — as does everything when the KMD
+ * lacks fence events (probed once at init; loud diag there). */
+static bool
+helios_ioctl_wait_fence(struct helios *helios, uint64_t fence_id, uint64_t timeout_ns)
+{
+   if (!helios->fence_events_supported || timeout_ns == 0)
+      return helios_wait_fence_blocking(helios, fence_id, timeout_ns);
+   return helios_event_wait_fence(helios, fence_id, timeout_ns);
+}
+
+/* Capability probe (init, once): REGISTER with fence_id == 0 && handle == 0.
+ * A supporting KMD (22.22.54+) answers PROBE_ACK; older KMDs fail the escape
+ * with STATUS_NOT_IMPLEMENTED. Quiet D3DKMTEscape (helios_escape_ex would log
+ * an alarming failure line against every old KMD); exactly one diag line
+ * either way. */
+static void
+helios_probe_fence_events(struct helios *helios)
+{
+   helios->fence_events_supported = false;
+
+   struct helios_escape_fence_event req = { 0 };
+   helios_hdr_init(&req.hdr, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, sizeof(req));
+   req.out_state = HELIOS_FENCE_EVENT_ESCAPE_FAILED;
+
+   D3DKMT_ESCAPE esc;
+   memset(&esc, 0, sizeof(esc));
+   esc.hAdapter = helios->adapter;
+   esc.hDevice = helios->device;
+   esc.hContext = helios->context;
+   esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
+   esc.pPrivateDriverData = &req;
+   esc.PrivateDriverDataSize = sizeof(req);
+
+   const NTSTATUS st = D3DKMTEscape(&esc);
+   helios->fence_events_supported =
+      st == 0 && req.out_state == HELIOS_FENCE_EVENT_PROBE_ACK;
+   if (helios->fence_events_supported)
+      helios_diag("fence-events: KMD probe ACK — usermode event waits live "
+                  "(escape-park convoy path retired)");
+   else
+      helios_diag("fence-events: KMD UNSUPPORTED (status=0x%08x state=%u) — "
+                  "blocking escape-wait fallback (convoy-prone)",
+                  (unsigned)st, req.out_state);
 }
 
 static void
@@ -1368,19 +1607,70 @@ helios_sync_mark_fence_locked(struct vn_renderer *renderer,
 
 /* ── external-sync retire thread ───────────────────────────────────────────── */
 
-/* Bounded WAIT_FENCE slices so helios_destroy's join is never stuck behind a
- * long host wait, with a hard per-fence cap far above any legitimate GPU work.
- * On cap the WDDM fence is deliberately left UNSIGNALED (loud diag): a consumer
- * timing out on a real stall beats a consumer reading unfinished pixels. */
-/* Slice length trades give-up granularity against escape-park duration: a
- * parked WAIT_FENCE escape serializes against this process's SUBMIT_VENUS
- * escapes at the dxgkrnl escape layer (measured 24th session: Doom's
- * win32-signal submit escape averaged 2.9 ms behind the ICD1 retire
- * thread's 250 ms parks; dwm/sw-path submits without parked waits run at
- * 3-5 µs). Short slices bound the convoy; the retire deadline stays
- * slices × slice = 60 s. */
+/* Per-fence retire deadline: far above any legitimate GPU work. On expiry the
+ * WDDM fence is deliberately left UNSIGNALED (loud diag): a consumer timing
+ * out on a real stall beats a consumer reading unfinished pixels.
+ *
+ * Event path (fence_events_supported): ONE WaitForMultipleObjects on
+ * {fence event, retire_stop_event} bounded by HELIOS_RETIRE_DEADLINE_MS —
+ * sane give-up math, prompt destroy-join, and zero escape parks.
+ *
+ * Fallback path (old KMD): bounded WAIT_FENCE slices. Slice length trades
+ * give-up granularity against escape-park duration: a parked WAIT_FENCE
+ * escape serializes against this process's SUBMIT_VENUS escapes at the
+ * dxgkrnl escape layer (measured 24th session: Doom's win32-signal submit
+ * escape averaged 2.9 ms behind the ICD1 retire thread's 250 ms parks;
+ * dwm/sw-path submits without parked waits run at 3-5 µs). Short slices
+ * bound the convoy; the retire deadline stays slices × slice = 60 s. */
+#define HELIOS_RETIRE_DEADLINE_MS 60000
 #define HELIOS_RETIRE_SLICE_NS (2ull * 1000 * 1000)
 #define HELIOS_RETIRE_MAX_SLICES 30000 /* 60 s */
+
+/* Outcome of the retire thread's event-path wait for one entry. */
+enum helios_retire_wait {
+   HELIOS_RETIRE_WAIT_COMPLETE,
+   HELIOS_RETIRE_WAIT_TIMEOUT,  /* deadline expired — give up loudly */
+   HELIOS_RETIRE_WAIT_STOPPED,  /* retire_stop_event — destroy join */
+   HELIOS_RETIRE_WAIT_FALLBACK, /* event machinery refused — use slices */
+};
+
+static enum helios_retire_wait
+helios_retire_event_wait(struct helios *helios, uint64_t fence_id)
+{
+   HANDLE ev = helios_fence_event_get();
+   if (!ev || !helios->retire_stop_event || !ResetEvent(ev)) {
+      InterlockedIncrement(&helios_fence_event_fallbacks);
+      return HELIOS_RETIRE_WAIT_FALLBACK;
+   }
+
+   const uint32_t state = helios_escape_fence_event(
+      helios, HELIOS_ESCAPE_REGISTER_FENCE_EVENT, fence_id, ev);
+   if (state == HELIOS_FENCE_EVENT_ALREADY_COMPLETE) {
+      InterlockedIncrement(&helios_fence_event_immediate);
+      return HELIOS_RETIRE_WAIT_COMPLETE;
+   }
+   if (state != HELIOS_FENCE_EVENT_REGISTERED) {
+      InterlockedIncrement(&helios_fence_event_fallbacks);
+      return HELIOS_RETIRE_WAIT_FALLBACK;
+   }
+
+   InterlockedIncrement(&helios_fence_event_waits);
+   const HANDLE handles[2] = { ev, helios->retire_stop_event };
+   const DWORD wr =
+      WaitForMultipleObjects(2, handles, FALSE, HELIOS_RETIRE_DEADLINE_MS);
+   if (wr == WAIT_OBJECT_0)
+      return HELIOS_RETIRE_WAIT_COMPLETE;
+
+   /* Stop or deadline: cancel the registration either way (a completion that
+    * raced in still reports COMPLETE so the sync is marked before exit). */
+   const bool complete = helios_fence_event_cancel(helios, fence_id, ev);
+   if (complete)
+      return HELIOS_RETIRE_WAIT_COMPLETE;
+   if (wr == WAIT_OBJECT_0 + 1)
+      return HELIOS_RETIRE_WAIT_STOPPED;
+   InterlockedIncrement(&helios_fence_event_timeouts);
+   return HELIOS_RETIRE_WAIT_TIMEOUT;
+}
 
 /* Caller holds dev_mutex. Returns whether the struct must be freed (caller
  * frees OUTSIDE the lock). */
@@ -1426,20 +1716,44 @@ helios_sync_retire_thread(void *arg)
 
       bool complete = false;
       if (!helios->retire_stop) {
-         uint32_t slices = 0;
-         while (!helios->retire_stop && slices < HELIOS_RETIRE_MAX_SLICES) {
-            if (helios_ioctl_wait_fence(helios, entry->fence_id,
-                                        HELIOS_RETIRE_SLICE_NS)) {
+         bool handled = false;
+         if (helios->fence_events_supported) {
+            switch (helios_retire_event_wait(helios, entry->fence_id)) {
+            case HELIOS_RETIRE_WAIT_COMPLETE:
                complete = true;
+               handled = true;
                break;
+            case HELIOS_RETIRE_WAIT_STOPPED:
+               handled = true;
+               break;
+            case HELIOS_RETIRE_WAIT_TIMEOUT:
+               handled = true;
+               helios_diag("retire-thread GIVING UP on wire fence %llu after "
+                           "%u ms event wait — shared sync stays UNSIGNALED "
+                           "(sem=%p)",
+                           (unsigned long long)entry->fence_id,
+                           HELIOS_RETIRE_DEADLINE_MS, (void *)entry->sync);
+               break;
+            case HELIOS_RETIRE_WAIT_FALLBACK:
+               break; /* slice loop below */
             }
-            slices++;
          }
-         if (!complete && !helios->retire_stop) {
-            helios_diag("retire-thread GIVING UP on wire fence %llu after %u "
-                        "slices — shared sync stays UNSIGNALED (sem=%p)",
-                        (unsigned long long)entry->fence_id,
-                        HELIOS_RETIRE_MAX_SLICES, (void *)entry->sync);
+         if (!handled) {
+            uint32_t slices = 0;
+            while (!helios->retire_stop && slices < HELIOS_RETIRE_MAX_SLICES) {
+               if (helios_wait_fence_blocking(helios, entry->fence_id,
+                                              HELIOS_RETIRE_SLICE_NS)) {
+                  complete = true;
+                  break;
+               }
+               slices++;
+            }
+            if (!complete && !helios->retire_stop) {
+               helios_diag("retire-thread GIVING UP on wire fence %llu after %u "
+                           "slices — shared sync stays UNSIGNALED (sem=%p)",
+                           (unsigned long long)entry->fence_id,
+                           HELIOS_RETIRE_MAX_SLICES, (void *)entry->sync);
+            }
          }
       }
 
@@ -1577,6 +1891,13 @@ helios_perf_write(struct helios *helios, bool final)
            (unsigned long long)helios->perf.wait_fast,
            (unsigned long long)helios->perf.wait_slow,
            (unsigned long long)helios->perf.wait_timeout);
+   fprintf(f,
+           "fence_events supported=%d waits=%ld imm=%ld raced=%ld timeouts=%ld "
+           "fallbacks=%ld lost=%ld\n",
+           helios->fence_events_supported ? 1 : 0, helios_fence_event_waits,
+           helios_fence_event_immediate, helios_fence_event_raced,
+           helios_fence_event_timeouts, helios_fence_event_fallbacks,
+           helios_fence_event_lost);
    fprintf(f, "shmem_creates=%llu shmem_cache_hits=%llu bo_creates=%llu bo_maps=%llu\n",
            (unsigned long long)helios->perf.shmem_creates,
            (unsigned long long)helios->perf.shmem_cache_hits,
@@ -2746,8 +3067,15 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    const bool join_retire = helios->retire_thread_live;
    cnd_signal(&helios->retire_cond);
    mtx_unlock(&helios->retire_mutex);
+   /* Unpark an event-path fence wait (WaitForMultipleObjects) promptly. */
+   if (helios->retire_stop_event)
+      SetEvent(helios->retire_stop_event);
    if (join_retire)
       thrd_join(helios->retire_thread, NULL);
+   if (helios->retire_stop_event) {
+      CloseHandle(helios->retire_stop_event);
+      helios->retire_stop_event = NULL;
+   }
 
    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
 
@@ -2808,6 +3136,14 @@ helios_init(struct helios *helios)
       helios_diag("helios_open_d3dkmt failed");
       return VK_ERROR_INITIALIZATION_FAILED;
    }
+
+   /* Versioned ICD↔KMD capability handshake (no deploy-order assumptions):
+    * one quiet probe decides event waits vs the blocking-escape fallback. */
+   helios_probe_fence_events(helios);
+   helios->retire_stop_event = CreateEventW(NULL, /*bManualReset*/ TRUE, FALSE, NULL);
+   if (helios->fence_events_supported && !helios->retire_stop_event)
+      helios_diag("retire_stop_event creation FAILED — retire thread will use "
+                  "the slice-wait fallback");
 
    /* Create the single venus virtio-gpu context up front so it exists before the
     * first shmem/submit (analog of vtest_vcmd_context_init). */
