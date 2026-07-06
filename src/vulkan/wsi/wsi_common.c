@@ -512,8 +512,13 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(InvalidateMappedMemoryRanges);
    WSI_GET_CB(MapMemory);
    WSI_GET_CB(UnmapMemory);
-   if (wsi->has_present_wait)
+   /* WaitSemaphores also serves the Helios vehicle acquire-side recycle
+    * gate, which needs timeline waits without KHR_present_wait. */
+   if (wsi->has_present_wait || wsi->has_timeline_semaphore)
       WSI_GET_CB(WaitSemaphores);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   WSI_GET_CB(ImportSemaphoreWin32HandleKHR);
+#endif
 #undef WSI_GET_CB
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)

@@ -101,6 +101,19 @@ static volatile LONG helios_vehicle_wait_timeouts;  /* wait_last_present bounded
 static volatile LONG helios_vehicle_drops;          /* non-FIFO frames dropped
                                                      * because DXGI would block
                                                      * (latency queue full) */
+static volatile LONG helios_vehicle_gate_arms;      /* presents recycled via the
+                                                     * acquire-side gate */
+static volatile LONG helios_vehicle_gate_fallbacks; /* presents with no usable
+                                                     * (fenceId, value) result —
+                                                     * served by the serial wait */
+static volatile LONG helios_vehicle_gate_timeouts;  /* bounded acquire-gate wait
+                                                     * timeouts (proceed loudly) */
+
+/* Acquire-gate cost telemetry (WS2 measure-first discipline): aggregated on
+ * the app's acquire thread, one diag line per 512 gated acquires. */
+static volatile LONG helios_vehicle_gate_waits;
+static volatile LONG64 helios_vehicle_gate_wait_us_total;
+static volatile LONG64 helios_vehicle_gate_wait_us_max;
 
 static bool
 helios_win32_wsi_direct_map_enabled(void)
@@ -155,7 +168,8 @@ helios_win32_wsi_perf_write(void)
            " getdc_ms=%.3f getdc_avg_us=%.3f"
            " stretch_ms=%.3f stretch_avg_us=%.3f"
            " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
-           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld drops=%ld\n",
+           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld drops=%ld"
+           " gate_arms=%ld gate_fb=%ld gate_to=%ld\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
            (double)helios_win32_wsi_perf.copy_ns / 1000000.0,
@@ -174,7 +188,8 @@ helios_win32_wsi_perf_write(void)
            helios_vehicle_create_fails, helios_vehicle_export_miss,
            helios_vehicle_presents, helios_vehicle_present_fails,
            helios_vehicle_fallbacks, helios_vehicle_wait_timeouts,
-           helios_vehicle_drops);
+           helios_vehicle_drops, helios_vehicle_gate_arms,
+           helios_vehicle_gate_fallbacks, helios_vehicle_gate_timeouts);
 
    if (f != stderr)
       fclose(f);
@@ -240,6 +255,8 @@ typedef int32_t (*helios_umd_set_present_source_fn)(
    uint32_t resid, uint64_t fence_value, uint32_t width, uint32_t height,
    uint32_t dxgi_format, uint64_t alloc_size, uint32_t memory_type_index);
 typedef int32_t (*helios_umd_wait_last_present_fn)(uint32_t timeout_us);
+typedef int32_t (*helios_umd_get_present_result_fn)(uint32_t *fence_id,
+                                                    uint64_t *value);
 
 enum wsi_win32_vehicle_state {
    WSI_VEHICLE_OFF = 0, /* knob off / not applicable to this chain */
@@ -283,6 +300,18 @@ struct wsi_win32_vehicle {
     * worker from the already-loaded helios_umd module. */
    helios_umd_set_present_source_fn set_source;
    helios_umd_wait_last_present_fn wait_present;
+   helios_umd_get_present_result_fn get_result;
+
+   /* Acquire-side recycle gate: the VEHICLE device's named present fence
+    * (Global\HeliosPresentFence_<pid>_<release_fence_id> — UMD low-half id
+    * space, distinct from fence_id below), imported ONCE per chain as a
+    * timeline semaphore at the first present that returned a result. Image
+    * reuse then gates on (release_sem, per-image release_value) at ACQUIRE
+    * — fully pipelined — instead of the worker-serial wait_last_present.
+    * unavailable latches the serial-wait fallback (loud, counted). */
+   VkSemaphore release_sem;
+   uint32_t release_fence_id;
+   bool release_unavailable;
 
    /* SetContent+Commit are deferred to the first successful vehicle present
     * (mirrors the dxgi path's current_swapchain switch): until then the sw
@@ -495,6 +524,11 @@ struct wsi_win32_image {
       uint32_t resid;
       uint64_t alloc_size;
       uint32_t mem_type;
+      /* Vehicle-fence timeline value the last present's frame copy retires
+       * at (0 = no copy pending). Written by the present worker BEFORE
+       * set_image_idle (acquire_mutex orders it); consumed by the acquire
+       * gate. DROPPED frames never set it — no copy, recycle immediately. */
+      uint64_t release_value;
    } vehicle;
 };
 
@@ -706,7 +740,9 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
          wsi_win32_vehicle_find_umd_export("helios_umd_set_present_source");
       v->wait_present = (helios_umd_wait_last_present_fn)
          wsi_win32_vehicle_find_umd_export("helios_umd_wait_last_present");
-      if (!v->set_source || !v->wait_present) {
+      v->get_result = (helios_umd_get_present_result_fn)
+         wsi_win32_vehicle_find_umd_export("helios_umd_get_present_result");
+      if (!v->set_source || !v->wait_present || !v->get_result) {
          InterlockedIncrement(&helios_vehicle_export_miss);
          hr = E_NOINTERFACE;
          goto fail;
@@ -1437,7 +1473,43 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
    wsi_helios_present_worker_finish(&chain->base);
    if (!chain->dxgi)
       wsi_win32_vehicle_unbind_content(chain);
+
+   /* Acquire-gate teardown drain: pending release values mean the vehicle's
+    * frame copies may still be reading these images on the host GPU. The
+    * worker is drained (values final); bounded wait on the max pending
+    * value — the timeline is monotonic. Belt to vehicle_finish's suspender
+    * (the vehicle device teardown also waits idle), explicit and counted. */
+   if (chain->vehicle.release_sem != VK_NULL_HANDLE &&
+       wsi_win32_vehicle_wait_us() != 0) {
+      uint64_t max_pending = 0;
+      for (uint32_t i = 0; i < chain->base.image_count; i++)
+         max_pending = MAX2(max_pending, chain->images[i].vehicle.release_value);
+      if (max_pending) {
+         const VkSemaphoreWaitInfo wait_info = {
+            VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            NULL,
+            0,
+            1,
+            &chain->vehicle.release_sem,
+            &max_pending,
+         };
+         if (chain->base.wsi->WaitSemaphores(
+                chain->base.device, &wait_info,
+                (uint64_t)wsi_win32_vehicle_wait_us() * 1000) != VK_SUCCESS) {
+            InterlockedIncrement(&helios_vehicle_gate_timeouts);
+            helios_wsi_vehicle_diag(
+               "acquire-gate: teardown drain TIMED OUT chain=%p value=%llu",
+               (void *)chain, (unsigned long long)max_pending);
+         }
+      }
+   }
+
    wsi_win32_vehicle_finish(chain);
+
+   if (chain->vehicle.release_sem != VK_NULL_HANDLE)
+      chain->base.wsi->DestroySemaphore(chain->base.device,
+                                        chain->vehicle.release_sem,
+                                        &chain->base.alloc);
 
    for (uint32_t i = 0; i < chain->base.image_count; i++)
       wsi_win32_image_finish(chain, allocator, &chain->images[i]);
@@ -1554,6 +1626,65 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
    return result;
 }
 
+/* Acquire-side recycle gate: bounded wait until the vehicle's frame copy
+ * OUT of this image completed on the host GPU — the imported vehicle-fence
+ * timeline reaching the image's release value. Runs on the app's acquire
+ * thread AFTER the image was claimed (DRAWING) and outside the acquire
+ * mutex, so it pipelines against the worker instead of serializing it.
+ * Timeout: proceed loudly (same policy as the serial wait it replaces —
+ * a rare one-frame tear beats a wedge). Telemetry: one diag line per 512
+ * gated acquires. */
+static void
+wsi_win32_acquire_gate_vehicle_release(struct wsi_win32_swapchain *chain,
+                                       struct wsi_win32_image *image)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+   const uint64_t value = image->vehicle.release_value;
+   if (value == 0)
+      return;
+   image->vehicle.release_value = 0;
+   if (v->release_sem == VK_NULL_HANDLE)
+      return;
+   const uint32_t bound_us = wsi_win32_vehicle_wait_us();
+   if (bound_us == 0)
+      return; /* explicit A/B lever: recycle gating off (racy) */
+
+   const uint64_t t0 = os_time_get_nano();
+   const VkSemaphoreWaitInfo wait_info = {
+      VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+      NULL,
+      0,
+      1,
+      &v->release_sem,
+      &value,
+   };
+   VkResult res = chain->base.wsi->WaitSemaphores(
+      chain->base.device, &wait_info, (uint64_t)bound_us * 1000);
+   const LONG64 wait_us = (LONG64)((os_time_get_nano() - t0) / 1000);
+
+   if (res != VK_SUCCESS)
+      InterlockedIncrement(&helios_vehicle_gate_timeouts);
+
+   InterlockedExchangeAdd64(&helios_vehicle_gate_wait_us_total, wait_us);
+   LONG64 prev_max = helios_vehicle_gate_wait_us_max;
+   while (wait_us > prev_max) {
+      const LONG64 seen = InterlockedCompareExchange64(
+         &helios_vehicle_gate_wait_us_max, wait_us, prev_max);
+      if (seen == prev_max)
+         break;
+      prev_max = seen;
+   }
+   const LONG n = InterlockedIncrement(&helios_vehicle_gate_waits);
+   if ((n % 512) == 0) {
+      helios_wsi_vehicle_diag(
+         "acquire-gate: n=%ld avg_us=%lld max_us=%lld timeouts=%ld",
+         n, (long long)(helios_vehicle_gate_wait_us_total / n),
+         (long long)helios_vehicle_gate_wait_us_max,
+         helios_vehicle_gate_timeouts);
+      InterlockedExchange64(&helios_vehicle_gate_wait_us_max, 0);
+   }
+}
+
 static VkResult
 wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
                              const VkAcquireNextImageInfoKHR *info,
@@ -1567,8 +1698,14 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
       return chain->status;
 
    /* acquire timeout has to be explicitly handled for sw wsi */
-   if (!chain->dxgi)
-      return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+   if (!chain->dxgi) {
+      VkResult result =
+         wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
+      if (result == VK_SUCCESS)
+         wsi_win32_acquire_gate_vehicle_release(chain,
+                                                &chain->images[*image_index]);
+      return result;
+   }
 
    if (wsi_win32_find_idle_image(chain, image_index))
       return VK_SUCCESS;
@@ -1661,6 +1798,95 @@ wsi_win32_vehicle_latch_present_fail(struct wsi_win32_swapchain *chain)
    InterlockedIncrement(&helios_vehicle_fallbacks);
    InterlockedExchange(&chain->vehicle.state, WSI_VEHICLE_FAILED);
    wsi_win32_vehicle_unbind_content(chain);
+}
+
+/* Arm the acquire-side recycle gate: import the VEHICLE device's named
+ * present fence (Global\HeliosPresentFence_<pid>_<fence_id>, UMD low-half
+ * id space) as a timeline semaphore, once per chain, on the present worker.
+ * The d5d698aaec5 import-by-name machinery (D3DKMTOpenSyncObjectNtHandle-
+ * FromName) is probe-proven at LIMITED IL. Any failure latches
+ * release_unavailable — the worker-serial wait fallback serves the chain,
+ * loudly (gate_fb counter). */
+static bool
+wsi_win32_vehicle_arm_release_gate(struct wsi_win32_swapchain *chain,
+                                   uint32_t fence_id)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+   const struct wsi_device *wsi = chain->base.wsi;
+
+   if (v->release_unavailable)
+      return false;
+   if (v->release_sem != VK_NULL_HANDLE) {
+      if (v->release_fence_id == fence_id)
+         return true;
+      /* The vehicle D3D11 device (and so its fence id) lives exactly as
+       * long as this chain — a change is an upstream contract break. */
+      helios_wsi_vehicle_diag(
+         "release-gate DISARMED chain=%p: fence id changed %u -> %u",
+         (void *)chain, v->release_fence_id, fence_id);
+      v->release_unavailable = true;
+      return false;
+   }
+
+   if (!wsi->ImportSemaphoreWin32HandleKHR || !wsi->WaitSemaphores) {
+      helios_wsi_vehicle_diag(
+         "release-gate UNAVAILABLE chain=%p: entrypoints import=%p wait=%p",
+         (void *)chain, (void *)wsi->ImportSemaphoreWin32HandleKHR,
+         (void *)wsi->WaitSemaphores);
+      v->release_unavailable = true;
+      return false;
+   }
+
+   const VkSemaphoreTypeCreateInfo type_info = {
+      VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+      NULL,
+      VK_SEMAPHORE_TYPE_TIMELINE,
+      0,
+   };
+   const VkSemaphoreCreateInfo sem_info = {
+      VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      &type_info,
+      0,
+   };
+   VkSemaphore sem = VK_NULL_HANDLE;
+   VkResult res = wsi->CreateSemaphore(chain->base.device, &sem_info,
+                                       &chain->base.alloc, &sem);
+   if (res != VK_SUCCESS) {
+      helios_wsi_vehicle_diag(
+         "release-gate UNAVAILABLE chain=%p: semaphore create failed (%d)",
+         (void *)chain, (int)res);
+      v->release_unavailable = true;
+      return false;
+   }
+
+   WCHAR sem_name[96];
+   _snwprintf(sem_name, ARRAY_SIZE(sem_name),
+              L"Global\\HeliosPresentFence_%lu_%u",
+              (unsigned long)GetCurrentProcessId(), fence_id);
+   const VkImportSemaphoreWin32HandleInfoKHR import_info = {
+      VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+      NULL,
+      sem,
+      0,
+      VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT,
+      NULL, /* null handle + name = import BY NAME */
+      sem_name,
+   };
+   res = wsi->ImportSemaphoreWin32HandleKHR(chain->base.device, &import_info);
+   if (res != VK_SUCCESS) {
+      wsi->DestroySemaphore(chain->base.device, sem, &chain->base.alloc);
+      helios_wsi_vehicle_diag(
+         "release-gate UNAVAILABLE chain=%p: import fence_id=%u failed (%d)",
+         (void *)chain, fence_id, (int)res);
+      v->release_unavailable = true;
+      return false;
+   }
+
+   v->release_sem = sem;
+   v->release_fence_id = fence_id;
+   helios_wsi_vehicle_diag("release-gate ARMED chain=%p fence_id=%u",
+                           (void *)chain, fence_id);
+   return true;
 }
 
 /* Present the frame through the dcomp vehicle. Runs on the async present
@@ -1796,11 +2022,30 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
                               chain->extent.height);
    }
 
-   /* Bounded wait for the vehicle's frame copy to complete before the image
-    * becomes acquirable again — the copy reads it, and re-rendering first is
-    * exactly the 21st-session torn-copy class. Timeout: proceed loudly. */
-   if (v->wait_present(wsi_win32_vehicle_wait_us()) != 0)
-      InterlockedIncrement(&helios_vehicle_wait_timeouts);
+   /* Recycle guard — the vehicle's copy reads this image, and re-rendering
+    * it first is exactly the 21st-session torn-copy class. Preferred:
+    * acquire-side gate. Take THIS present's (fenceId, value) — the vehicle
+    * device's named-fence signal recorded after the copy, so it retires at
+    * host-GPU copy completion — arm the imported timeline once per chain,
+    * and stamp the image; the bounded wait moves to this image's NEXT
+    * acquire, where the copy has had ~image_count-1 frame slots of wall
+    * time (expect ~0). Fallback when no result arrived or the import is
+    * unavailable: the original worker-serial bounded wait, counted. */
+   bool gated = false;
+   uint32_t rel_fence_id = 0;
+   uint64_t rel_value = 0;
+   if (v->get_result(&rel_fence_id, &rel_value) == 0 &&
+       rel_fence_id != 0 && rel_value != 0 &&
+       wsi_win32_vehicle_arm_release_gate(chain, rel_fence_id)) {
+      image->vehicle.release_value = rel_value;
+      InterlockedIncrement(&helios_vehicle_gate_arms);
+      gated = true;
+   }
+   if (!gated) {
+      InterlockedIncrement(&helios_vehicle_gate_fallbacks);
+      if (v->wait_present(wsi_win32_vehicle_wait_us()) != 0)
+         InterlockedIncrement(&helios_vehicle_wait_timeouts);
+   }
 
    InterlockedIncrement(&helios_vehicle_presents);
    chain->status = VK_SUCCESS;

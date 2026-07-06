@@ -261,6 +261,11 @@ struct wsi_device {
    WSI_CB(MapMemory);
    WSI_CB(UnmapMemory);
    WSI_CB(WaitSemaphores);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* Helios dcomp present vehicle: import of the vehicle's named present
+    * fence (acquire-side image-recycle gate). */
+   WSI_CB(ImportSemaphoreWin32HandleKHR);
+#endif
 #undef WSI_CB
 
     struct wsi_interface *                  wsi[VK_ICD_WSI_PLATFORM_MAX];
