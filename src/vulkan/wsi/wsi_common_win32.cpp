@@ -108,6 +108,11 @@ static volatile LONG helios_vehicle_gate_fallbacks; /* presents with no usable
                                                      * served by the serial wait */
 static volatile LONG helios_vehicle_gate_timeouts;  /* bounded acquire-gate wait
                                                      * timeouts (proceed loudly) */
+static volatile LONG helios_vehicle_present_odd;    /* Present() SUCCEEDED but
+                                                     * hr != S_OK (e.g.
+                                                     * DXGI_STATUS_OCCLUDED =
+                                                     * frame NOT displayed) —
+                                                     * stale-frame triage c1 */
 
 /* Acquire-gate cost telemetry (WS2 measure-first discipline): aggregated on
  * the app's acquire thread, one diag line per 512 gated acquires. */
@@ -168,8 +173,8 @@ helios_win32_wsi_perf_write(void)
            " getdc_ms=%.3f getdc_avg_us=%.3f"
            " stretch_ms=%.3f stretch_avg_us=%.3f"
            " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
-           " presents=%ld pfails=%ld fallbacks=%ld wait_to=%ld drops=%ld"
-           " gate_arms=%ld gate_fb=%ld gate_to=%ld\n",
+           " presents=%ld pfails=%ld odd_hr=%ld fallbacks=%ld wait_to=%ld"
+           " drops=%ld gate_arms=%ld gate_fb=%ld gate_to=%ld\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
            (double)helios_win32_wsi_perf.copy_ns / 1000000.0,
@@ -187,6 +192,7 @@ helios_win32_wsi_perf_write(void)
            helios_vehicle_ready, helios_vehicle_creates,
            helios_vehicle_create_fails, helios_vehicle_export_miss,
            helios_vehicle_presents, helios_vehicle_present_fails,
+           helios_vehicle_present_odd,
            helios_vehicle_fallbacks, helios_vehicle_wait_timeouts,
            helios_vehicle_drops, helios_vehicle_gate_arms,
            helios_vehicle_gate_fallbacks, helios_vehicle_gate_timeouts);
@@ -323,6 +329,18 @@ struct wsi_win32_vehicle {
     * set — the UMD's own producer counter lives in another DLL and a name
     * collision fails the second create, proven live). */
    uint32_t fence_id;
+
+   /* Stale-frame triage c1 (27th session): Present() returns SUCCESS
+    * statuses (DXGI_STATUS_OCCLUDED 0x087A0001 = frame NOT displayed) that
+    * pass the FAILED(hr) check silently. Diag on hr TRANSITIONS only — a
+    * backgrounded window would flood a per-present line. Worker-thread
+    * (or inline-present) private; no locking needed. */
+   HRESULT last_present_hr;
+   uint32_t present_hr_run; /* presents since the last hr change */
+   bool present_hr_seen;
+   /* Latency-waitable drop streaks: dwm ceasing to consume an unfocused
+    * chain's frames would surface here as an unbounded streak. */
+   uint32_t drop_streak;
 };
 
 static bool
@@ -1912,10 +1930,23 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
    if (v->frame_latency_waitable &&
        WaitForSingleObject(v->frame_latency_waitable, 0) == WAIT_TIMEOUT) {
       InterlockedIncrement(&helios_vehicle_drops);
+      /* Short streaks are routine (render-unthrottled vs dwm's ~60 Hz
+       * consumption). A LONG streak = dwm stopped consuming this chain
+       * (occluded/background?) — nothing new displays while we drop.
+       * Log at 64 then every doubling; bounded. */
+      const uint32_t streak = ++v->drop_streak;
+      if (streak >= 64 && (streak & (streak - 1)) == 0)
+         helios_wsi_vehicle_diag(
+            "drop streak chain=%p len=%u (latency waitable unsignaled — dwm "
+            "not consuming)", (void *)chain, streak);
       chain->status = VK_SUCCESS;
       wsi_win32_set_image_idle(chain, image);
       return true;
    }
+   if (v->drop_streak >= 64)
+      helios_wsi_vehicle_diag("drop streak END chain=%p len=%u",
+                              (void *)chain, v->drop_streak);
+   v->drop_streak = 0;
 
    /* The frame image's venus identity, resolved once per image. */
    if (!image->vehicle.resolved) {
@@ -1983,6 +2014,30 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
    }
 
    const HRESULT hr = v->sc->Present(interval, flags);
+
+   /* Stale-frame triage c1: SUCCESS statuses (DXGI_STATUS_OCCLUDED
+    * 0x087A0001 et al.) mean the frame was NOT displayed, yet pass the
+    * FAILED() check below. Diag on transitions only — the line timestamps
+    * then bracket exactly when the status flipped (e.g. at a window
+    * click). fg/vis snapshot the window state at the transition. */
+   if (!v->present_hr_seen || hr != v->last_present_hr) {
+      helios_wsi_vehicle_diag(
+         "present hr %s chain=%p hr=0x%08lx (prev=0x%08lx x%u) fg=%d vis=%d%s",
+         v->present_hr_seen ? "TRANSITION" : "FIRST",
+         (void *)chain, (unsigned long)hr,
+         (unsigned long)v->last_present_hr, v->present_hr_run,
+         GetForegroundWindow() == v->hwnd ? 1 : 0,
+         IsWindowVisible(v->hwnd) ? 1 : 0,
+         (SUCCEEDED(hr) && hr != S_OK) ? " [SUCCESS-STATUS: NOT DISPLAYED]"
+                                       : "");
+      v->last_present_hr = hr;
+      v->present_hr_run = 0;
+      v->present_hr_seen = true;
+   }
+   v->present_hr_run++;
+   if (SUCCEEDED(hr) && hr != S_OK)
+      InterlockedIncrement(&helios_vehicle_present_odd);
+
    if (FAILED(hr)) {
       helios_wsi_vehicle_diag("present FAILED chain=%p: Present hr=0x%08lx",
                               (void *)chain, (unsigned long)hr);
