@@ -284,6 +284,10 @@ struct helios_retire_entry {
    struct helios_retire_entry *next;
    struct helios_sync *sync;
    uint64_t fence_id;
+   /* QPC at enqueue (== the wire fence's submit, same call path) — the
+    * retire thread computes submit→retirement-observed latency from it
+    * (WS2 copy-latency decomposition). */
+   int64_t enqueue_qpc;
 };
 
 enum helios_ioctl_stat {
@@ -326,6 +330,18 @@ struct helios_perf_stats {
    uint64_t wait_fast;
    uint64_t wait_slow;
    uint64_t wait_timeout;
+   /* Wire-fence submit→retirement-observed latency, measured by the retire
+    * thread (external-sync signals only — one per vehicle/producer present).
+    * Splits the bridge's copy-lat: a fat leg here = venus submit → host
+    * completion → fence event; a thin leg = the delay is in guest dispatch
+    * before submit or in the waiter hop after the WDDM signal. */
+   uint64_t retire_lat_count;
+   int64_t retire_lat_ticks;
+   int64_t retire_lat_ticks_max;
+   /* Distribution shape (µs buckets: <1000, <3000, <6000, <10000, <20000,
+    * rest) — uniform-over-[0,10ms] indicts a host-side 10 ms fence poll;
+    * a tight spike = a fixed pipeline delay. */
+   uint64_t retire_lat_hist[6];
    uint64_t shmem_cache_hits;
    uint64_t shmem_creates;
    uint64_t bo_creates;
@@ -1797,8 +1813,25 @@ helios_sync_retire_thread(void *arg)
 
       bool free_sync;
       mtx_lock(&helios->dev_mutex);
-      if (complete)
+      if (complete) {
          helios_sync_mark_fence_locked(renderer, entry->sync, entry->fence_id);
+         if (helios->perf.enabled) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            const int64_t dt = now.QuadPart - entry->enqueue_qpc;
+            helios->perf.retire_lat_count++;
+            helios->perf.retire_lat_ticks += dt;
+            if (dt > helios->perf.retire_lat_ticks_max)
+               helios->perf.retire_lat_ticks_max = dt;
+            const int64_t us = helios->perf.qpc_freq.QuadPart
+               ? dt * 1000000 / helios->perf.qpc_freq.QuadPart
+               : 0;
+            const uint32_t bucket =
+               us < 1000 ? 0 : us < 3000 ? 1 : us < 6000 ? 2 :
+               us < 10000 ? 3 : us < 20000 ? 4 : 5;
+            helios->perf.retire_lat_hist[bucket]++;
+         }
+      }
       free_sync = helios_sync_unref_locked(renderer, entry->sync);
       mtx_unlock(&helios->dev_mutex);
       if (free_sync)
@@ -1826,6 +1859,11 @@ helios_retire_enqueue_locked(struct helios *helios,
    entry->next = NULL;
    entry->sync = sync;
    entry->fence_id = fence_id;
+   {
+      LARGE_INTEGER now;
+      QueryPerformanceCounter(&now);
+      entry->enqueue_qpc = now.QuadPart;
+   }
 
    mtx_lock(&helios->retire_mutex);
    if (!helios->retire_thread_live) {
@@ -1929,6 +1967,22 @@ helios_perf_write(struct helios *helios, bool final)
            (unsigned long long)helios->perf.wait_fast,
            (unsigned long long)helios->perf.wait_slow,
            (unsigned long long)helios->perf.wait_timeout);
+   if (helios->perf.retire_lat_count) {
+      fprintf(f,
+              "retire_lat n=%llu avg_us=%.1f max_us=%.1f "
+              "hist_ms[<1,1-3,3-6,6-10,10-20,20+]=%llu/%llu/%llu/%llu/%llu/%llu\n",
+              (unsigned long long)helios->perf.retire_lat_count,
+              helios_perf_ms(helios, helios->perf.retire_lat_ticks) * 1000.0 /
+                 (double)helios->perf.retire_lat_count,
+              helios_perf_ms(helios, helios->perf.retire_lat_ticks_max) *
+                 1000.0,
+              (unsigned long long)helios->perf.retire_lat_hist[0],
+              (unsigned long long)helios->perf.retire_lat_hist[1],
+              (unsigned long long)helios->perf.retire_lat_hist[2],
+              (unsigned long long)helios->perf.retire_lat_hist[3],
+              (unsigned long long)helios->perf.retire_lat_hist[4],
+              (unsigned long long)helios->perf.retire_lat_hist[5]);
+   }
    fprintf(f,
            "fence_events supported=%d waits=%ld imm=%ld raced=%ld timeouts=%ld "
            "fallbacks=%ld lost=%ld\n",
