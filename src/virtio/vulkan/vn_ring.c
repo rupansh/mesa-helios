@@ -21,6 +21,41 @@
 
 #define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
 
+/* HELIOS: idle-notify decisions skipped by the rate limiter while the host
+ * ring advertised IDLE — the suspected wire-fence slow-mode source (29th
+ * session). Read out of a live process via a debugger or a diag line; kept
+ * global-simple on purpose. */
+static uint32_t helios_ring_notify_skips;
+
+#if DETECT_OS_WINDOWS
+/* Local Win32 prototype — this mesa-common file deliberately avoids
+ * windows.h (helios_win_compat.h keeps the tree upstream-identical). */
+unsigned long __stdcall GetEnvironmentVariableA(const char *name,
+                                                char *buffer,
+                                                unsigned long size);
+#endif
+
+/* HELIOS_RING_NOTIFY_EAGER=1: notify on every submission that observes the
+ * IDLE status bit (A/B lever for the retire_lat slow mode). */
+static bool
+vn_ring_notify_eager(void)
+{
+#if DETECT_OS_WINDOWS
+   static int cached = -1;
+   if (cached < 0) {
+      char v[8];
+      cached = GetEnvironmentVariableA("HELIOS_RING_NOTIFY_EAGER", v,
+                                       sizeof(v)) &&
+                     v[0] != '0'
+                  ? 1
+                  : 0;
+   }
+   return cached == 1;
+#else
+   return false;
+#endif
+}
+
 static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(atomic_uint) == 4,
               "vn_ring_shared requires lock-free 32-bit atomic_uint");
 
@@ -621,14 +656,32 @@ vn_ring_submit_internal(struct vn_ring *ring,
    /* Notify renderer to wake up idle ring if at least VN_RING_IDLE_TIMEOUT_NS
     * has passed since the last sent notification to avoid excessive wake up
     * calls (non-trivial since submitted via virtio-gpu kernel).
+    *
+    * HELIOS A/B (29th session, wire-fence latency): a rate-limited notify
+    * that is SKIPPED while the host ring sits in its wakeable idle wait is
+    * simply dropped — the tail then sits undecoded until the next
+    * submission that passes the limiter. HELIOS_RING_NOTIFY_EAGER=1
+    * notifies on EVERY submission that observes the IDLE status bit (cost:
+    * one extra ~120 µs escape per idle wakeup) to A/B the retire_lat
+    * slow mode against the limiter.
     */
    if (status & VK_RING_STATUS_IDLE_BIT_MESA) {
+      if (vn_ring_notify_eager())
+         return true;
       const int64_t now = os_time_get_nano();
       if (os_time_timeout(ring->last_notify, ring->next_notify, now)) {
          ring->last_notify = now;
          ring->next_notify = now + VN_RING_IDLE_TIMEOUT_NS;
          return true;
       }
+      helios_ring_notify_skips++;
+#if DETECT_OS_WINDOWS
+      if (helios_diag_should_log(helios_ring_notify_skips))
+         vn_renderer_helios_diag_log(
+            "ring notify SKIPPED while host idle (x%u) — tail undecoded "
+            "until the next passing submission",
+            helios_ring_notify_skips);
+#endif
    }
    return false;
 }
