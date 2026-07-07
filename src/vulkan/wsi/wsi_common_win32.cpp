@@ -351,15 +351,24 @@ struct wsi_win32_vehicle {
    uint32_t drop_streak;
 };
 
+/* Default ON since the 28th session (bring-up opt-in retired): the ladder
+ * is green end-to-end — kwait flip ordering (code default ON), the
+ * hwnd→target registry (resize/fullscreen re-create), skip-if-unretired
+ * consumers (windowed stutter, owner-confirmed fixed), stale class dead.
+ * HELIOS_WSI_DCOMP_PRESENT=0 is the per-process kill switch back to the
+ * sw present path; any vehicle build failure still latches the chain to
+ * the sw path loudly, per-chain. */
 static bool
 wsi_win32_vehicle_enabled(void)
 {
    static int cached = -1;
    if (cached < 0) {
       char value[8] = "";
-      cached = GetEnvironmentVariableA("HELIOS_WSI_DCOMP_PRESENT", value,
-                                       sizeof(value)) &&
-               value[0] && value[0] != '0';
+      if (GetEnvironmentVariableA("HELIOS_WSI_DCOMP_PRESENT", value,
+                                  sizeof(value)) && value[0])
+         cached = value[0] != '0';
+      else
+         cached = 1;
    }
    return cached > 0;
 }
