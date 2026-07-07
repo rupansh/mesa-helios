@@ -3243,8 +3243,32 @@ helios_init_renderer_info(struct helios *helios)
    info->pci.device_id = 0x1050;
    info->pci.has_bus_info = false;
 
-   /* LUID for DXVK/VKD3D D3DKMT interop is a Phase 6 concern. */
-   info->id.has_luid = false;
+   /* Report the guest WDDM adapter's LUID as VkPhysicalDeviceIDProperties::
+    * deviceLUID, exactly as a native Windows Vulkan driver does. helios->adapter_luid
+    * was captured from D3DKMTEnumAdapters2 in helios_open_d3dkmt (which runs before
+    * this) and IS the same LUID DXGI/D3DKMT reports for our kmd_render adapter
+    * (EnumAdapters1 AdapterLuid). Without this, deviceLUIDValid was false and no
+    * VkPhysicalDevice carried the guest adapter LUID, so any app that selects an
+    * adapter via DXGI and then matches it into Vulkan by deviceLUID (3DMark/UL
+    * benchmarks, dxvk findAdapterByLuid, dxvk_adapter D3DKMTOpenAdapterFromLuid)
+    * could not find the Vulkan device — "VkPhysicalDevice with device LUID X not
+    * found". node_mask=1 mirrors a single-node adapter. LUID bytes are copied
+    * verbatim (LowPart then HighPart); consumers memcpy them straight back into a
+    * LUID struct. A zero LUID means the OS never assigned one — keep it invalid
+    * rather than advertise a bogus all-zero identity. */
+   _Static_assert(sizeof(helios->adapter_luid) == sizeof(info->id.luid),
+                  "WDDM LUID size must equal Vulkan deviceLUID size");
+   if (helios->adapter_luid.LowPart != 0 || helios->adapter_luid.HighPart != 0) {
+      info->id.has_luid = true;
+      info->id.node_mask = 1;
+      memcpy(info->id.luid, &helios->adapter_luid, sizeof(info->id.luid));
+      helios_diag("renderer info: deviceLUID=%08lx:%08lx node_mask=1",
+                  (unsigned long)helios->adapter_luid.HighPart,
+                  (unsigned long)helios->adapter_luid.LowPart);
+   } else {
+      info->id.has_luid = false;
+      helios_diag("renderer info: WDDM adapter LUID is zero; deviceLUIDValid=false");
+   }
 }
 
 static void
