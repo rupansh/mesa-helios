@@ -2481,8 +2481,22 @@ vn_semaphore_feedback_init(struct vn_device *dev,
 
    assert(sem->type == VK_SEMAPHORE_TYPE_TIMELINE);
 
-   if (sem->is_external)
+   if (sem->is_external) {
+#if DETECT_OS_WINDOWS
+      /* HELIOS feedback-shadow retire (WS2): EXPORTED timelines on this
+       * stack are self-signaled only (queue signal ops in the exporting
+       * process — the present fences; importers never signal), so the
+       * feedback slot is complete for them and gives the retire thread a
+       * sub-ms completion channel that bypasses the wire-fence response
+       * (measured 10-20 ms through QEMU's fence delivery). The wait/read
+       * paths keep their win32/WDDM-fold priority — the slot only ever
+       * ADDS an observer. HELIOS_RETIRE_FEEDBACK=0 restores the skip. */
+      if (!vn_renderer_helios_retire_feedback_enabled())
+         return VK_SUCCESS;
+#else
       return VK_SUCCESS;
+#endif
+   }
 
    if (VN_PERF(NO_SEMAPHORE_FEEDBACK))
       return VK_SUCCESS;
@@ -2576,6 +2590,16 @@ vn_CreateSemaphore(VkDevice device,
          goto out_payloads_fini;
    }
 
+#if DETECT_OS_WINDOWS
+   /* Feedback-shadow retire: hand the slot's GPU-written counter to the
+    * exported sync so the retire thread can observe completion through it
+    * (detached in vn_DestroySemaphore BEFORE the slot is pool-recycled). */
+   if (sem->feedback.slot && sem->permanent.win32_sync)
+      vn_renderer_helios_sync_set_feedback(dev->renderer,
+                                           sem->permanent.win32_sync,
+                                           sem->feedback.slot->counter);
+#endif
+
    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
    vn_async_vkCreateSemaphore(dev->primary_ring, device, pCreateInfo, NULL,
                               &sem_handle);
@@ -2609,6 +2633,16 @@ vn_DestroySemaphore(VkDevice device,
       return;
 
    vn_async_vkDestroySemaphore(dev->primary_ring, device, semaphore, NULL);
+
+#if DETECT_OS_WINDOWS
+   /* Detach the feedback counter from the sync BEFORE the slot returns to
+    * the feedback pool — retire entries can outlive the semaphore (they
+    * hold sync refs) and must fall back to the wire fence rather than poll
+    * recycled slot memory. */
+   if (sem->feedback.slot && sem->permanent.win32_sync)
+      vn_renderer_helios_sync_set_feedback(dev->renderer,
+                                           sem->permanent.win32_sync, NULL);
+#endif
 
    if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
       vn_semaphore_feedback_fini(dev, sem);

@@ -268,6 +268,24 @@ vn_renderer_helios_sync_export_win32(
    struct vn_renderer_sync *sync,
    VkExternalSemaphoreHandleTypeFlagBits handle_type,
    void **out_handle);
+
+/* Feedback-shadow retire (WS2 wire-fence latency workaround): hand the
+ * exported semaphore's vn feedback-slot counter VA to its helios_sync so
+ * the retire thread can observe host completion through the GPU-written
+ * feedback slot (~sub-ms) instead of the wire-fence response (measured
+ * 10-20 ms through QEMU's fence delivery). Pass NULL to detach BEFORE the
+ * slot is returned to the feedback pool (semaphore destroy) — a stale
+ * pointer would poll recycled slot memory. */
+void
+vn_renderer_helios_sync_set_feedback(struct vn_renderer *renderer,
+                                     struct vn_renderer_sync *sync,
+                                     const volatile uint64_t *counter_va);
+
+/* HELIOS_RETIRE_FEEDBACK gate (absent/1 = ON, "0" = off). Read once per
+ * process; also gates the feedback-slot allocation for exported timeline
+ * semaphores in vn_semaphore_feedback_init. */
+bool
+vn_renderer_helios_retire_feedback_enabled(void);
 #endif
 
 struct vn_renderer {
