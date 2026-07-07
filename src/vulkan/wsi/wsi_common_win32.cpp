@@ -113,6 +113,10 @@ static volatile LONG helios_vehicle_present_odd;    /* Present() SUCCEEDED but
                                                      * DXGI_STATUS_OCCLUDED =
                                                      * frame NOT displayed) —
                                                      * stale-frame triage c1 */
+static volatile LONG helios_vehicle_target_reuse;   /* vehicle builds that found
+                                                     * a live hwnd-comp entry
+                                                     * (the 0x88980800 re-create
+                                                     * class, now reused) */
 
 /* Acquire-gate cost telemetry (WS2 measure-first discipline): aggregated on
  * the app's acquire thread, one diag line per 512 gated acquires. */
@@ -173,6 +177,7 @@ helios_win32_wsi_perf_write(void)
            " getdc_ms=%.3f getdc_avg_us=%.3f"
            " stretch_ms=%.3f stretch_avg_us=%.3f"
            " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
+           " tgt_reuse=%ld"
            " presents=%ld pfails=%ld odd_hr=%ld fallbacks=%ld wait_to=%ld"
            " drops=%ld gate_arms=%ld gate_fb=%ld gate_to=%ld\n",
            helios_win32_wsi_perf.frames,
@@ -191,6 +196,7 @@ helios_win32_wsi_perf_write(void)
               (double)helios_win32_wsi_perf.frames : 0.0,
            helios_vehicle_ready, helios_vehicle_creates,
            helios_vehicle_create_fails, helios_vehicle_export_miss,
+           helios_vehicle_target_reuse,
            helios_vehicle_presents, helios_vehicle_present_fails,
            helios_vehicle_present_odd,
            helios_vehicle_fallbacks, helios_vehicle_wait_timeouts,
@@ -246,9 +252,11 @@ helios_win32_wsi_perf_note_frame(bool direct, uint64_t copy_ns,
  *  - The worker also RELEASES the vehicle COM objects: after READY it parks
  *    on a condvar; swapchain destroy signals stop and joins. The nested
  *    D3D11→helios_umd→DXVK→ICD2 teardown therefore never runs on an ICD1
- *    thread. The dcomp target/visual are per-SURFACE (owned/released by the
- *    surface, like the in-tree dxgi path); the dcomp device + DXGI factory
- *    are process-lifetime.
+ *    thread. The dcomp target/visual are PER-HWND, PROCESS-GLOBAL entries
+ *    (Windows allows one composition target per hwnd, and runtimes create a
+ *    new VkSurface for the same hwnd on resize/fullscreen) — refcounted by
+ *    surfaces, released with the last surface; the dcomp device + DXGI
+ *    factory are process-lifetime.
  *  - Kill switch: HELIOS_WSI_DCOMP_PRESENT (default OFF for bring-up).
  *
  * ICD singleton audit for the nested ICD2 stack (23rd session): TLS rings
@@ -404,10 +412,30 @@ helios_wsi_vehicle_diag(const char *fmt, ...)
    fclose(f);
 }
 
+/* One dcomp target per HWND per process — Windows refuses a second
+ * CreateTargetForHwnd for the same (hwnd, topmost) with 0x88980800, and
+ * runtimes-on-Vulkan (vkd3d) create a NEW VkSurface for the same hwnd on
+ * resize/fullscreen, so caching the target on the surface alone made every
+ * such re-create latch the chain to the sw path (Doom fullscreen, 27th
+ * session). Entries are refcounted by surfaces and live on the runtime
+ * list under rt->mutex. current_swapchain (which chain's vehicle swapchain
+ * is the visual's content) lives HERE, not on the surface, so a retired
+ * chain hanging off the OLD surface cannot blank a newer chain's content
+ * on the same hwnd. */
+struct wsi_win32_hwnd_comp {
+   HWND hwnd;
+   IDCompositionTarget *target;
+   IDCompositionVisual *visual;
+   struct wsi_win32_swapchain *current_swapchain;
+   uint32_t refs; /* one per surface holding a vehicle_comp pointer */
+   struct wsi_win32_hwnd_comp *next;
+};
+
 /* Process-lifetime vehicle runtime: the d3d11/dxgi/dcomp modules, the DXGI
  * factory and the (rendering-device-less) dcomp device. Built lazily on a
  * vehicle worker thread — never at DllMain, never on an app thread. The
- * mutex also serializes per-surface dcomp target/visual creation. */
+ * mutex also serializes hwnd-comp registry mutation and visual content
+ * binding. */
 struct wsi_win32_vehicle_runtime {
    mtx_t mutex;
    bool init_attempted;
@@ -415,6 +443,7 @@ struct wsi_win32_vehicle_runtime {
    PFN_D3D11_CREATE_DEVICE create_device;
    IDXGIFactory4 *factory;
    IDCompositionDevice *dcomp;
+   struct wsi_win32_hwnd_comp *comps;
 
    wsi_win32_vehicle_runtime()
    {
@@ -424,6 +453,7 @@ struct wsi_win32_vehicle_runtime {
       create_device = NULL;
       factory = NULL;
       dcomp = NULL;
+      comps = NULL;
    }
 };
 
@@ -495,6 +525,80 @@ wsi_win32_vehicle_runtime_init_locked(struct wsi_win32_vehicle_runtime *rt)
    return true;
 }
 
+/* Find-or-create the hwnd's composition entry; caller holds rt->mutex and
+ * rt is usable. Returns the entry with one additional surface reference, or
+ * NULL with *hr_out set. */
+static struct wsi_win32_hwnd_comp *
+wsi_win32_hwnd_comp_acquire_locked(struct wsi_win32_vehicle_runtime *rt,
+                                   HWND hwnd, HRESULT *hr_out)
+{
+   for (struct wsi_win32_hwnd_comp *c = rt->comps; c; c = c->next) {
+      if (c->hwnd == hwnd) {
+         c->refs++;
+         InterlockedIncrement(&helios_vehicle_target_reuse);
+         return c;
+      }
+   }
+
+   struct wsi_win32_hwnd_comp *c =
+      (struct wsi_win32_hwnd_comp *)calloc(1, sizeof(*c));
+   if (!c) {
+      *hr_out = E_OUTOFMEMORY;
+      return NULL;
+   }
+
+   /* topmost=FALSE matches the proven probe and the upstream dzn path. */
+   HRESULT hr = rt->dcomp->CreateTargetForHwnd(hwnd, FALSE, &c->target);
+   if (SUCCEEDED(hr) && c->target) {
+      hr = rt->dcomp->CreateVisual(&c->visual);
+      if (SUCCEEDED(hr) && c->visual)
+         hr = c->target->SetRoot(c->visual);
+   }
+   if (FAILED(hr) || !c->target || !c->visual) {
+      if (c->visual)
+         c->visual->Release();
+      if (c->target)
+         c->target->Release();
+      free(c);
+      *hr_out = FAILED(hr) ? hr : E_UNEXPECTED;
+      return NULL;
+   }
+
+   c->hwnd = hwnd;
+   c->refs = 1;
+   c->next = rt->comps;
+   rt->comps = c;
+   return c;
+}
+
+/* Drop one surface reference; the last one unlinks the entry and releases
+ * the COM objects (parity with the old per-surface release — the dcomp
+ * target/visual are lightweight compositor objects, no nested UMD teardown
+ * runs here). All chains of the releasing surface are already destroyed
+ * (Vulkan surface lifetime), so its chains cannot be the bound content. */
+static void
+wsi_win32_hwnd_comp_release(struct wsi_win32_vehicle_runtime *rt,
+                            struct wsi_win32_hwnd_comp *comp)
+{
+   mtx_lock(&rt->mutex);
+   assert(comp->refs > 0);
+   bool dead = --comp->refs == 0;
+   if (dead) {
+      struct wsi_win32_hwnd_comp **link = &rt->comps;
+      while (*link && *link != comp)
+         link = &(*link)->next;
+      if (*link)
+         *link = comp->next;
+      if (comp->visual)
+         comp->visual->Release();
+      if (comp->target)
+         comp->target->Release();
+   }
+   mtx_unlock(&rt->mutex);
+   if (dead)
+      free(comp);
+}
+
 /* Vulkan surface format -> vehicle backbuffer format. Flip-model swapchains
  * refuse SRGB formats; UNORM + raw bytes matches what the sw path presents
  * today (the bits are sRGB-encoded either way, dwm treats composition
@@ -563,6 +667,14 @@ struct wsi_win32_surface {
    IDCompositionTarget *target;
    IDCompositionVisual *visual;
    struct wsi_win32_swapchain *current_swapchain;
+
+   /* Helios dcomp vehicle: this surface's reference on the process-global
+    * hwnd->composition entry (rt->comps). Acquired on the vehicle worker at
+    * first vehicle build against this surface, dropped at surface destroy.
+    * Distinct from target/visual above, which belong to the in-tree dxgi
+    * (d3d12-interop) path and its separate dcomp device — the two paths
+    * are mutually exclusive per chain (vehicle requires !chain->dxgi). */
+   struct wsi_win32_hwnd_comp *vehicle_comp;
 };
 
 struct wsi_win32_swapchain {
@@ -726,27 +838,25 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
       }
    }
 
-   /* Per-surface dcomp target/visual (surface-owned; released in
-    * wsi_win32_surface_destroy — all chains are gone by then). Serialized
-    * against other chains' workers on the runtime mutex. Content binding is
-    * deferred to the first vehicle present. topmost=FALSE matches the
-    * proven probe and the upstream dzn path; verified live 23rd session
-    * (windowed vkcube composes; a maximized chain gets promoted to direct/
+   /* Process-global dcomp target/visual for this hwnd (one composition
+    * target per hwnd is a Windows rule — a second CreateTargetForHwnd
+    * fails 0x88980800; runtimes create a NEW VkSurface for the same hwnd
+    * on resize/fullscreen, so the entry is keyed by hwnd, refcounted by
+    * surfaces, released with the last surface). Serialized against other
+    * chains' workers on the runtime mutex. Content binding is deferred to
+    * the first vehicle present. Verified live 23rd session (windowed
+    * vkcube composes; a maximized chain gets promoted to direct/
     * independent flip — correct on the display, but ABSENT from GDI-based
     * paintcaps: eyeball vehicle windows through Looking Glass). */
    {
       stage = "dcomp target/visual";
       wsi_win32_surface *surface = chain->surface;
       mtx_lock(&rt->mutex);
-      if (!surface->target)
-         hr = rt->dcomp->CreateTargetForHwnd(v->hwnd, FALSE, &surface->target);
-      if (SUCCEEDED(hr) && surface->target && !surface->visual) {
-         hr = rt->dcomp->CreateVisual(&surface->visual);
-         if (SUCCEEDED(hr) && surface->visual)
-            hr = surface->target->SetRoot(surface->visual);
-      }
+      if (!surface->vehicle_comp)
+         surface->vehicle_comp =
+            wsi_win32_hwnd_comp_acquire_locked(rt, v->hwnd, &hr);
       mtx_unlock(&rt->mutex);
-      if (FAILED(hr) || !surface->target || !surface->visual)
+      if (!surface->vehicle_comp)
          goto fail;
    }
 
@@ -1025,6 +1135,9 @@ wsi_win32_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
       surface->visual->Release();
    if (surface->target)
       surface->target->Release();
+   if (surface->vehicle_comp)
+      wsi_win32_hwnd_comp_release(wsi_win32_vehicle_runtime_get(),
+                                  surface->vehicle_comp);
    vk_free2(&instance->alloc, pAllocator, icd_surface);
 }
 
@@ -1799,12 +1912,13 @@ wsi_win32_vehicle_unbind_content(struct wsi_win32_swapchain *chain)
    struct wsi_win32_vehicle_runtime *rt = wsi_win32_vehicle_runtime_get();
 
    mtx_lock(&rt->mutex);
-   if (chain->surface->current_swapchain == chain) {
-      if (chain->surface->visual && rt->dcomp) {
-         chain->surface->visual->SetContent(NULL);
+   struct wsi_win32_hwnd_comp *comp = chain->surface->vehicle_comp;
+   if (comp && comp->current_swapchain == chain) {
+      if (comp->visual && rt->dcomp) {
+         comp->visual->SetContent(NULL);
          rt->dcomp->Commit();
       }
-      chain->surface->current_swapchain = NULL;
+      comp->current_swapchain = NULL;
    }
    mtx_unlock(&rt->mutex);
 }
@@ -2049,18 +2163,22 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
       return false;
    }
 
-   /* First successful present: bind the swapchain to the surface's visual
+   /* First successful present: bind the swapchain to the hwnd's visual
     * (deferred from init so the window never shows an empty composition
-    * swapchain; the sw GDI blits painted it until now). */
-   if (chain->surface->current_swapchain != chain) {
+    * swapchain; the sw GDI blits painted it until now). The binding owner
+    * lives on the shared hwnd-comp entry: rebinding here also steals the
+    * visual from a retired chain (old surface, same hwnd) whose destroy
+    * then no-ops instead of blanking our content. */
+   if (chain->surface->vehicle_comp->current_swapchain != chain) {
       HRESULT chr = S_OK;
       mtx_lock(&rt->mutex);
-      if (chain->surface->visual) {
-         chr = chain->surface->visual->SetContent(v->sc);
+      struct wsi_win32_hwnd_comp *comp = chain->surface->vehicle_comp;
+      if (comp && comp->visual) {
+         chr = comp->visual->SetContent(v->sc);
          if (SUCCEEDED(chr))
             chr = rt->dcomp->Commit();
          if (SUCCEEDED(chr))
-            chain->surface->current_swapchain = chain;
+            comp->current_swapchain = chain;
       } else {
          chr = E_UNEXPECTED;
       }
