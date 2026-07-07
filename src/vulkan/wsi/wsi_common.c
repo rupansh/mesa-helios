@@ -66,6 +66,10 @@ struct helios_wsi_perf {
 
 static struct helios_wsi_perf helios_wsi_perf;
 
+/* Insurance blits skipped on vehicle-served chains (see
+ * wsi_helios_insurance_blit_enabled below). App-thread only. */
+static uint64_t helios_insurance_blits_skipped;
+
 static void
 helios_wsi_perf_init(void)
 {
@@ -104,7 +108,8 @@ helios_wsi_perf_write(void)
            " submit_ms=%.3f submit_avg_us=%.3f"
            " wait_ms=%.3f wait_avg_us=%.3f"
            " invalidate_ms=%.3f invalidate_avg_us=%.3f"
-           " queue_present_ms=%.3f queue_present_avg_us=%.3f\n",
+           " queue_present_ms=%.3f queue_present_avg_us=%.3f"
+           " insurance_skipped=%" PRIu64 "\n",
            helios_wsi_perf.frames,
            helios_wsi_perf.submit_calls,
            (double)helios_wsi_perf.submit_ns / 1000000.0,
@@ -119,10 +124,31 @@ helios_wsi_perf_write(void)
               (double)helios_wsi_perf.invalidate_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
            (double)helios_wsi_perf.queue_present_ns / 1000000.0,
            helios_wsi_perf.frames ?
-              (double)helios_wsi_perf.queue_present_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0);
+              (double)helios_wsi_perf.queue_present_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
+           helios_insurance_blits_skipped);
 
    if (f != stderr)
       fclose(f);
+}
+
+/* Insurance-blit control (WS2, 28th session): a vehicle-served chain still
+ * submits the pre-recorded image->buffer blit with every present so the sw
+ * GDI fallback always has fresh bytes — but the vehicle-fail latch is
+ * TERMINAL, so the per-frame insurance only ever buys the handful of
+ * in-flight frames around one latch, at the cost of a full-frame
+ * device->host-visible GPU copy per present (~7 MB at Doom res) and a
+ * later present-order retirement (the published value includes the blit).
+ * HELIOS_WSI_INSURANCE_BLIT=0 skips the blit while the vehicle serves
+ * (counted; A/B lever, default ON until measured). */
+static bool
+wsi_helios_insurance_blit_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *env = os_get_option("HELIOS_WSI_INSURANCE_BLIT");
+      cached = !(env && env[0] == '0');
+   }
+   return cached > 0;
 }
 
 static void
@@ -2720,11 +2746,22 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
 
          if (swapchain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
-            command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
-               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-               .commandBuffer =
-                  image->blit.cmd_buffers[queue->queue_family_index],
-            };
+            /* Vehicle-served chains: the buffer blit is pure sw-fallback
+             * insurance (the vehicle copies the IMAGE, not the buffer).
+             * Skipping it (knob) also retires the present-order value at
+             * render completion instead of blit completion. The frames
+             * in flight around a (terminal) vehicle-fail latch may show
+             * one stale GDI frame each — counted, loud. */
+            if (swapchain->helios_vehicle_serving &&
+                !wsi_helios_insurance_blit_enabled()) {
+               helios_insurance_blits_skipped++;
+            } else {
+               command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
+                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                  .commandBuffer =
+                     image->blit.cmd_buffers[queue->queue_family_index],
+               };
+            }
          }
 
          if (needs_timing_command_buffer) {
