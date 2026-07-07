@@ -37,7 +37,13 @@ struct hps_slot {
    uint32_t pid;
    uint32_t fence_id;
    volatile LONG64 value;
-   uint64_t reserved2;
+   /* Producer process CREATION TIME (FILETIME as u64): pid liveness alone is
+    * wrong for recycling — the table file persists across boots and Windows
+    * reuses pids, so a dead producer's slot can look alive forever. A pid
+    * whose current creation time differs from this stamp is a reused pid;
+    * legacy slots carry 0 here and are recycled on first pressure. Layout
+    * mirrored in dxvk-helios/src/dxvk/dxvk_helios_present_sync.cpp. */
+   uint64_t producer_start;
 };
 
 _Static_assert(sizeof(struct hps_header) == 32, "HPS header ABI");
@@ -112,14 +118,44 @@ hps_init_mapping(INIT_ONCE *once, void *param, void **context)
    return TRUE;
 }
 
-static bool
-hps_pid_alive(uint32_t pid)
+static uint64_t
+hps_self_start(void)
 {
+   static volatile LONG64 cached;
+   LONG64 v = InterlockedCompareExchange64(&cached, 0, 0);
+   if (v)
+      return (uint64_t)v;
+   FILETIME creation = {0}, exit_t = {0}, kernel = {0}, user = {0};
+   if (GetProcessTimes(GetCurrentProcess(), &creation, &exit_t, &kernel, &user))
+      v = (LONG64)(((uint64_t)creation.dwHighDateTime << 32) |
+                   creation.dwLowDateTime);
+   InterlockedCompareExchange64(&cached, v, 0);
+   return (uint64_t)v;
+}
+
+/* A slot's producer is alive iff its pid exists AND the process' creation
+ * time matches the stamp the producer wrote — anything else (dead pid,
+ * reused pid, legacy zero stamp) makes the slot recyclable. A shielded
+ * process (ACCESS_DENIED) is conservatively treated as alive. */
+static bool
+hps_producer_alive(const struct hps_slot *slot)
+{
+   const uint32_t pid = slot->pid;
+   if (!pid)
+      return false;
    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
    if (!proc)
       return GetLastError() == ERROR_ACCESS_DENIED; /* exists, shielded */
    DWORD code = 0;
-   const bool alive = GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+   bool alive = GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+   if (alive) {
+      FILETIME creation = {0}, exit_t = {0}, kernel = {0}, user = {0};
+      if (GetProcessTimes(proc, &creation, &exit_t, &kernel, &user)) {
+         const uint64_t start = ((uint64_t)creation.dwHighDateTime << 32) |
+                                creation.dwLowDateTime;
+         alive = (start == slot->producer_start);
+      }
+   }
    CloseHandle(proc);
    return alive;
 }
@@ -145,12 +181,12 @@ hps_claim_slot(uint32_t resid)
          return slot;
    }
 
-   /* Recycle a dead producer's slot (its fence name is unresolvable). */
+   /* Recycle a dead/reused-pid producer's slot (its fence name is
+    * unresolvable anyway). */
    for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
       struct hps_slot *slot = &hps_slots[i];
-      const uint32_t pid = slot->pid;
       const uint32_t old = slot->resid;
-      if (old != 0 && pid != 0 && !hps_pid_alive(pid) &&
+      if (old != 0 && !hps_producer_alive(slot) &&
           InterlockedCompareExchange((volatile LONG *)&slot->resid,
                                      (LONG)resid, (LONG)old) == (LONG)old)
          return slot;
@@ -179,6 +215,7 @@ wsi_helios_present_sync_publish(uint32_t resid, uint32_t pid,
    slot->pid = pid;
    slot->fence_id = fence_id;
    slot->value = (LONG64)value;
+   slot->producer_start = hps_self_start();
    InterlockedIncrement(&slot->seq); /* -> even */
    return true;
 }
