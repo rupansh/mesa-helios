@@ -1190,6 +1190,40 @@ vn_queue_submission_prepare_submit(struct vn_queue_submission *submit)
    return VK_SUCCESS;
 }
 
+#if DETECT_OS_WINDOWS
+/* Helios stale-signal guard. Atomically advance the per-semaphore
+ * max-forwarded HOST timeline value to `value`.
+ *
+ * Returns true iff `value` STRICTLY advances the max (i.e. this is a fresh,
+ * monotonic host signal the caller should forward). Returns false iff a value
+ * >= `value` was already forwarded to the host: the explicit vn_SignalSemaphore
+ * forward must then be SKIPPED, because re-forwarding it trips
+ * VUID-VkSemaphoreSignalInfo-value-03258 (host: "value N must be greater than
+ * current M"), which kills the renderer context and drops dwm into a terminal
+ * VK_ERROR_DEVICE_LOST loop (black desktop). Skipping is semantically safe: a
+ * prior signal already advanced the timeline past `value`.
+ *
+ * The queue-submit signal path calls this to RECORD progress (ignoring the
+ * result — queued signals are monotonic per app contract and are already baked
+ * into the forwarded batch); vn_SignalSemaphore calls it to gate the explicit
+ * host forward. Lock-free CAS loop so it is valid for win32 timelines with no
+ * feedback slot (whose counter_mtx is never initialized). */
+static bool
+helios_sem_claim_host_signal(struct vn_semaphore *sem, uint64_t value)
+{
+   uint64_t prev = p_atomic_read(&sem->helios_max_forwarded_host_value);
+   for (;;) {
+      if (value <= prev)
+         return false;
+      uint64_t got = p_atomic_cmpxchg(&sem->helios_max_forwarded_host_value,
+                                      prev, value);
+      if (got == prev)
+         return true;
+      prev = got;
+   }
+}
+#endif
+
 static VkResult
 vn_signal_win32_external_semaphore(struct vn_device *dev,
                                    struct vn_semaphore *sem,
@@ -1313,6 +1347,18 @@ vn_queue_submit(struct vn_queue_submission *submit)
       for (uint32_t j = 0; j < signal_count; j++) {
          struct vn_semaphore *sem =
             vn_semaphore_from_handle(vn_get_signal_semaphore(submit, i, j));
+#if DETECT_OS_WINDOWS
+         /* Record the value this queue submit advances the HOST timeline to
+          * (its signal-semaphore-info was forwarded to the host above via
+          * vn_submit_vkQueueSubmit2). vn_SignalSemaphore consults this max so
+          * it never re-forwards a stale explicit signal the queue already
+          * superseded (VUID-...-03258 -> dwm DEVICE_LOST). Result ignored:
+          * queued signals are monotonic per app contract, so we only advance
+          * the max and never skip a queued signal. */
+         if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
+            (void)helios_sem_claim_host_signal(
+               sem, vn_get_signal_semaphore_counter(submit, i, j));
+#endif
          if (sem->is_external) {
             assert(sem->payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
             sem->external_payload = submit->external_payload;
@@ -2675,6 +2721,14 @@ vn_CreateSemaphore(VkDevice device,
       sem->type = VK_SEMAPHORE_TYPE_BINARY;
    }
 
+#if DETECT_OS_WINDOWS
+   /* Seed the stale-signal guard with the host's starting counter so a
+    * redundant signal of the initial value (value == current) is also
+    * skipped. vk_zalloc already zeroed it; this makes non-zero initialValue
+    * explicit. */
+   sem->helios_max_forwarded_host_value = initial_val;
+#endif
+
    const struct VkExportSemaphoreCreateInfo *export_info =
       vk_find_struct_const(pCreateInfo->pNext, EXPORT_SEMAPHORE_CREATE_INFO);
    sem->is_external = export_info && export_info->handleTypes;
@@ -3129,7 +3183,40 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pSignalInfo->semaphore);
 
+   /* Helios: the HOST timeline for a WDDM-folded semaphore is advanced
+    * monotonically by the queue-submit signal path (vn_queue_submit ->
+    * vn_submit_vkQueueSubmit2). An explicit vkSignalSemaphore that lags that
+    * progress (the DXVK present model races a CPU signal against the GPU queue
+    * signal on the same shared timeline) would forward a value <= the host
+    * counter and trip VUID-VkSemaphoreSignalInfo-value-03258, killing the host
+    * context and dropping dwm into a terminal DEVICE_LOST / black-desktop loop.
+    * Skip the host forward for such a stale/redundant signal: a prior signal
+    * already advanced the timeline past `value`, so it still reaches at least
+    * `value` (timeline monotonicity) and no progress is lost. The guest-side
+    * effects below (feedback slot update + WDDM win32_sync fence write) are
+    * ALWAYS performed. */
+#if DETECT_OS_WINDOWS
+   const bool forward_host_signal =
+      sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||
+      helios_sem_claim_host_signal(sem, pSignalInfo->value);
+   if (forward_host_signal) {
+      vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
+   } else {
+      static uint32_t stale_skips = 0;
+      const uint32_t n = p_atomic_inc_return(&stale_skips);
+      if (n == 1 || (n % 64) == 0)
+         vn_renderer_helios_diag_log(
+            "HELIOS skipped stale host timeline signal (VUID-03258 guard): "
+            "sem=%llu value=%llu max_forwarded=%llu skip_count=%u",
+            (unsigned long long)sem->base.id,
+            (unsigned long long)pSignalInfo->value,
+            (unsigned long long)p_atomic_read(
+               &sem->helios_max_forwarded_host_value),
+            n);
+   }
+#else
    vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
+#endif
 
    if (sem->feedback.slot) {
       /* Must not update the sfb dst slot here because there's no followed

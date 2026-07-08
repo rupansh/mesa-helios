@@ -145,6 +145,21 @@ struct vn_semaphore {
 
    VkSemaphoreType type;
 
+#if DETECT_OS_WINDOWS
+   /* Helios stale-signal guard (atomic; no lock — counter_mtx is only
+    * initialized when a feedback slot is allocated, which win32 exported
+    * timelines may skip). The greatest timeline value ever forwarded to the
+    * HOST for this semaphore, across BOTH the queue-submit signal path and the
+    * explicit vn_SignalSemaphore forward. Seeded to the initial value at
+    * create. Consulted by vn_SignalSemaphore to drop a stale explicit signal
+    * (value <= this) that the queue-submit path already superseded — such a
+    * forward would trip VUID-VkSemaphoreSignalInfo-value-03258 on the host and
+    * drop the renderer context (dwm -> terminal DEVICE_LOST / black desktop).
+    * Timeline monotonicity makes skipping it safe: the timeline has already
+    * reached at least `value`, so no progress is lost. */
+   uint64_t helios_max_forwarded_host_value;
+#endif
+
    struct vn_sync_payload *payload;
 
    struct vn_sync_payload permanent;
