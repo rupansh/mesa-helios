@@ -1315,8 +1315,17 @@ vn_physical_device_get_native_extensions(
        * which vkr's export-blob path (vkGetMemoryFdKHR) and dma_buf
        * import-by-resource-id run against a host device that never enabled
        * those extensions.
+       *
+       * VK_EXT_external_memory_dma_buf must ALSO be advertised to the guest so
+       * DXVK can legally enable it at vkCreateDevice and chain the DMA_BUF
+       * external handle type on the DWM scan-out primary — a virtio-gpu
+       * SET_SCANOUT_BLOB needs a DRM_FORMAT_MODIFIER + DMA_BUF-exported image
+       * (a plain OPTIMAL/LINEAR image exports as MOD_INVALID → host paints
+       * black; see icd/win-build/helios_vk_present.c:251-254). No POSIX fd
+       * crosses into the guest — the HOST exports the dmabuf from the res_id.
        */
       exts->KHR_external_memory_fd = true;
+      exts->EXT_external_memory_dma_buf = true;
 #endif /* !DETECT_OS_WINDOWS */
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
@@ -2948,7 +2957,16 @@ vn_GetPhysicalDeviceImageFormatProperties2(
       }
 #endif /* !DETECT_OS_WINDOWS */
 
-      if (external_info->handleType != renderer_handle_type) {
+      /* Helios scan-out primary: keep the DMA_BUF + DRM_FORMAT_MODIFIER caps
+       * query honest so the host validates the real handle type the scan-out
+       * image will be created with, not a rewritten OPAQUE_FD (see the matching
+       * bypass in vn_CreateImage). */
+      const bool is_dmabuf_modifier_scanout =
+         (external_info->handleType &
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+         pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+      if (!is_dmabuf_modifier_scanout &&
+          external_info->handleType != renderer_handle_type) {
          pImageFormatInfo = vn_physical_device_fix_image_format_info(
             pImageFormatInfo, renderer_handle_type, &local_info);
          if (!pImageFormatInfo) {

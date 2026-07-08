@@ -166,11 +166,23 @@ VkResult
 vn_wsi_init(struct vn_physical_device *physical_dev)
 {
    const bool use_sw_device =
+#ifdef _WIN32
+      /* Helios: the virtio-gpu render-only miniport has no DXGI/DirectComposition
+       * hardware WSI; the Windows guest present path is the wsi_common_win32
+       * GDI/DIB blit (software WSI). Do NOT gate this on
+       * EXT_external_memory_dma_buf: we advertise that extension so DXVK can
+       * chain a DMA_BUF external handle on the DWM scan-out primary, but that
+       * advertisement must not flip WSI to the hardware DXGI/dcomp path
+       * (dxgi_get_factory() fails on this guest -> VK_ERROR_INITIALIZATION_FAILED
+       * -> vkEnumeratePhysicalDevices returns 0 devices). Force software WSI. */
+      true;
+#else
       !physical_dev->base.vk.supported_extensions
           .EXT_external_memory_dma_buf ||
       (physical_dev->renderer_driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
        physical_dev->renderer_driver_version <
           VN_MAKE_NVIDIA_VERSION(590, 48, 1, 0));
+#endif
 
    /* Normally Venus on Nvidia GPUs takes the prime blit path. The exception
     * is when KWin or any wlroots based compositors are used:

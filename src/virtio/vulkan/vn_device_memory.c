@@ -492,7 +492,17 @@ vn_device_memory_alloc(struct vn_device *dev,
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
       dev->physical_device->external_memory.renderer_handle_type;
    struct vn_device_memory_alloc_info local_info;
-   if (mem_vk->export_handle_types &&
+   /* Helios scan-out primary: keep a device-local DMA_BUF export unchanged so
+    * its dedicated memory stays dma_buf-exportable for SET_SCANOUT_BLOB. Only
+    * the scan-out primary requests DMA_BUF export on this transport (the dcomp
+    * vehicle and shared textures use OPAQUE_FD); it is device-local, so it does
+    * not collide with vkr's force-export of HOST_VISIBLE memory as OPAQUE_FD. */
+   const bool is_dmabuf_scanout_export =
+      (mem_vk->export_handle_types &
+       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+      !host_visible;
+   if (!is_dmabuf_scanout_export &&
+       mem_vk->export_handle_types &&
        mem_vk->export_handle_types != renderer_handle_type) {
       alloc_info = vn_device_memory_fix_alloc_info(
          alloc_info, renderer_handle_type, has_guest_vram, &local_info);
@@ -789,6 +799,15 @@ vn_GetMemoryFdKHR(VkDevice device,
           (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT));
    assert(mem->base_bo);
+
+   /* Helios: the renderer may NULL out bo_ops.export_dma_buf (no guest-side fd
+    * export — the host exports the dmabuf from the res_id for SET_SCANOUT_BLOB).
+    * Guard so a stray vkGetMemoryFdKHR fails cleanly instead of dereferencing a
+    * NULL fn-ptr (vn_renderer_helios.c:3405). DXVK on Windows shares via Win32
+    * NT handles, not fd export, so this should not fire in the scan-out path. */
+   if (!dev->renderer->bo_ops.export_dma_buf)
+      return vn_error(dev->instance, VK_ERROR_FEATURE_NOT_PRESENT);
+
    *pFd = vn_renderer_bo_export_dma_buf(dev->renderer, mem->base_bo);
    if (*pFd < 0)
       return vn_error(dev->instance, VK_ERROR_TOO_MANY_OBJECTS);
