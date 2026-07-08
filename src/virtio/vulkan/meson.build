@@ -131,7 +131,10 @@ if with_platform_windows
   # only winapifamily.h, which mingw has) vendored under icd/win-build/wdk-include.
   # Real headers = authoritative ABI (they self-default DXGKDDI_INTERFACE_VERSION
   # to WDDM3_2, matching the OS), so no hand-shimmed D3DKMT structs to keep in sync.
-  vn_c_args += '-IZ:/icd/win-build/wdk-include'
+  # This mesa checkout lives at <helios>/icd/mesa, so the vendored headers sit
+  # one level up — resolves to Z:/icd/win-build/wdk-include on the dev VM and
+  # equally on CI runners, with no absolute path baked in.
+  vn_c_args += '-I' + meson.project_source_root() / '..' / 'win-build' / 'wdk-include'
 endif
 
 if with_platform_wayland or with_platform_x11 or \
