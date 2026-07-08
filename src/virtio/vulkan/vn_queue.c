@@ -1978,6 +1978,50 @@ vn_fence_feedback_fini(struct vn_device *dev,
    vk_free(alloc, fence->feedback.commands);
 }
 
+struct vn_fence_create_info {
+   VkFenceCreateInfo create;
+   VkExportFenceCreateInfo export;
+};
+
+/* Sanitize the host-bound create info: win32 external handle types must
+ * never reach the (Linux) host driver — see vn_semaphore_fix_create_info
+ * for the full rationale.
+ */
+static const VkFenceCreateInfo *
+vn_fence_fix_create_info(const VkFenceCreateInfo *create_info,
+                         struct vn_fence_create_info *local_info)
+{
+   local_info->create = *create_info;
+   VkBaseOutStructure *cur = (void *)&local_info->create;
+
+   vk_foreach_struct_const(src, create_info->pNext) {
+      void *next = NULL;
+      switch (src->sType) {
+      case VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO:
+         memcpy(&local_info->export, src, sizeof(local_info->export));
+         local_info->export.handleTypes &=
+            ~(VkExternalFenceHandleTypeFlags)(
+               VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+               VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
+         if (!local_info->export.handleTypes)
+            break;
+         next = &local_info->export;
+         break;
+      default:
+         break;
+      }
+
+      if (next) {
+         cur->pNext = next;
+         cur = next;
+      }
+   }
+
+   cur->pNext = NULL;
+
+   return &local_info->create;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateFence(VkDevice device,
                const VkFenceCreateInfo *pCreateInfo,
@@ -2011,8 +2055,10 @@ vn_CreateFence(VkDevice device,
       goto out_payloads_fini;
 
    *pFence = vn_fence_to_handle(fence);
-   vn_async_vkCreateFence(dev->primary_ring, device, pCreateInfo, NULL,
-                          pFence);
+   struct vn_fence_create_info local_info;
+   vn_async_vkCreateFence(dev->primary_ring, device,
+                          vn_fence_fix_create_info(pCreateInfo, &local_info),
+                          NULL, pFence);
 
    return VK_SUCCESS;
 
@@ -2541,6 +2587,66 @@ vn_semaphore_feedback_fini(struct vn_device *dev, struct vn_semaphore *sem)
    vn_feedback_pool_free(&dev->feedback_pool, sem->feedback.slot);
 }
 
+struct vn_semaphore_create_info {
+   VkSemaphoreCreateInfo create;
+   VkSemaphoreTypeCreateInfo type;
+   VkExportSemaphoreCreateInfo export;
+};
+
+/* Sanitize the host-bound create info. The host semaphore never backs the
+ * win32 external handle types: the cross-process rendezvous is entirely
+ * guest-orchestrated (WDDM sync object + signaled-payload import at submit
+ * time), so the host object needs no export capability. Forwarding
+ * OPAQUE_WIN32/D3D12_FENCE bits makes a Mesa host driver fail
+ * vkCreateSemaphore with VK_ERROR_INVALID_EXTERNAL_HANDLE
+ * (vk_semaphore_create: no Linux vk_sync_type has export_win32_handle) —
+ * and because creation is async, the failure is silent: the object never
+ * exists host-side until a submit dies with "failed to look up object N of
+ * type 5" and the renderer destroys the whole context. Proven root cause of
+ * the RADV black-desktop LogonUI crash loop (2026-07-08); NVIDIA hosts
+ * merely tolerate the invalid bits. Mirrors what
+ * vn_device_memory_fix_alloc_info already does for memory exports.
+ */
+static const VkSemaphoreCreateInfo *
+vn_semaphore_fix_create_info(const VkSemaphoreCreateInfo *create_info,
+                             struct vn_semaphore_create_info *local_info)
+{
+   local_info->create = *create_info;
+   VkBaseOutStructure *cur = (void *)&local_info->create;
+
+   vk_foreach_struct_const(src, create_info->pNext) {
+      void *next = NULL;
+      switch (src->sType) {
+      case VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO:
+         memcpy(&local_info->type, src, sizeof(local_info->type));
+         next = &local_info->type;
+         break;
+      case VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO:
+         memcpy(&local_info->export, src, sizeof(local_info->export));
+         local_info->export.handleTypes &=
+            ~(VkExternalSemaphoreHandleTypeFlags)(
+               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT);
+         if (!local_info->export.handleTypes)
+            break;
+         next = &local_info->export;
+         break;
+      default:
+         break;
+      }
+
+      if (next) {
+         cur->pNext = next;
+         cur = next;
+      }
+   }
+
+   cur->pNext = NULL;
+
+   return &local_info->create;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateSemaphore(VkDevice device,
                    const VkSemaphoreCreateInfo *pCreateInfo,
@@ -2601,8 +2707,30 @@ vn_CreateSemaphore(VkDevice device,
 #endif
 
    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
-   vn_async_vkCreateSemaphore(dev->primary_ring, device, pCreateInfo, NULL,
-                              &sem_handle);
+   struct vn_semaphore_create_info local_info;
+   const VkSemaphoreCreateInfo *host_create_info =
+      vn_semaphore_fix_create_info(pCreateInfo, &local_info);
+   if (sem->is_external) {
+      /* Loud failure over fake success: an async create that the host
+       * rejects leaves a semaphore that poisons the first submit touching
+       * it ("failed to look up object N of type 5" + fatal decoder state).
+       * External semaphores are exactly where that has happened, so pay
+       * one roundtrip and surface the host result.
+       */
+      result = vn_call_vkCreateSemaphore(dev->primary_ring, device,
+                                         host_create_info, NULL, &sem_handle);
+      if (result != VK_SUCCESS) {
+         vn_log(dev->instance,
+                "external semaphore host create failed: %d (handleTypes 0x%x)",
+                result, export_info ? export_info->handleTypes : 0);
+         if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
+            vn_semaphore_feedback_fini(dev, sem);
+         goto out_payloads_fini;
+      }
+   } else {
+      vn_async_vkCreateSemaphore(dev->primary_ring, device, host_create_info,
+                                 NULL, &sem_handle);
+   }
 
    *pSemaphore = sem_handle;
 
