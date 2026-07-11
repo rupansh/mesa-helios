@@ -110,6 +110,7 @@ struct helios_unicode_string {
 #define HELIOS_ESCAPE_ATTACH_RESOURCE 0x0009u
 #define HELIOS_ESCAPE_REGISTER_FENCE_EVENT   0x000Bu
 #define HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT 0x000Cu
+#define HELIOS_ESCAPE_QUERY_SCANOUT           0x000Du
 
 /* helios_escape_fence_event.out_state values (protocol/src/escape.rs). */
 #define HELIOS_FENCE_EVENT_REGISTERED       0u
@@ -220,6 +221,33 @@ struct helios_escape_fence_event {
    uint32_t _pad;
 };
 
+struct helios_escape_query_scanout {
+   struct helios_escape_header hdr;
+   uint64_t out_alloc_size;
+   uint32_t out_resource_id;
+   uint32_t out_width;
+   uint32_t out_height;
+   uint32_t out_dxgi_format;
+   uint32_t out_pitch;
+   uint32_t out_plane_offset;
+   uint32_t out_memory_type_index;
+   uint32_t out_generation;
+   uint32_t reserved[2];
+};
+
+/* Stable export ABI used by the in-process Helios DXVK bridge. */
+struct helios_venus_scanout_info {
+   uint64_t alloc_size;
+   uint32_t resource_id;
+   uint32_t width;
+   uint32_t height;
+   uint32_t dxgi_format;
+   uint32_t pitch;
+   uint32_t plane_offset;
+   uint32_t memory_type_index;
+   uint32_t generation;
+};
+
 /* Wire-size guards mirroring protocol/src/escape.rs const _: () asserts. */
 _Static_assert(sizeof(struct helios_escape_header) == 16, "hdr size");
 _Static_assert(sizeof(struct helios_escape_ctx_create) == 24, "ctx_create size");
@@ -231,6 +259,8 @@ _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob si
 _Static_assert(sizeof(struct helios_escape_attach_resource) == 24, "attach_resource size");
 _Static_assert(sizeof(struct helios_escape_wait_fence) == 40, "wait_fence size");
 _Static_assert(sizeof(struct helios_escape_fence_event) == 40, "fence_event size");
+_Static_assert(sizeof(struct helios_escape_query_scanout) == 64, "query_scanout size");
+_Static_assert(sizeof(struct helios_venus_scanout_info) == 40, "scanout_info size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -394,6 +424,10 @@ struct helios {
 
    uint32_t ctx_id;
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
+   /* Reused D3DKMTEscape staging. dev_mutex serializes every submit, and the
+    * thunk consumes the private buffer synchronously before returning. */
+   uint8_t *submit_buf;
+   size_t submit_buf_capacity;
 
    /* Retire thread (WS1 #4): a wire fence recorded on a SHARED sync (external
     * win32 semaphore) must signal the shared WDDM monitored fence when it
@@ -451,6 +485,19 @@ static volatile LONG helios_fence_event_lost;      /* NOT_FOUND + unsignaled
 static struct helios *helios_perf_at_exit_renderer;
 static bool helios_perf_at_exit_registered;
 static uint32_t helios_current_ctx_id;
+/* The scanout query is called through a private DLL export, not through the
+ * Vulkan loader dispatch table.  A VkInstance supplied by DXVK must therefore
+ * never be decoded with vn_instance_from_handle here: if the export was found
+ * in another loaded ICD image, or instance teardown raced the call, that turns
+ * into an invalid renderer/dev_mutex pointer (DWM AV in mtx_lock).
+ *
+ * The query is adapter-global, so any live Helios renderer in this module is
+ * sufficient.  Hold this process-wide lock across the short escape so destroy
+ * cannot invalidate the selected renderer.  Last-created wins; if it dies
+ * while an older renderer remains, queries fail cleanly until the next device
+ * creation instead of guessing across instances. */
+static SRWLOCK helios_current_renderer_lock = SRWLOCK_INIT;
+static struct helios *helios_current_renderer;
 
 /* Open a diag log under C:\ProgramData\Helios. The restricted IddCx host
  * process (which loads this ICD via DXVK to open the IDD swapchain surface)
@@ -516,6 +563,8 @@ __declspec(dllexport) uint32_t helios_venus_memory_transfer_resource_ownership(V
 __declspec(dllexport) bool helios_venus_memory_alloc_info(VkDeviceMemory memory,
                                                           uint64_t *out_alloc_size,
                                                           uint32_t *out_memory_type_index);
+__declspec(dllexport) bool helios_venus_query_scanout(
+   VkInstance instance, struct helios_venus_scanout_info *out_info);
 
 __declspec(dllexport) uint32_t
 helios_venus_current_ctx_id(void)
@@ -1103,6 +1152,19 @@ helios_ioctl(struct helios *helios,
  * 30+ s. A blocking WAIT_FENCE must therefore pass 0 (it touches no hardware —
  * the KMD parks the thread on a KEVENT) so it never convoys other escapes. */
 static bool
+helios_escape_no_adapter_sync_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      char value[8];
+      enabled = GetEnvironmentVariableA("HELIOS_ESCAPE_NO_ADAPTER_SYNC", value,
+                                        sizeof(value)) &&
+                       value[0] && value[0] != '0';
+   }
+   return enabled > 0;
+}
+
+static bool
 helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_access)
 {
    if (!helios->adapter) {
@@ -1117,6 +1179,11 @@ helios_escape_ex(struct helios *helios, void *buf, uint32_t size, bool hardware_
    esc.hContext = helios->context;
    esc.Type = D3DKMT_ESCAPE_DRIVERPRIVATE;
    esc.Flags.HardwareAccess = hardware_access ? 1 : 0;
+   /* Opt-in A/B only. Enabling this did not improve measured frame cadence and
+    * a subsequent cold boot produced black output, so production behavior
+    * keeps dxgkrnl's default adapter synchronization. */
+   esc.Flags.NoAdapterSynchronization =
+      !hardware_access && helios_escape_no_adapter_sync_enabled() ? 1 : 0;
    esc.pPrivateDriverData = buf;
    esc.PrivateDriverDataSize = size;
 
@@ -1176,6 +1243,52 @@ static bool
 helios_escape(struct helios *helios, void *buf, uint32_t size)
 {
    return helios_escape_ex(helios, buf, size, helios_escape_hw_forced());
+}
+
+/* Query the adapter-owned LINEAR VidPn primary through one live renderer.
+ * `instance` is retained for the stable bridge ABI but is intentionally opaque
+ * here; see helios_current_renderer above. */
+__declspec(dllexport) bool
+helios_venus_query_scanout(VkInstance instance,
+                           struct helios_venus_scanout_info *out_info)
+{
+   if (!out_info)
+      return false;
+   memset(out_info, 0, sizeof(*out_info));
+   (void)instance;
+
+   AcquireSRWLockExclusive(&helios_current_renderer_lock);
+   struct helios *helios = helios_current_renderer;
+   if (!helios) {
+      ReleaseSRWLockExclusive(&helios_current_renderer_lock);
+      return false;
+   }
+
+   struct helios_escape_query_scanout req = { 0 };
+   helios_hdr_init(&req.hdr, HELIOS_ESCAPE_QUERY_SCANOUT, sizeof(req));
+   mtx_lock(&helios->dev_mutex);
+   const bool ok = helios_escape(helios, &req, sizeof(req));
+   mtx_unlock(&helios->dev_mutex);
+   ReleaseSRWLockExclusive(&helios_current_renderer_lock);
+   if (!ok || !req.out_resource_id || !req.out_alloc_size ||
+       !req.out_width || !req.out_height || !req.out_pitch)
+      return false;
+
+   out_info->alloc_size = req.out_alloc_size;
+   out_info->resource_id = req.out_resource_id;
+   out_info->width = req.out_width;
+   out_info->height = req.out_height;
+   out_info->dxgi_format = req.out_dxgi_format;
+   out_info->pitch = req.out_pitch;
+   out_info->plane_offset = req.out_plane_offset;
+   out_info->memory_type_index = req.out_memory_type_index;
+   out_info->generation = req.out_generation;
+   helios_diag("query_scanout res=%u %ux%u pitch=%u off=%u alloc=%llu mti=%u gen=%u",
+               out_info->resource_id, out_info->width, out_info->height,
+               out_info->pitch, out_info->plane_offset,
+               (unsigned long long)out_info->alloc_size,
+               out_info->memory_type_index, out_info->generation);
+   return true;
 }
 
 static bool
@@ -1321,9 +1434,24 @@ helios_ioctl_submit_cs(struct helios *helios,
    const size_t total = sizeof(hdr) + cs_size;
    if (total > UINT32_MAX)
       return false;
-   uint8_t *buf = malloc(total);
-   if (!buf)
-      return false;
+   if (total > helios->submit_buf_capacity) {
+      size_t capacity = helios->submit_buf_capacity
+                           ? helios->submit_buf_capacity
+                           : 4096;
+      while (capacity < total) {
+         if (capacity > UINT32_MAX / 2u) {
+            capacity = total;
+            break;
+         }
+         capacity *= 2;
+      }
+      uint8_t *grown = realloc(helios->submit_buf, capacity);
+      if (!grown)
+         return false;
+      helios->submit_buf = grown;
+      helios->submit_buf_capacity = capacity;
+   }
+   uint8_t *buf = helios->submit_buf;
    memcpy(buf, &hdr, sizeof(hdr));
    memcpy(buf + sizeof(hdr), cs_data, cs_size);
    const bool ok = helios_escape(helios, buf, (uint32_t)total);
@@ -1335,8 +1463,6 @@ helios_ioctl_submit_cs(struct helios *helios,
       if (out.fence_id)
          wire_fence_id = out.fence_id;
    }
-   free(buf);
-
    if (ok && out_fence_id)
       *out_fence_id = wire_fence_id;
    return ok;
@@ -2044,7 +2170,9 @@ helios_perf_write(struct helios *helios, bool final)
       "wait_fence",
    };
 
-   fprintf(f, "Helios perf summary (%s)\n", final ? "final" : "live");
+   fprintf(f, "Helios perf summary pid=%lu epoch=%lld (%s)\n",
+           (unsigned long)GetCurrentProcessId(), (long long)time(NULL),
+           final ? "final" : "live");
    fprintf(f,
            "submit_calls=%llu batches=%llu empty_batches=%llu syncs=%llu cs_bytes=%llu\n",
            (unsigned long long)helios->perf.submit_calls,
@@ -3276,6 +3404,11 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
 {
    struct helios *helios = (struct helios *)renderer;
 
+   AcquireSRWLockExclusive(&helios_current_renderer_lock);
+   if (helios_current_renderer == helios)
+      helios_current_renderer = NULL;
+   ReleaseSRWLockExclusive(&helios_current_renderer_lock);
+
    helios_perf_dump(helios);
    if (helios_perf_at_exit_renderer == helios)
       helios_perf_at_exit_renderer = NULL;
@@ -3334,6 +3467,7 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    cnd_destroy(&helios->retire_cond);
    mtx_destroy(&helios->retire_mutex);
    mtx_destroy(&helios->dev_mutex);
+   free(helios->submit_buf);
 
    vk_free(alloc, helios);
 }
@@ -3437,6 +3571,10 @@ vn_renderer_create_helios(struct vn_instance *instance,
       helios_destroy(&helios->base, alloc);
       return result;
    }
+
+   AcquireSRWLockExclusive(&helios_current_renderer_lock);
+   helios_current_renderer = helios;
+   ReleaseSRWLockExclusive(&helios_current_renderer_lock);
 
    *renderer = &helios->base;
    return VK_SUCCESS;

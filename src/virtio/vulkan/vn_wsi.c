@@ -167,9 +167,10 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
 {
    const bool use_sw_device =
 #ifdef _WIN32
-      /* Helios: the virtio-gpu render-only miniport has no DXGI/DirectComposition
-       * hardware WSI; the Windows guest present path is the wsi_common_win32
-       * GDI/DIB blit (software WSI). Do NOT gate this on
+      /* Helios: the Mesa ICD still uses wsi_common_win32 GDI/DIB presentation
+       * for Vulkan application windows; the WDDM display miniport's D3D UMD
+       * path does not provide a Vulkan DXGI/DirectComposition WSI bridge. Do
+       * not gate this on
        * EXT_external_memory_dma_buf: we advertise that extension so DXVK can
        * chain a DMA_BUF external handle on the DWM scan-out primary, but that
        * advertisement must not flip WSI to the hardware DXGI/dcomp path

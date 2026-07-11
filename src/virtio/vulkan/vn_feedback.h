@@ -96,6 +96,12 @@ vn_feedback_cpu_invalidate(const void *ptr, size_t size)
 struct vn_semaphore_feedback_cmd {
    struct vn_feedback_slot *src_slot;
    VkCommandBuffer *cmd_handles;
+   VkSemaphore wait_sem_handle;
+   uint64_t wait_sem_id;
+   uint64_t wait_value;
+   uint64_t signal_value;
+   bool ring_seqno_valid;
+   uint32_t ring_seqno;
 
    struct list_head head;
 };

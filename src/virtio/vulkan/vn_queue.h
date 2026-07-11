@@ -242,6 +242,9 @@ struct vn_semaphore {
       uint32_t last_signal_ring_idx;
       uint64_t last_signal_value;
       int64_t last_signal_ns;
+      VkSemaphore last_signal_wait_sem_handle;
+      uint64_t last_signal_wait_sem_id;
+      uint64_t last_signal_wait_value;
 
       /* Start of the current continuous period in which at least one signal
        * op is pending host-side with no observed counter movement (guarded by

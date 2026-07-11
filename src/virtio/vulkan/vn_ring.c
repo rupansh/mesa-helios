@@ -35,8 +35,12 @@ unsigned long __stdcall GetEnvironmentVariableA(const char *name,
                                                 unsigned long size);
 #endif
 
-/* HELIOS_RING_NOTIFY_EAGER=1: notify on every submission that observes the
- * IDLE status bit (A/B lever for the retire_lat slow mode). */
+/* HELIOS_RING_NOTIFY_EAGER=0 disables the Windows default of notifying on
+ * every submission that observes IDLE. DWM can park after a single frame; if
+ * that submit is rate-limited while the host is idle, the tail remains
+ * undecoded until another app happens to submit and DWM trips its semaphore
+ * forward-progress deadline.
+ */
 static bool
 vn_ring_notify_eager(void)
 {
@@ -44,8 +48,8 @@ vn_ring_notify_eager(void)
    static int cached = -1;
    if (cached < 0) {
       char v[8];
-      cached = GetEnvironmentVariableA("HELIOS_RING_NOTIFY_EAGER", v,
-                                       sizeof(v)) &&
+      cached = !GetEnvironmentVariableA("HELIOS_RING_NOTIFY_EAGER", v,
+                                        sizeof(v)) ||
                      v[0] != '0'
                   ? 1
                   : 0;
