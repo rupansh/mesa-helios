@@ -626,22 +626,14 @@ vn_CreateImage(VkDevice device,
        * info (VUID-VkImageCreateInfo-pNext-01443), so those keep the
        * upstream-venus bind mismatch — apps like vkcube use them for
        * staging textures; Doom does not. */
-      /* Helios scan-out primary: an app-requested DMA_BUF external handle on a
-       * DRM_FORMAT_MODIFIER image is the unmistakable signature of the DWM
-       * scan-out primary. venus normally rewrites the handle to the renderer
-       * type (OPAQUE_FD on NVIDIA), which makes the host-exported blob
-       * MOD_INVALID and the scan-out black. The raw host driver DOES support
-       * dma_buf export of a modifier-tiled BGRA image (host_dmabuf_probe), so
-       * pass this one image through unchanged. Scoped to DMA_BUF+MODIFIER so
-       * buffers, the dcomp present-vehicle (OPAQUE_FD), and host-visible LINEAR
-       * images are untouched. */
-      const bool is_dmabuf_modifier_scanout =
+      /* Helios: preserve an explicit DMA_BUF request exactly. The image and
+       * its exported memory must carry the same external handle type. */
+      const bool preserve_external =
          external_info &&
-         (external_info->handleTypes &
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
-         pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+         vn_preserve_explicit_dmabuf_handle_types(
+            dev->physical_device, external_info->handleTypes);
       const bool fix_external =
-         !is_dmabuf_modifier_scanout && renderer_handle_type &&
+         !preserve_external && renderer_handle_type &&
          (external_info
              ? external_info->handleTypes != renderer_handle_type
              : (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
@@ -1050,8 +1042,12 @@ vn_GetDeviceImageMemoryRequirements(
       dev->physical_device->external_memory.renderer_handle_type;
    const VkExternalMemoryImageCreateInfo *external_info = vk_find_struct_const(
       pInfo->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   const bool preserve_external =
+      external_info &&
+      vn_preserve_explicit_dmabuf_handle_types(
+         dev->physical_device, external_info->handleTypes);
    const bool fix_external =
-      renderer_handle_type &&
+      !preserve_external && renderer_handle_type &&
       (external_info
           ? external_info->handleTypes != renderer_handle_type
           : (pInfo->pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&

@@ -492,16 +492,12 @@ vn_device_memory_alloc(struct vn_device *dev,
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
       dev->physical_device->external_memory.renderer_handle_type;
    struct vn_device_memory_alloc_info local_info;
-   /* Helios scan-out primary: keep a device-local DMA_BUF export unchanged so
-    * its dedicated memory stays dma_buf-exportable for SET_SCANOUT_BLOB. Only
-    * the scan-out primary requests DMA_BUF export on this transport (the dcomp
-    * vehicle and shared textures use OPAQUE_FD); it is device-local, so it does
-    * not collide with vkr's force-export of HOST_VISIBLE memory as OPAQUE_FD. */
-   const bool is_dmabuf_scanout_export =
-      (mem_vk->export_handle_types &
-       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
-      !host_visible;
-   if (!is_dmabuf_scanout_export &&
+   /* Preserve the caller's explicit DMA_BUF export handle exactly, matching
+    * the image-side policy. */
+   const bool preserve_export =
+      vn_preserve_explicit_dmabuf_handle_types(
+         dev->physical_device, mem_vk->export_handle_types);
+   if (!preserve_export &&
        mem_vk->export_handle_types &&
        mem_vk->export_handle_types != renderer_handle_type) {
       alloc_info = vn_device_memory_fix_alloc_info(

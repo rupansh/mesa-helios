@@ -2957,15 +2957,13 @@ vn_GetPhysicalDeviceImageFormatProperties2(
       }
 #endif /* !DETECT_OS_WINDOWS */
 
-      /* Helios scan-out primary: keep the DMA_BUF + DRM_FORMAT_MODIFIER caps
-       * query honest so the host validates the real handle type the scan-out
-       * image will be created with, not a rewritten OPAQUE_FD (see the matching
-       * bypass in vn_CreateImage). */
-      const bool is_dmabuf_modifier_scanout =
-         (external_info->handleType &
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
-         pImageFormatInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-      if (!is_dmabuf_modifier_scanout &&
+      /* Keep capability queries consistent with vn_CreateImage: an explicit
+       * DMA_BUF request is validated by the host as DMA_BUF, not as an
+       * unrelated renderer-default handle type. */
+      const bool preserve_external =
+         vn_preserve_explicit_dmabuf_handle_types(
+            physical_dev, external_info->handleType);
+      if (!preserve_external &&
           external_info->handleType != renderer_handle_type) {
          pImageFormatInfo = vn_physical_device_fix_image_format_info(
             pImageFormatInfo, renderer_handle_type, &local_info);

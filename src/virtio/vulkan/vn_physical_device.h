@@ -143,6 +143,34 @@ VK_DEFINE_HANDLE_CASTS(vn_physical_device,
                        VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
+/*
+ * Helios transports fd-based Vulkan external-memory handle types over the
+ * Venus wire; no POSIX fd crosses into the Windows guest.  An explicit
+ * DMA_BUF request therefore names the handle type that the renderer must use
+ * for both the VkImage and its VkDeviceMemory.  Rewriting only the image to
+ * renderer_handle_type produces an invalid mixed external-memory contract and
+ * can turn the exported blob into an opaque device fd.
+ *
+ * Keep this based exclusively on the caller-provided Vulkan handle type.  In
+ * particular, image tiling, dimensions, usage, process, and creation order are
+ * not resource-identity signals.
+ */
+static inline bool
+vn_preserve_explicit_dmabuf_handle_types(
+   const struct vn_physical_device *physical_dev,
+   const VkExternalMemoryHandleTypeFlags handle_types)
+{
+#if DETECT_OS_WINDOWS
+   return handle_types == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
+          (physical_dev->external_memory.supported_handle_types &
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+#else
+   (void)physical_dev;
+   (void)handle_types;
+   return false;
+#endif
+}
+
 void
 vn_physical_device_fini(struct vn_physical_device *physical_dev);
 
