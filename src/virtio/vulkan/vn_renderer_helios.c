@@ -471,6 +471,10 @@ static volatile LONG helios_fence_event_fallbacks; /* event path refused →
 static volatile LONG helios_fence_event_lost;      /* NOT_FOUND + unsignaled
                                                     * (teardown purge) — loud */
 
+/* GetModuleHandleExW(..._PIN) refusals — see helios_pin_module. Expected 0;
+ * non-zero means the per-device handle leak below is still live. */
+static volatile LONG helios_module_pin_failures;
+
 /* Process-global state, audited 2026-07-06 (23rd session) for the two-live-
  * VkInstance shape the dcomp present vehicle introduces (a Vulkan app's own
  * instance + the vehicle's DXVK->ICD stack in the SAME process):
@@ -3472,10 +3476,63 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
    vk_free(alloc, helios);
 }
 
+/* Hold this DLL in the process for as long as the process lives.
+ *
+ * The Vulkan loader FreeLibrary()s an ICD when its last VkInstance is
+ * destroyed, and DXVK builds and tears down a VkInstance per D3D11 device, so
+ * this module is loaded and unloaded ONCE PER DEVICE. Measured, not assumed:
+ * a probe that creates and releases one D3D11 device sees this module appear
+ * in and vanish from EnumProcessModules within that single call.
+ *
+ * Nothing releases a module's process- or thread-lifetime state on unload.
+ * The loader closes no handles the module opened, and thread-specific-storage
+ * destructors run at THREAD exit, not at module unload — so on a thread that
+ * outlives the module (every caller's thread does) they never run at all.
+ * Five kernel handles were therefore stranded per device, dead linear with no
+ * plateau, of which only one belongs to code in this file:
+ *
+ *   Event      helios_fence_event_get (below) — the per-thread fence event
+ *              held in tss, whose destructor the unload skips
+ *   Event    \ winpthreads registering the caller's NATIVE thread: an event
+ *   Thread   / plus a DuplicateHandle of the thread, freed at thread exit
+ *   Semaphore x2  libgcc emutls_init -> __gthread_mutex_lock, i.e. the mutex
+ *              objects winpthreads mints lazily for a static initialiser
+ *
+ * Four of the five are inside the mingw runtime we link statically, so no
+ * DLL_PROCESS_DETACH hook we could write reaches them, and the fifth belongs
+ * to threads this module does not own. Pinning is what makes the
+ * process-lifetime assumption those statics are already written against true.
+ * The deeper fix is upstream of here — a DXVK that shares one VkInstance
+ * across D3D11 devices would stop the churn at its source, and would also
+ * stop paying loader enumeration and ICD load per device — but that is a
+ * different change with a different blast radius.
+ *
+ * Idempotent by construction (PIN on an already-pinned module is a no-op);
+ * call_once keeps it to one syscall.
+ */
+static void
+helios_pin_module(void)
+{
+   HMODULE self = NULL;
+   if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                             GET_MODULE_HANDLE_EX_FLAG_PIN,
+                          (LPCWSTR)(const void *)&helios_pin_module, &self)) {
+      helios_diag("module pinned hmodule=%p", (void *)self);
+      return;
+   }
+   /* Counted, not silent: without the pin every device strands five handles. */
+   InterlockedIncrement(&helios_module_pin_failures);
+   helios_diag("module PIN FAILED err=%lu — the per-device handle leak is live",
+               (unsigned long)GetLastError());
+}
+
+static once_flag helios_pin_once = ONCE_FLAG_INIT;
+
 static VkResult
 helios_init(struct helios *helios)
 {
    helios_diag("helios_init enter");
+   call_once(&helios_pin_once, helios_pin_module);
    mtx_init(&helios->dev_mutex, mtx_plain);
    mtx_init(&helios->retire_mutex, mtx_plain);
    cnd_init(&helios->retire_cond);
