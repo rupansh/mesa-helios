@@ -2686,6 +2686,40 @@ vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
    return VK_SUCCESS;
 }
 
+/* Helios: bound for the renderer-side race-closing waits — the async
+ * vkWaitSemaphores / vkWaitForFences sent when a feedback slot already shows
+ * the completion. Upstream sends UINT64_MAX; stock virglrenderer executes
+ * these SYNCHRONOUSLY on the per-context ring thread and passes the timeout
+ * VERBATIM to the host driver (vkr_queue.c:532), so an unbounded wait on a
+ * signal that never arrives parks the ring thread forever. The render
+ * server's socket consumer then blocks in vkWaitRingSeqnoMESA behind the
+ * ring, its command socket stops draining, and QEMU's single virtio-gpu ctrl
+ * path starves EVERY guest context — the whole-transport wedge of
+ * tmp/xid109-evidence/INCIDENT.md, three occurrences by 2026-08-03. Wedge #3
+ * was captured live: gdb showed the ring thread inside the NVIDIA driver in
+ * vkr_dispatch_vkWaitSemaphores with timeout=UINT64_MAX for a value whose
+ * GPU channel NVRM had killed (Xid-109 CTX SWITCH TIMEOUT), i.e. a signal
+ * that could never come.
+ *
+ * The wait exists only to close an ISR-deferral race that is microseconds
+ * wide (the feedback write has already been OBSERVED; only the trailing
+ * semaphore/fence signal op may lag), so a bound in seconds keeps the race
+ * closed in every live case and converts a permanent transport wedge into a
+ * bounded ring stall that the deadline/strike machinery above can then see
+ * moving again. 8000 ms matches VN_HELIOS_SEM_DEADLINE_MS's rationale
+ * (below IddCx's ~10 s, 4x the 2 s TDR norm). */
+static uint64_t
+vn_helios_ring_wait_bound_ns(void)
+{
+   static uint64_t bound_ns = 0;
+   if (!bound_ns) {
+      const uint64_t ms =
+         debug_get_num_option("VN_HELIOS_RING_WAIT_BOUND_MS", 8000);
+      bound_ns = ms * 1000000ull;
+   }
+   return bound_ns;
+}
+
 static VkResult
 vn_get_fence_status(VkDevice dev_handle,
                     VkFence fence_handle,
@@ -2711,8 +2745,11 @@ vn_get_fence_status(VkDevice dev_handle,
              * longer sees any fence status checks and falsely believes the
              * caller does not sync.
              */
+            /* Helios: bounded, not UINT64_MAX — this runs BLOCKING on the
+             * host ring thread; see vn_helios_ring_wait_bound_ns. */
             vn_async_vkWaitForFences(dev->primary_ring, dev_handle, 1,
-                                     &fence_handle, VK_TRUE, UINT64_MAX);
+                                     &fence_handle, VK_TRUE,
+                                     vn_helios_ring_wait_bound_ns());
          } else if (relax_state && vn_relax_warn(relax_state)) {
             /* Upon vn_relax warn order, emit a synchronous vkGetFenceStatus
              * to catch renderer device lost. Meanwhile, validate consistency
@@ -3460,8 +3497,12 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
             .pValues = &counter,
          };
 
+         /* Helios: bounded, not UINT64_MAX — this runs BLOCKING on the host
+          * ring thread and wedge #3 was exactly this wait, live-confirmed
+          * (timeout=UINT64_MAX, value 58530, channel already Xid-killed);
+          * see vn_helios_ring_wait_bound_ns. */
          vn_async_vkWaitSemaphores(dev->primary_ring, dev_handle, &wait_info,
-                                   UINT64_MAX);
+                                   vn_helios_ring_wait_bound_ns());
 
          /* search pending cmds for already signaled values */
          simple_mtx_lock(&sem->feedback.cmd_mtx);
