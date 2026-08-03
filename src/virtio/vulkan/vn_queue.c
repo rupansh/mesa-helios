@@ -670,6 +670,50 @@ vn_fix_device_group_cmd_count(struct vn_queue_submission *submit,
 static bool
 vn_semaphore_wait_external(struct vn_device *dev, struct vn_semaphore *sem);
 
+#if DETECT_OS_WINDOWS
+static bool
+helios_sem_claim_host_signal(struct vn_semaphore *sem, uint64_t value);
+
+/* A Win32-imported timeline is backed by a WDDM monitored fence in the
+ * guest, but the host VkSemaphore is a separate ordinary timeline.  Once the
+ * WDDM wait has completed, mirror that value synchronously before forwarding
+ * a queue submission that waits on the host object.  SYNC_FD cannot be used
+ * for this: Linux only permits SYNC_FD payloads on binary semaphores, and
+ * importing the signaled fd -1 payload into a timeline makes vkr mark the
+ * entire Venus context fatal. */
+static VkResult
+helios_mirror_imported_timeline_to_host(struct vn_device *dev,
+                                        VkDevice dev_handle,
+                                        VkSemaphore sem_handle,
+                                        struct vn_semaphore *sem,
+                                        uint64_t value)
+{
+   if (!dev->helios_host_timeline_procs)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   simple_mtx_lock(&sem->helios_host_signal_mtx);
+
+   uint64_t host_value = 0;
+   VkResult result = vn_call_vkGetSemaphoreCounterValue(
+      dev->primary_ring, dev_handle, sem_handle, &host_value);
+   if (result == VK_SUCCESS && host_value < value) {
+      const VkSemaphoreSignalInfo signal_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+         .semaphore = sem_handle,
+         .value = value,
+      };
+      result = vn_call_vkSignalSemaphore(dev->primary_ring, dev_handle,
+                                         &signal_info);
+   }
+
+   if (result == VK_SUCCESS)
+      (void)helios_sem_claim_host_signal(sem, MAX2(host_value, value));
+
+   simple_mtx_unlock(&sem->helios_host_signal_mtx);
+   return result;
+}
+#endif
+
 static VkResult
 vn_queue_submission_fix_batch_semaphores(struct vn_queue_submission *submit,
                                          uint32_t batch_index)
@@ -703,13 +747,21 @@ vn_queue_submission_fix_batch_semaphores(struct vn_queue_submission *submit,
             if (result != VK_SUCCESS)
                return result;
 
-            const VkImportSemaphoreResourceInfoMESA res_info = {
-               .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA,
-               .semaphore = sem_handle,
-               .resourceId = 0,
-            };
-            vn_async_vkImportSemaphoreResourceMESA(dev->primary_ring,
-                                                   dev_handle, &res_info);
+            if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE) {
+               result = helios_mirror_imported_timeline_to_host(
+                  dev, dev_handle, sem_handle, sem, value);
+               if (result != VK_SUCCESS)
+                  return result;
+            } else {
+               const VkImportSemaphoreResourceInfoMESA res_info = {
+                  .sType =
+                     VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_RESOURCE_INFO_MESA,
+                  .semaphore = sem_handle,
+                  .resourceId = 0,
+               };
+               vn_async_vkImportSemaphoreResourceMESA(dev->primary_ring,
+                                                      dev_handle, &res_info);
+            }
          }
 #endif
          continue;
@@ -3241,6 +3293,10 @@ vn_CreateSemaphore(VkDevice device,
 
    vn_object_base_init(&sem->base, VK_OBJECT_TYPE_SEMAPHORE, &dev->base);
 
+#if DETECT_OS_WINDOWS
+   simple_mtx_init(&sem->helios_host_signal_mtx, mtx_plain);
+#endif
+
    const VkSemaphoreTypeCreateInfo *type_info =
       vk_find_struct_const(pCreateInfo->pNext, SEMAPHORE_TYPE_CREATE_INFO);
    uint64_t initial_val = 0;
@@ -3325,6 +3381,9 @@ out_payloads_fini:
    vn_sync_payload_release(dev, &sem->temporary);
 
 out_object_base_fini:
+#if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&sem->helios_host_signal_mtx);
+#endif
    vn_object_base_fini(&sem->base);
    vk_free(alloc, sem);
    return vn_error(dev->instance, result);
@@ -3362,6 +3421,9 @@ vn_DestroySemaphore(VkDevice device,
    vn_sync_payload_release(dev, &sem->permanent);
    vn_sync_payload_release(dev, &sem->temporary);
 
+#if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&sem->helios_host_signal_mtx);
+#endif
    vn_object_base_fini(&sem->base);
    vk_free(alloc, sem);
 }
@@ -3421,10 +3483,24 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
    bool check_device_lost = false;
    bool deadline_hit = false;
 
-   assert(payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
-
    if (p_atomic_read(&dev->helios_lost))
       return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+
+#if DETECT_OS_WINDOWS
+   /* An imported Win32 semaphore has no renderer-side timeline state to
+    * query: its authoritative counter is the imported WDDM monitored fence.
+    * vn_WaitSemaphores follows the same rule.  This must precede the
+    * DEVICE_ONLY assertion below; otherwise vkGetSemaphoreCounterValue on a
+    * valid imported semaphore aborts before the Win32 path can run. */
+   if (payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC) {
+      if (!payload->win32_sync)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      return vn_renderer_sync_read(dev->renderer, payload->win32_sync,
+                                   out_value);
+   }
+#endif
+
+   assert(payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
 
    if (sem->feedback.pollable) {
       assert(sem->feedback.slot);

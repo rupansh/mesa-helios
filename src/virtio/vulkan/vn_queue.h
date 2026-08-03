@@ -146,6 +146,12 @@ struct vn_semaphore {
    VkSemaphoreType type;
 
 #if DETECT_OS_WINDOWS
+   /* Serializes host counter query+CPU signal when a WDDM-imported timeline
+    * is mirrored into its otherwise independent host VkSemaphore.  The pair
+    * must be atomic with respect to another guest thread mirroring the same
+    * value, because duplicate vkSignalSemaphore values are invalid. */
+   simple_mtx_t helios_host_signal_mtx;
+
    /* Helios stale-signal guard (atomic; no lock — counter_mtx is only
     * initialized when a feedback slot is allocated, which win32 exported
     * timelines may skip). The greatest timeline value ever forwarded to the

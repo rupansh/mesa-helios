@@ -489,6 +489,13 @@ static volatile LONG helios_module_pin_failures;
 static struct helios *helios_perf_at_exit_renderer;
 static bool helios_perf_at_exit_registered;
 static uint32_t helios_current_ctx_id;
+/* Private DLL exports are invoked directly rather than through Vulkan loader
+ * dispatch, so an application VkInstance is a loader wrapper and cannot be
+ * decoded with vn_instance_from_handle().  The bridge asks for the context on
+ * the same thread that synchronously created its DxvkInstance; retain that
+ * renderer identity per thread so a concurrent instance create cannot replace
+ * it as it can with helios_current_ctx_id. */
+static _Thread_local uint32_t helios_calling_thread_ctx_id;
 /* The scanout query is called through a private DLL export, not through the
  * Vulkan loader dispatch table.  A VkInstance supplied by DXVK must therefore
  * never be decoded with vn_instance_from_handle here: if the export was found
@@ -576,23 +583,15 @@ helios_venus_current_ctx_id(void)
    return helios_current_ctx_id;
 }
 
-/* Instance-scoped venus context id. The process-global form above is
- * last-writer-wins: with the dcomp present vehicle a game process holds TWO
- * live instances (its own + the vehicle's DXVK stack), and a concurrent
- * instance create (overlays do this) can slip between a bridge's device init
- * and its ctx-id read. A caller that owns a VkInstance (the UMD bridge does)
- * must resolve through it. Returns 0 for a null instance/renderer. */
+/* Context id for the renderer synchronously created by this calling thread.
+ * `instance` is retained for the stable bridge ABI but is intentionally opaque:
+ * this export is called directly, not through Vulkan loader dispatch, so the
+ * supplied handle is the loader's wrapper rather than a vn_instance. */
 __declspec(dllexport) uint32_t
 helios_venus_instance_ctx_id(VkInstance instance)
 {
-   if (instance == VK_NULL_HANDLE)
-      return 0;
-
-   struct vn_instance *inst = vn_instance_from_handle(instance);
-   if (!inst || !inst->renderer)
-      return 0;
-
-   return ((struct helios *)inst->renderer)->ctx_id;
+   (void)instance;
+   return helios_calling_thread_ctx_id;
 }
 
 __declspec(dllexport) uint64_t
@@ -3442,6 +3441,8 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       helios_ioctl_ctx_destroy(helios, helios->ctx_id); /* CTX_DESTROY via escape */
    if (helios_current_ctx_id == helios->ctx_id)
       helios_current_ctx_id = 0;
+   if (helios_calling_thread_ctx_id == helios->ctx_id)
+      helios_calling_thread_ctx_id = 0;
 
    /* WDDM D3DKMT teardown (reverse of helios_open_d3dkmt). */
    if (helios->context) {
@@ -3573,6 +3574,7 @@ helios_init(struct helios *helios)
    fprintf(stderr, "HELIOS[gate5a]: CTX_CREATE(VENUS) over D3DKMTEscape OK ctx_id=%u\n",
            helios->ctx_id);
    helios_current_ctx_id = helios->ctx_id;
+   helios_calling_thread_ctx_id = helios->ctx_id;
 
    vn_renderer_shmem_cache_init(&helios->shmem_cache, &helios->base,
                                 helios_shmem_destroy_now);
