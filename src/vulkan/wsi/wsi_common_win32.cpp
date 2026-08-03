@@ -1592,6 +1592,12 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
       DeleteDC(image->sw.dc);
    if(image->sw.bmp)
       DeleteObject(image->sw.bmp);
+   // The vehicle publishes this exact Venus resource id. Release it while
+   // the image's backing memory is still alive; a later release could erase a
+   // same-process resource that reused the id after wsi_destroy_image.
+   if (image->vehicle.resid)
+      wsi_helios_present_sync_release(image->vehicle.resid,
+                                      chain->vehicle.fence_id);
    wsi_destroy_image(&chain->base, &image->base);
 }
 

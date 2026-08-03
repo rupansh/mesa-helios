@@ -6,8 +6,8 @@
  *
  * Byte-compatible port of the producer half of
  * dxvk-helios/src/dxvk/dxvk_helios_present_sync.cpp (wire format HPS1:
- * 32-byte header, 64 x 32-byte slots, CAS-claimed resid keys, seqlock
- * odd-while-writing). The table file is
+ * 32-byte header, 64 x 32-byte slots, atomic (seq,resid) claims and a
+ * seqlock writer epoch). The table file is
  * C:\ProgramData\Helios\helios_present_sync.bin (override:
  * HELIOS_PRESENT_SYNC_PATH) and must NEVER be deleted while mapped —
  * existing views split-brain until every mapper restarts.
@@ -41,6 +41,11 @@ uint32_t wsi_helios_present_sync_alloc_fence_id(void);
  * consumers then take their bounded no-slot path). */
 bool wsi_helios_present_sync_publish(uint32_t resid, uint32_t pid,
                                      uint32_t fence_id, uint64_t value);
+
+/* Release the slot only if the current process, exact creation-time stamp, and
+ * per-device fence generation still own it. Call at the vehicle image's real
+ * Vulkan-memory lifetime boundary, before wsi_destroy_image tears it down. */
+bool wsi_helios_present_sync_release(uint32_t resid, uint32_t fence_id);
 
 #ifdef __cplusplus
 }

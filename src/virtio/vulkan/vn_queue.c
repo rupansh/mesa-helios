@@ -1025,7 +1025,10 @@ vn_queue_submission_add_query_feedback(struct vn_queue_submission *submit,
 struct vn_semaphore_feedback_cmd *
 vn_semaphore_get_feedback_cmd(struct vn_device *dev,
                               struct vn_semaphore *sem,
-                              uint64_t counter);
+                              uint64_t counter,
+                              VkSemaphore wait_sem_handle,
+                              uint64_t wait_sem_id,
+                              uint64_t wait_value);
 
 static VkResult
 vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
@@ -1041,15 +1044,6 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
    VK_FROM_HANDLE(vk_queue, queue_vk, submit->queue_handle);
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
 
-   /* Helios: the signal value must be known BEFORE the sfb cmd becomes
-    * visible on pending_cmds — see vn_semaphore_get_feedback_cmd. */
-   const uint64_t counter =
-      vn_get_signal_semaphore_counter(submit, batch_index, signal_index);
-   struct vn_semaphore_feedback_cmd *sfb_cmd =
-      vn_semaphore_get_feedback_cmd(dev, sem, counter);
-   if (!sfb_cmd)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
    VkSemaphore wait_sem_handle = VK_NULL_HANDLE;
    uint64_t wait_sem_id = 0;
    uint64_t wait_value = 0;
@@ -1059,10 +1053,17 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
       wait_sem_id = wait_sem ? wait_sem->base.id : 0;
       wait_value = vn_get_wait_semaphore_counter(submit, batch_index, 0);
    }
-   sfb_cmd->signal_value = counter;
-   sfb_cmd->wait_sem_handle = wait_sem_handle;
-   sfb_cmd->wait_sem_id = wait_sem_id;
-   sfb_cmd->wait_value = wait_value;
+
+   /* Helios: all recycler and attribution metadata must be initialized
+    * BEFORE the sfb cmd becomes visible on pending_cmds — see
+    * vn_semaphore_get_feedback_cmd. */
+   const uint64_t counter =
+      vn_get_signal_semaphore_counter(submit, batch_index, signal_index);
+   struct vn_semaphore_feedback_cmd *sfb_cmd =
+      vn_semaphore_get_feedback_cmd(dev, sem, counter, wait_sem_handle,
+                                    wait_sem_id, wait_value);
+   if (!sfb_cmd)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    /* Helios strike attribution: remember which queue last submitted a signal
     * op for this semaphore (read by the sem-deadline strike log). */
@@ -1679,6 +1680,16 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
                                     sem->external_payload.ring_seqno);
       batch.cs_data = local_data;
       batch.cs_size = vn_cs_encoder_get_len(&local_enc);
+
+      /* The signal batch already waits for THIS exact async queue-submit
+       * sequence and submits on its graphics ring.  Tag that existing batch
+       * only when a registered UMD stream has a representable monotonic
+       * value.  No sequence means no host ordering proof, so stay legacy. */
+      if (sem->helios_present_stream_cookie && value > 0 &&
+          value <= UINT32_MAX) {
+         batch.present_cookie = sem->helios_present_stream_cookie;
+         batch.present_value32 = (uint32_t)value;
+      }
    }
 
    const struct vn_renderer_submit submit = {
@@ -1690,6 +1701,48 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
    return VK_SUCCESS;
 #endif
 }
+
+#if DETECT_OS_WINDOWS
+/* Private UMD-facing ICD export.  This is deliberately not a Vulkan extension:
+ * bridge_icd_exports resolves it by DLL export name so an older ICD simply
+ * leaves the UMD correlation zero and preserves its old CPU gate. */
+__declspec(dllexport) bool
+helios_venus_register_present_stream(VkDevice device,
+                                     VkSemaphore semaphore,
+                                     uint64_t *out_cookie);
+
+__declspec(dllexport) bool
+helios_venus_register_present_stream(VkDevice device,
+                                     VkSemaphore semaphore,
+                                     uint64_t *out_cookie)
+{
+   if (out_cookie)
+      *out_cookie = 0;
+   if (!device || !semaphore || !out_cookie || VN_PERF(NO_ASYNC_QUEUE_SUBMIT))
+      return false;
+
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_semaphore *sem = vn_semaphore_from_handle(semaphore);
+   if (!dev || !sem || sem->helios_present_stream_cookie ||
+       sem->type != VK_SEMAPHORE_TYPE_TIMELINE || !sem->is_external ||
+       sem->external_handle_types !=
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       sem->payload != &sem->permanent || !sem->permanent.win32_sync)
+      return false;
+
+   uint64_t cookie = 0;
+   if (!vn_renderer_helios_present_stream_register(dev->renderer, &cookie) ||
+       !cookie)
+      return false;
+
+   /* This exact Vulkan semaphore owns this stream until DestroySemaphore.
+    * A second registration is refused above rather than guessing identity from
+    * process/queue/creation timing. */
+   sem->helios_present_stream_cookie = cookie;
+   *out_cookie = cookie;
+   return true;
+}
+#endif
 
 static VkResult
 vn_queue_submit(struct vn_queue_submission *submit)
@@ -3092,7 +3145,10 @@ vn_semaphore_wait_external(struct vn_device *dev, struct vn_semaphore *sem)
 
 struct vn_semaphore_feedback_cmd *
 vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem,
-                              uint64_t counter)
+                              uint64_t counter,
+                              VkSemaphore wait_sem_handle,
+                              uint64_t wait_sem_id,
+                              uint64_t wait_value)
 {
    struct vn_semaphore_feedback_cmd *sfb_cmd = NULL;
 
@@ -3116,15 +3172,19 @@ vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem,
                                  struct vn_semaphore_feedback_cmd, head);
       vn_feedback_set_counter(sfb_cmd->src_slot, counter);
       sfb_cmd->signal_value = counter;
+      sfb_cmd->wait_sem_handle = wait_sem_handle;
+      sfb_cmd->wait_sem_id = wait_sem_id;
+      sfb_cmd->wait_value = wait_value;
       sfb_cmd->ring_seqno_valid = false;
       sfb_cmd->ring_seqno = 0;
       list_move_to(&sfb_cmd->head, &sem->feedback.pending_cmds);
       sem->feedback.free_cmd_count--;
+
+      /* Helios sem-deadline: a signal op is now pending — arm the
+       * pending-signal clock if it is not already running. */
+      if (!sem->feedback.pending_signal_since_ns)
+         sem->feedback.pending_signal_since_ns = os_time_get_nano();
    }
-   /* Helios sem-deadline: a signal op is now pending — arm the
-    * pending-signal clock if it is not already running. */
-   if (!sem->feedback.pending_signal_since_ns)
-      sem->feedback.pending_signal_since_ns = os_time_get_nano();
    simple_mtx_unlock(&sem->feedback.cmd_mtx);
 
    if (!sfb_cmd) {
@@ -3137,11 +3197,16 @@ vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem,
        * anything can observe it on pending_cmds. */
       vn_feedback_set_counter(sfb_cmd->src_slot, counter);
       sfb_cmd->signal_value = counter;
+      sfb_cmd->wait_sem_handle = wait_sem_handle;
+      sfb_cmd->wait_sem_id = wait_sem_id;
+      sfb_cmd->wait_value = wait_value;
       sfb_cmd->ring_seqno_valid = false;
       sfb_cmd->ring_seqno = 0;
 
       simple_mtx_lock(&sem->feedback.cmd_mtx);
       list_add(&sfb_cmd->head, &sem->feedback.pending_cmds);
+      if (!sem->feedback.pending_signal_since_ns)
+         sem->feedback.pending_signal_since_ns = os_time_get_nano();
       simple_mtx_unlock(&sem->feedback.cmd_mtx);
    }
 
@@ -3411,6 +3476,17 @@ vn_DestroySemaphore(VkDevice device,
 
    if (!sem)
       return;
+
+#if DETECT_OS_WINDOWS
+   if (sem->helios_present_stream_cookie) {
+      /* Best effort before the semaphore's WDDM sync and renderer context can
+       * disappear.  The renderer also owns a teardown backstop for Vulkan
+       * device destruction with outstanding children. */
+      vn_renderer_helios_present_stream_unregister(
+         dev->renderer, sem->helios_present_stream_cookie);
+      sem->helios_present_stream_cookie = 0;
+   }
+#endif
 
    vn_async_vkDestroySemaphore(dev->primary_ring, device, semaphore, NULL);
 

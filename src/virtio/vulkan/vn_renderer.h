@@ -93,6 +93,13 @@ struct vn_renderer_submit_batch {
     */
    uint32_t ring_idx;
 
+   /* Helios registered present-stream attribution.  Both fields are zero for
+    * every ordinary batch.  When present_value32 is nonzero, present_cookie
+    * is supplied to the 40-byte SUBMIT_VENUS header as its input fence_id;
+    * the KMD overwrites that field with its normal fresh wire fence id. */
+   uint64_t present_cookie;
+   uint32_t present_value32;
+
    /* syncs to update when the timeline is signaled */
    struct vn_renderer_sync *const *syncs;
    /* TODO allow NULL when syncs are all binary? */
@@ -286,6 +293,16 @@ vn_renderer_helios_sync_set_feedback(struct vn_renderer *renderer,
  * semaphores in vn_semaphore_feedback_init. */
 bool
 vn_renderer_helios_retire_feedback_enabled(void);
+
+/* Registered monotonic present-stream lifecycle.  The renderer owns the KMD
+ * registration table so a context teardown can best-effort unregister streams
+ * whose VkSemaphore owner did not destroy them first. */
+bool
+vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
+                                           uint64_t *out_cookie);
+void
+vn_renderer_helios_present_stream_unregister(struct vn_renderer *renderer,
+                                             uint64_t cookie);
 #endif
 
 struct vn_renderer {

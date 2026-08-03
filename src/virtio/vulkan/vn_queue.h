@@ -276,6 +276,11 @@ struct vn_semaphore {
 
 #if defined(_WIN32)
    VkExternalSemaphoreHandleTypeFlags external_handle_types;
+
+   /* Nonzero only after helios_venus_register_present_stream accepted this
+    * exact OPAQUE_WIN32 exported timeline.  It is not inferred from a handle,
+    * queue, process, or creation order. */
+   uint64_t helios_present_stream_cookie;
 #endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_semaphore,

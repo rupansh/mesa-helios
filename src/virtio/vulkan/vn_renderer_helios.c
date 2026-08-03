@@ -111,6 +111,10 @@ struct helios_unicode_string {
 #define HELIOS_ESCAPE_REGISTER_FENCE_EVENT   0x000Bu
 #define HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT 0x000Cu
 #define HELIOS_ESCAPE_QUERY_SCANOUT           0x000Du
+#define HELIOS_ESCAPE_PRESENT_STREAM           0x0010u
+
+#define HELIOS_PRESENT_STREAM_OP_REGISTER   1u
+#define HELIOS_PRESENT_STREAM_OP_UNREGISTER 2u
 
 /* helios_escape_fence_event.out_state values (protocol/src/escape.rs). */
 #define HELIOS_FENCE_EVENT_REGISTERED       0u
@@ -156,7 +160,14 @@ struct helios_escape_submit_venus {
    uint32_t ctx_id;
    uint32_t buffer_size;
    uint32_t ring_idx; /* venus per-queue host timeline (0 = CPU/primary ring) */
-   uint32_t _pad;
+   uint32_t present_value32; /* 0 = legacy; nonzero tags fence_id as cookie */
+};
+
+struct helios_escape_present_stream {
+   struct helios_escape_header hdr;
+   uint64_t cookie; /* out on REGISTER; exact in on UNREGISTER */
+   uint32_t ctx_id;
+   uint32_t op;
 };
 
 struct helios_escape_alloc_blob {
@@ -253,6 +264,8 @@ _Static_assert(sizeof(struct helios_escape_header) == 16, "hdr size");
 _Static_assert(sizeof(struct helios_escape_ctx_create) == 24, "ctx_create size");
 _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size");
 _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
+_Static_assert(sizeof(struct helios_escape_present_stream) == 32,
+               "present_stream size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
@@ -399,6 +412,14 @@ struct helios_perf_stats {
    uint64_t bo_map_unknown;
 };
 
+/* One record per accepted REGISTER.  This lives under dev_mutex, alongside the
+ * escape channel itself: that makes semaphore destruction and renderer/context
+ * teardown race-free without a process/global identity heuristic. */
+struct helios_present_stream {
+   uint64_t cookie;
+   struct helios_present_stream *next;
+};
+
 struct helios {
    struct vn_renderer base;
 
@@ -455,6 +476,10 @@ struct helios {
     * init). When false every wire-fence wait uses the blocking WAIT_FENCE
     * escape (correct, but parked escapes convoy this process's submits). */
    bool fence_events_supported;
+
+   /* Registered monotonic present streams not yet explicitly unregistered.
+    * Drained best-effort before CTX_DESTROY. */
+   struct helios_present_stream *present_streams;
 
    struct vn_renderer_shmem_cache shmem_cache;
    struct helios_perf_stats perf;
@@ -1249,6 +1274,108 @@ helios_escape(struct helios *helios, void *buf, uint32_t size)
    return helios_escape_ex(helios, buf, size, helios_escape_hw_forced());
 }
 
+/* REGISTER/UNREGISTER are intentionally synchronous control-plane escapes.
+ * Per-frame attribution remains on the already-existing SUBMIT_VENUS escape;
+ * do not add a renderer batch or an escape to the frame path.  Callers hold
+ * dev_mutex so the context id and the renderer-owned registration list are
+ * stable for the full request. */
+static bool
+helios_ioctl_present_stream(struct helios *helios,
+                            uint32_t op,
+                            uint64_t *inout_cookie)
+{
+   if (!helios->ctx_id || !inout_cookie)
+      return false;
+
+   struct helios_escape_present_stream req = { 0 };
+   helios_hdr_init(&req.hdr, HELIOS_ESCAPE_PRESENT_STREAM, sizeof(req));
+   req.cookie = *inout_cookie;
+   req.ctx_id = helios->ctx_id;
+   req.op = op;
+   if (!helios_escape(helios, &req, sizeof(req)))
+      return false;
+
+   if (op == HELIOS_PRESENT_STREAM_OP_REGISTER && !req.cookie)
+      return false;
+   *inout_cookie = req.cookie;
+   return true;
+}
+
+bool
+vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
+                                           uint64_t *out_cookie)
+{
+   if (out_cookie)
+      *out_cookie = 0;
+   if (!renderer || !out_cookie)
+      return false;
+
+   struct helios_present_stream *entry = calloc(1, sizeof(*entry));
+   if (!entry)
+      return false;
+
+   struct helios *helios = (struct helios *)renderer;
+   uint64_t cookie = 0;
+   mtx_lock(&helios->dev_mutex);
+   /* One Venus context has one UMD-created present timeline.  Reject a
+    * different semaphore rather than trying to infer a winner or allowing
+    * two cookies to make the marker's stream identity ambiguous.  Once its
+    * VkSemaphore is destroyed, unregister clears this record and a later
+    * explicit registration is possible. */
+   const bool ok = !helios->present_streams &&
+      helios_ioctl_present_stream(helios, HELIOS_PRESENT_STREAM_OP_REGISTER,
+                                  &cookie);
+   if (ok) {
+      entry->cookie = cookie;
+      entry->next = helios->present_streams;
+      helios->present_streams = entry;
+      *out_cookie = cookie;
+   }
+   mtx_unlock(&helios->dev_mutex);
+
+   if (!ok)
+      free(entry);
+   return ok;
+}
+
+void
+vn_renderer_helios_present_stream_unregister(struct vn_renderer *renderer,
+                                             uint64_t cookie)
+{
+   if (!renderer || !cookie)
+      return;
+
+   struct helios *helios = (struct helios *)renderer;
+   mtx_lock(&helios->dev_mutex);
+   struct helios_present_stream **link = &helios->present_streams;
+   while (*link && (*link)->cookie != cookie)
+      link = &(*link)->next;
+   if (*link) {
+      struct helios_present_stream *entry = *link;
+      *link = entry->next;
+      /* Best effort: a context/device teardown may already have reclaimed the
+       * stream.  The local record must still go away so no later teardown
+       * guesses at a stale cookie. */
+      (void)helios_ioctl_present_stream(
+         helios, HELIOS_PRESENT_STREAM_OP_UNREGISTER, &cookie);
+      free(entry);
+   }
+   mtx_unlock(&helios->dev_mutex);
+}
+
+static void
+helios_present_stream_unregister_all_locked(struct helios *helios)
+{
+   while (helios->present_streams) {
+      struct helios_present_stream *entry = helios->present_streams;
+      helios->present_streams = entry->next;
+      uint64_t cookie = entry->cookie;
+      (void)helios_ioctl_present_stream(
+         helios, HELIOS_PRESENT_STREAM_OP_UNREGISTER, &cookie);
+      free(entry);
+   }
+}
+
 /* Query the adapter-owned LINEAR VidPn primary through one live renderer.
  * `instance` is retained for the stable bridge ABI but is intentionally opaque
  * here; see helios_current_renderer above. */
@@ -1417,20 +1544,27 @@ helios_ioctl_submit_cs(struct helios *helios,
                        const void *cs_data,
                        size_t cs_size,
                        uint32_t ring_idx,
+                       uint64_t present_cookie,
+                       uint32_t present_value32,
                        uint64_t *out_fence_id)
 {
    if (cs_size == 0 || cs_size > UINT32_MAX)
       return false;
 
-   const uint64_t fence_id = ++helios->next_fence_id;
+   const uint64_t local_fence_id = ++helios->next_fence_id;
+   const bool tagged_present = present_cookie && present_value32;
 
    struct helios_escape_submit_venus hdr = { 0 };
    helios_hdr_init(&hdr.hdr, HELIOS_ESCAPE_SUBMIT_VENUS, sizeof(hdr));
-   hdr.fence_id = fence_id;
+   /* The tagged form deliberately reuses the pre-existing 40-byte header:
+    * cookie in fence_id on input, value32 in the former reserved word.  The
+    * KMD overwrites fence_id with its ordinary fresh wire fence on return. */
+   hdr.fence_id = tagged_present ? present_cookie : local_fence_id;
    hdr.ctx_id = helios->ctx_id;
    hdr.buffer_size = (uint32_t)cs_size;
    hdr.ring_idx = ring_idx;
-   helios_trace_submit(helios, cs_data, cs_size, ring_idx, fence_id);
+   hdr.present_value32 = tagged_present ? present_value32 : 0;
+   helios_trace_submit(helios, cs_data, cs_size, ring_idx, hdr.fence_id);
 
    /* Over D3DKMTEscape the venus stream rides INSIDE the escape buffer, directly
     * after the fixed header (the KMD reads it at buf[sizeof(hdr)..]); there is no
@@ -1459,7 +1593,7 @@ helios_ioctl_submit_cs(struct helios *helios,
    memcpy(buf, &hdr, sizeof(hdr));
    memcpy(buf + sizeof(hdr), cs_data, cs_size);
    const bool ok = helios_escape(helios, buf, (uint32_t)total);
-   uint64_t wire_fence_id = fence_id;
+   uint64_t wire_fence_id = local_fence_id;
    if (ok) {
       /* The KMD wrote the assigned wire fence id back into the header. */
       struct helios_escape_submit_venus out;
@@ -2435,6 +2569,7 @@ helios_submit(struct vn_renderer *renderer, const struct vn_renderer_submit *sub
             QueryPerformanceCounter(&t1);
          const bool ok = helios_ioctl_submit_cs(
             helios, batch->cs_data, batch->cs_size, batch->ring_idx,
+            batch->present_cookie, batch->present_value32,
             &fence_id);
          if (perf) {
             QueryPerformanceCounter(&t2);
@@ -2756,7 +2891,8 @@ helios_bo_create_from_device_memory(
       uint64_t fence_id = 0;
       if (batch->cs_size &&
           !helios_ioctl_submit_cs(helios, batch->cs_data, batch->cs_size,
-                                  batch->ring_idx, &fence_id)) {
+                                  batch->ring_idx, batch->present_cookie,
+                                  batch->present_value32, &fence_id)) {
          mtx_unlock(&helios->dev_mutex);
          return VK_ERROR_DEVICE_LOST;
       }
@@ -3435,6 +3571,14 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       CloseHandle(helios->retire_stop_event);
       helios->retire_stop_event = NULL;
    }
+
+   /* Vulkan callers normally destroy every semaphore before VkDevice, but the
+    * registered stream table is also a context-teardown backstop.  UNREGISTER
+    * while the D3DKMT context is still valid; a failed best-effort escape does
+    * not retain a stale local cookie. */
+   mtx_lock(&helios->dev_mutex);
+   helios_present_stream_unregister_all_locked(helios);
+   mtx_unlock(&helios->dev_mutex);
 
    vn_renderer_shmem_cache_fini(&helios->shmem_cache);
 

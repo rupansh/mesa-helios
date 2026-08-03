@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -28,9 +29,10 @@ struct hps_header {
    uint32_t reserved[6];
 };
 
-/* 32 bytes; `seq` odd while a write is in flight. `resid` is CAS-claimed
- * once and never returns to 0 while the file lives; stale slots are only
- * recycled via producer-pid liveness. */
+/* 32 bytes. `seq` is both an inter-process writer lock and a seqlock:
+ * writers CAS even->odd before changing key or payload, then publish the
+ * next even value. Stable dead producers are recyclable by their exact
+ * (pid, creation-time) identity. */
 struct hps_slot {
    volatile LONG seq;
    uint32_t resid;
@@ -48,6 +50,11 @@ struct hps_slot {
 
 _Static_assert(sizeof(struct hps_header) == 32, "HPS header ABI");
 _Static_assert(sizeof(struct hps_slot) == 32, "HPS slot ABI");
+_Static_assert(sizeof(struct hps_header) % _Alignof(struct hps_slot) == 0,
+               "HPS slot alignment");
+_Static_assert(offsetof(struct hps_slot, seq) == 0, "HPS seq offset");
+_Static_assert(offsetof(struct hps_slot, resid) == sizeof(LONG), "HPS resid offset");
+_Static_assert(_Alignof(struct hps_slot) >= _Alignof(LONG64), "HPS pair alignment");
 
 static struct hps_header *hps_header;
 static struct hps_slot *hps_slots;
@@ -138,9 +145,8 @@ hps_self_start(void)
  * reused pid, legacy zero stamp) makes the slot recyclable. A shielded
  * process (ACCESS_DENIED) is conservatively treated as alive. */
 static bool
-hps_producer_alive(const struct hps_slot *slot)
+hps_producer_alive(uint32_t pid, uint64_t producer_start)
 {
-   const uint32_t pid = slot->pid;
    if (!pid)
       return false;
    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -153,46 +159,99 @@ hps_producer_alive(const struct hps_slot *slot)
       if (GetProcessTimes(proc, &creation, &exit_t, &kernel, &user)) {
          const uint64_t start = ((uint64_t)creation.dwHighDateTime << 32) |
                                 creation.dwLowDateTime;
-         alive = (start == slot->producer_start);
+         alive = (start == producer_start);
       }
    }
    CloseHandle(proc);
    return alive;
 }
 
-static struct hps_slot *
-hps_find_slot(uint32_t resid)
+static uint64_t
+hps_pack_state(LONG seq, uint32_t resid)
 {
-   for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
-      if (hps_slots[i].resid == resid)
-         return &hps_slots[i];
-   }
-   return NULL;
+   return ((uint64_t)resid << 32) | (uint32_t)seq;
 }
 
-static struct hps_slot *
-hps_claim_slot(uint32_t resid)
+static LONG
+hps_state_seq(uint64_t state)
 {
-   for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
-      struct hps_slot *slot = &hps_slots[i];
-      if (slot->resid == 0 &&
-          InterlockedCompareExchange((volatile LONG *)&slot->resid,
-                                     (LONG)resid, 0) == 0)
-         return slot;
-   }
+   return (LONG)(uint32_t)state;
+}
 
-   /* Recycle a dead/reused-pid producer's slot (its fence name is
-    * unresolvable anyway). */
-   for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
-      struct hps_slot *slot = &hps_slots[i];
-      const uint32_t old = slot->resid;
-      if (old != 0 && !hps_producer_alive(slot) &&
-          InterlockedCompareExchange((volatile LONG *)&slot->resid,
-                                     (LONG)resid, (LONG)old) == (LONG)old)
-         return slot;
-   }
+static uint32_t
+hps_state_resid(uint64_t state)
+{
+   return (uint32_t)(state >> 32);
+}
 
-   return NULL;
+static uint64_t
+hps_read_state(const struct hps_slot *slot)
+{
+   return (uint64_t)InterlockedCompareExchange64(
+      (volatile LONG64 *)(volatile LONG *)&slot->seq, 0, 0);
+}
+
+/* Atomically claim the combined (seq,resid) state. This is deliberately a
+ * single 64-bit transition: an already-loaded legacy writer that still CASes
+ * resid alone either wins while the pair is even/free (we then fail cleanly),
+ * or loses once the new writer made seq odd with its new key. */
+static bool
+hps_try_claim(struct hps_slot *slot, uint64_t expected_state,
+              uint32_t new_resid, LONG *write_seq)
+{
+   const LONG seq = hps_state_seq(expected_state);
+   if (seq & 1)
+      return false;
+
+   const LONG locked = (LONG)((uint32_t)seq + 1u);
+   const uint64_t desired = hps_pack_state(locked, new_resid);
+   if ((uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&slot->seq,
+                                               (LONG64)desired,
+                                               (LONG64)expected_state) != expected_state)
+      return false;
+
+   *write_seq = locked;
+   return true;
+}
+
+static bool
+hps_unlock(struct hps_slot *slot, LONG write_seq, uint32_t resid)
+{
+   const uint64_t expected = hps_pack_state(write_seq, resid);
+   const uint64_t unlocked =
+      hps_pack_state((LONG)((uint32_t)write_seq + 1u), resid);
+   return (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&slot->seq,
+                                                  (LONG64)unlocked,
+                                                  (LONG64)expected) == expected;
+}
+
+static bool
+hps_free(struct hps_slot *slot, LONG unlocked_seq, uint32_t resid)
+{
+   const uint64_t expected = hps_pack_state(unlocked_seq, resid);
+   const uint64_t freed = hps_pack_state(unlocked_seq, 0);
+   return (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)&slot->seq,
+                                                  (LONG64)freed,
+                                                  (LONG64)expected) == expected;
+}
+
+static void
+hps_write_payload(struct hps_slot *slot, uint32_t pid, uint32_t fence_id,
+                  uint64_t value, uint64_t producer_start)
+{
+   slot->pid = pid;
+   slot->fence_id = fence_id;
+   slot->value = (LONG64)value;
+   slot->producer_start = producer_start;
+}
+
+static void
+hps_clear_payload(struct hps_slot *slot)
+{
+   slot->pid = 0;
+   slot->fence_id = 0;
+   slot->value = 0;
+   slot->producer_start = 0;
 }
 
 bool
@@ -204,20 +263,123 @@ wsi_helios_present_sync_publish(uint32_t resid, uint32_t pid,
    if (!hps_slots || !resid)
       return false;
 
-   struct hps_slot *slot = hps_find_slot(resid);
-   if (!slot)
-      slot = hps_claim_slot(resid);
-   if (!slot)
+   const uint64_t start = hps_self_start();
+   if (!pid || !start)
       return false;
 
-   /* Seqlock write; one producer per resid past the claim. */
-   InterlockedIncrement(&slot->seq); /* -> odd */
-   slot->pid = pid;
-   slot->fence_id = fence_id;
-   slot->value = (LONG64)value;
-   slot->producer_start = hps_self_start();
-   InterlockedIncrement(&slot->seq); /* -> even */
-   return true;
+   for (uint32_t attempt = 0; attempt < 8; attempt++) {
+      /* Refresh an existing resource first. */
+      for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
+         struct hps_slot *slot = &hps_slots[i];
+         const uint64_t state = hps_read_state(slot);
+         if (hps_state_resid(state) != resid || (hps_state_seq(state) & 1))
+            continue;
+
+         LONG write_seq = 0;
+         if (!hps_try_claim(slot, state, resid, &write_seq))
+            continue;
+
+         if (slot->resid == resid) {
+            hps_write_payload(slot, pid, fence_id, value, start);
+            return hps_unlock(slot, write_seq, resid);
+         }
+
+         if (!hps_unlock(slot, write_seq, resid))
+            return false;
+      }
+
+      /* Claim an actually free slot with one (seq,resid) transition. */
+      for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
+         struct hps_slot *slot = &hps_slots[i];
+         const uint64_t state = hps_read_state(slot);
+         if (hps_state_resid(state) != 0 || (hps_state_seq(state) & 1))
+            continue;
+
+         LONG write_seq = 0;
+         if (!hps_try_claim(slot, state, resid, &write_seq))
+            continue;
+
+         if (slot->resid == resid) {
+            hps_write_payload(slot, pid, fence_id, value, start);
+            return hps_unlock(slot, write_seq, resid);
+         }
+
+         if (!hps_unlock(slot, write_seq, resid))
+            return false;
+      }
+
+      /* Recycle only a stable even slot whose exact producer instance died. */
+      for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
+         struct hps_slot *slot = &hps_slots[i];
+         const uint64_t state = hps_read_state(slot);
+         if (hps_state_resid(state) == 0 || (hps_state_seq(state) & 1))
+            continue;
+
+         const uint32_t old_pid = slot->pid;
+         const uint64_t old_start = (uint64_t)InterlockedCompareExchange64(
+            (volatile LONG64 *)&slot->producer_start, 0, 0);
+         if (hps_read_state(slot) != state ||
+             hps_producer_alive(old_pid, old_start))
+            continue;
+
+         LONG write_seq = 0;
+         if (!hps_try_claim(slot, state, resid, &write_seq))
+            continue;
+
+         if (slot->resid == resid) {
+            hps_write_payload(slot, pid, fence_id, value, start);
+            return hps_unlock(slot, write_seq, resid);
+         }
+
+         if (!hps_unlock(slot, write_seq, resid))
+            return false;
+      }
+   }
+
+   return false;
+}
+
+bool
+wsi_helios_present_sync_release(uint32_t resid, uint32_t fence_id)
+{
+   InitOnceExecuteOnce(&hps_once, hps_init_mapping, NULL, NULL);
+
+   if (!hps_slots || !resid || !fence_id)
+      return false;
+
+   const uint32_t pid = (uint32_t)GetCurrentProcessId();
+   const uint64_t start = hps_self_start();
+   if (!pid || !start)
+      return false;
+
+   for (uint32_t attempt = 0; attempt < 8; attempt++) {
+      for (uint32_t i = 0; i < HPS_SLOT_COUNT; i++) {
+         struct hps_slot *slot = &hps_slots[i];
+         const uint64_t state = hps_read_state(slot);
+         if (hps_state_resid(state) != resid || (hps_state_seq(state) & 1))
+            continue;
+
+         LONG write_seq = 0;
+         if (!hps_try_claim(slot, state, resid, &write_seq))
+            continue;
+
+         const bool owned = slot->pid == pid && slot->producer_start == start &&
+                            slot->fence_id == fence_id;
+         if (!owned) {
+            if (!hps_unlock(slot, write_seq, resid))
+               return false;
+            return false;
+         }
+
+         hps_clear_payload(slot);
+         if (!hps_unlock(slot, write_seq, resid))
+            return false;
+
+         return hps_free(slot, (LONG)((uint32_t)write_seq + 1u), resid);
+      }
+   }
+
+   return false;
 }
 
 #endif /* _WIN32 */
