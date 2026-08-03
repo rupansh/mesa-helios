@@ -1024,7 +1024,8 @@ vn_queue_submission_add_query_feedback(struct vn_queue_submission *submit,
 
 struct vn_semaphore_feedback_cmd *
 vn_semaphore_get_feedback_cmd(struct vn_device *dev,
-                              struct vn_semaphore *sem);
+                              struct vn_semaphore *sem,
+                              uint64_t counter);
 
 static VkResult
 vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
@@ -1039,14 +1040,15 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
 
    VK_FROM_HANDLE(vk_queue, queue_vk, submit->queue_handle);
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
-   struct vn_semaphore_feedback_cmd *sfb_cmd =
-      vn_semaphore_get_feedback_cmd(dev, sem);
-   if (!sfb_cmd)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
+   /* Helios: the signal value must be known BEFORE the sfb cmd becomes
+    * visible on pending_cmds — see vn_semaphore_get_feedback_cmd. */
    const uint64_t counter =
       vn_get_signal_semaphore_counter(submit, batch_index, signal_index);
-   vn_feedback_set_counter(sfb_cmd->src_slot, counter);
+   struct vn_semaphore_feedback_cmd *sfb_cmd =
+      vn_semaphore_get_feedback_cmd(dev, sem, counter);
+   if (!sfb_cmd)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    VkSemaphore wait_sem_handle = VK_NULL_HANDLE;
    uint64_t wait_sem_id = 0;
@@ -3089,14 +3091,33 @@ vn_semaphore_wait_external(struct vn_device *dev, struct vn_semaphore *sem)
 }
 
 struct vn_semaphore_feedback_cmd *
-vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem)
+vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem,
+                              uint64_t counter)
 {
    struct vn_semaphore_feedback_cmd *sfb_cmd = NULL;
 
+   /* Helios GT1 Xid-109 root cause (tmp/xid-trap/cap-20260803-145359-cserr):
+    * the src_slot value and the pending_cmds listing must be one atomic
+    * step. The recycler in vn_get_semaphore_counter_value frees/recycles any
+    * PENDING entry whose src value trails the observed dst counter; a cmd
+    * listed first and stamped later (upstream order: get, then
+    * vn_feedback_set_counter at the call site, outside cmd_mtx) is visible
+    * for a window with its PREVIOUS (lower, or fresh-alloc garbage) value.
+    * A concurrent counter poll then recycles it into another submission
+    * ("VkCommandBuffer is already in use", host-validation-proven) or
+    * destroys it outright while the prepared submission still references it
+    * ("failed to look up object <id> of type 6" -> fatal CS error; without
+    * validation the freed-CB submit is UB and the NVIDIA channel dies with
+    * Xid-109 CTX SWITCH TIMEOUT). Stamp value + list membership under one
+    * cmd_mtx hold, and reset the ring stamp for the cmd's new life. */
    simple_mtx_lock(&sem->feedback.cmd_mtx);
    if (!list_is_empty(&sem->feedback.free_cmds)) {
       sfb_cmd = list_first_entry(&sem->feedback.free_cmds,
                                  struct vn_semaphore_feedback_cmd, head);
+      vn_feedback_set_counter(sfb_cmd->src_slot, counter);
+      sfb_cmd->signal_value = counter;
+      sfb_cmd->ring_seqno_valid = false;
+      sfb_cmd->ring_seqno = 0;
       list_move_to(&sfb_cmd->head, &sem->feedback.pending_cmds);
       sem->feedback.free_cmd_count--;
    }
@@ -3108,6 +3129,16 @@ vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem)
 
    if (!sfb_cmd) {
       sfb_cmd = vn_semaphore_feedback_cmd_alloc(dev, sem->feedback.slot);
+      if (!sfb_cmd)
+         return NULL;
+
+      /* Same atomicity for the fresh path: a newly allocated cmd's src slot
+       * holds whatever the feedback pool page contained — stamp it before
+       * anything can observe it on pending_cmds. */
+      vn_feedback_set_counter(sfb_cmd->src_slot, counter);
+      sfb_cmd->signal_value = counter;
+      sfb_cmd->ring_seqno_valid = false;
+      sfb_cmd->ring_seqno = 0;
 
       simple_mtx_lock(&sem->feedback.cmd_mtx);
       list_add(&sfb_cmd->head, &sem->feedback.pending_cmds);
