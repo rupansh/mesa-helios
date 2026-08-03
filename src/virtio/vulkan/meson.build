@@ -131,7 +131,7 @@ if with_platform_windows
   # only winapifamily.h, which mingw has) vendored under icd/win-build/wdk-include.
   # Real headers = authoritative ABI (they self-default DXGKDDI_INTERFACE_VERSION
   # to WDDM3_2, matching the OS), so no hand-shimmed D3DKMT structs to keep in sync.
-  vn_c_args += '-IZ:/icd/win-build/wdk-include'
+  vn_c_args += '-I' + get_option('helios-wdk-include')
 endif
 
 if with_platform_wayland or with_platform_x11 or \

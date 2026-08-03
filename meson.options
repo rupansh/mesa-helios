@@ -893,3 +893,10 @@ option(
   value : false,
   description : 'Build panfrost Rust components.'
 )
+
+option(
+  'helios-wdk-include',
+  type : 'string',
+  value : 'Z:/icd/win-build/wdk-include',
+  description : 'Path to the WDK D3DKMT headers used by the Helios Windows Venus backend.'
+)
