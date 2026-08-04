@@ -331,6 +331,20 @@ VkResult
 vn_renderer_create_helios(struct vn_instance *instance,
                           const VkAllocationCallbacks *alloc,
                           struct vn_renderer **renderer);
+
+/* Mirror a Venus VkDeviceMemory lifetime into Windows VidMm accounting.  The
+ * returned handles are opaque D3DKMT identities owned by the renderer. */
+bool
+vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
+                               uint64_t size,
+                               bool device_local,
+                               uint32_t *resource_handle,
+                               uint32_t *allocation_handle);
+
+void
+vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
+                              uint32_t resource_handle,
+                              uint32_t allocation_handle);
 #endif
 
 static inline VkResult
