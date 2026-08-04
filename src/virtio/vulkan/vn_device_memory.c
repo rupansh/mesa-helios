@@ -602,9 +602,17 @@ vn_AllocateMemory(VkDevice device,
     * owned by this VkDeviceMemory and receive one matching VidMm lifetime. */
    if (!mem->base.vk.import_handle_type && !import_resource_info &&
        !import_fd_info && !mem->base.vk.ahardware_buffer) {
+      const VkMemoryType *memory_type =
+         &dev->physical_device->memory_properties
+             .memoryTypes[mem->base.vk.memory_type_index];
+      const VkMemoryHeap *memory_heap =
+         &dev->physical_device->memory_properties
+             .memoryHeaps[memory_type->heapIndex];
+      const bool device_local =
+         memory_heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
       (void)vn_renderer_helios_vidmm_alloc(
-         dev->renderer, mem->base.vk.size, &mem->helios_vidmm_resource,
-         &mem->helios_vidmm_allocation);
+         dev->renderer, mem->base.vk.size, device_local,
+         &mem->helios_vidmm_resource, &mem->helios_vidmm_allocation);
    }
 #endif
 
