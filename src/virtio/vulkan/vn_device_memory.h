@@ -59,6 +59,10 @@ struct vn_device_memory {
     * and Task Manager accounting. */
    uint32_t helios_vidmm_resource;
    uint32_t helios_vidmm_allocation;
+   /* System-wide KMT share for the same tracker. Creator allocations publish
+    * it; imported allocations retain it by opening the shared resource. */
+   uint32_t helios_vidmm_global_share;
+   uint32_t helios_vidmm_cookie;
 #endif
 
    /* only valid when wsi platform is used */

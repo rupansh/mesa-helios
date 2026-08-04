@@ -45,8 +45,10 @@
 #include <wchar.h> /* wcsstr — adapter description match in helios_open_d3dkmt */
 
 #include "vn_renderer_internal.h"
+#include "vn_device.h"
 #include "vn_device_memory.h"
 #include "vn_instance.h" /* helios_venus_instance_ctx_id (instance-scoped export) */
+#include "vn_physical_device.h"
 
 #include "util/cache_ops.h"
 #include "util/u_thread.h" /* retire thread (external-sync GPU-completion signal) */
@@ -623,6 +625,9 @@ __declspec(dllexport) bool helios_venus_memory_alloc_info(VkDeviceMemory memory,
                                                           uint64_t *out_alloc_size,
                                                           uint32_t *out_memory_type_index);
 __declspec(dllexport) bool helios_venus_memory_vidmm_tracked(VkDeviceMemory memory);
+__declspec(dllexport) uint64_t helios_venus_memory_vidmm_global_identity(VkDeviceMemory memory);
+__declspec(dllexport) bool helios_venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
+                                                                  uint64_t global_identity);
 __declspec(dllexport) bool helios_venus_query_scanout(
    VkInstance instance, struct helios_venus_scanout_info *out_info);
 
@@ -689,19 +694,113 @@ helios_venus_memory_alloc_info(VkDeviceMemory memory,
    return true;
 }
 
-/* True only while this exact VkDeviceMemory owns a successfully created,
- * resident VidMm mirror. The UMD carries this attestation into the adopted
- * WDDM allocation so a missing export or any best-effort tracking failure
- * falls back to a full-size adopted charge instead of under-reporting. */
+/* Kept for old bridge DLLs, but deliberately never attest the legacy
+ * process-local lifetime. They then retain the adopted allocation's full
+ * conservative charge instead of recreating creator-exit under-reporting. */
 __declspec(dllexport) bool
 helios_venus_memory_vidmm_tracked(VkDeviceMemory memory)
 {
+   (void)memory;
+   return false;
+}
+
+/* System-wide share of the exact tracker described above. A nonzero result is
+ * stronger than the legacy boolean attestation: another process can open the
+ * same WDDM allocation and keep its one VidMm charge alive after this process
+ * releases the creator-side VkDeviceMemory. */
+__declspec(dllexport) uint64_t
+helios_venus_memory_vidmm_global_identity(VkDeviceMemory memory)
+{
    if (memory == VK_NULL_HANDLE)
+      return 0;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   return mem->helios_vidmm_resource && mem->helios_vidmm_allocation &&
+          mem->helios_vidmm_global_share && mem->helios_vidmm_cookie
+             ? ((uint64_t)mem->helios_vidmm_cookie << 32) |
+                  mem->helios_vidmm_global_share
+             : 0;
+}
+
+/* Retain a creator's shared VidMm tracker on an imported VkDeviceMemory. */
+__declspec(dllexport) bool
+helios_venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
+                                       uint64_t global_identity)
+{
+   const uint32_t global_share = (uint32_t)global_identity;
+   const uint32_t expected_cookie = (uint32_t)(global_identity >> 32);
+   if (memory == VK_NULL_HANDLE || !global_share || !expected_cookie)
       return false;
 
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
-   return mem->helios_vidmm_resource != 0 &&
-          mem->helios_vidmm_allocation != 0;
+   struct vk_device *vk_dev = mem->base.vk.base.device;
+   if (!vk_dev)
+      return false;
+   struct vn_device *dev = vn_device_from_vk(vk_dev);
+   struct helios *helios = (struct helios *)dev->renderer;
+   mtx_lock(&helios->dev_mutex);
+   const bool already_complete =
+      mem->helios_vidmm_resource && mem->helios_vidmm_allocation &&
+      mem->helios_vidmm_global_share && mem->helios_vidmm_cookie;
+   const bool already_partial =
+      mem->helios_vidmm_resource || mem->helios_vidmm_allocation ||
+      mem->helios_vidmm_global_share || mem->helios_vidmm_cookie;
+   mtx_unlock(&helios->dev_mutex);
+   if (already_complete || already_partial)
+      return already_complete;
+
+   const VkMemoryType *memory_type =
+      &dev->physical_device->memory_properties
+          .memoryTypes[mem->base.vk.memory_type_index];
+   const VkMemoryHeap *memory_heap =
+      &dev->physical_device->memory_properties
+          .memoryHeaps[memory_type->heapIndex];
+   const bool device_local =
+      memory_heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+   uint32_t resource = 0;
+   uint32_t allocation = 0;
+   uint32_t retained_share = global_share;
+   uint32_t retained_cookie = expected_cookie;
+   bool retained = vn_renderer_helios_vidmm_open_shared(
+      dev->renderer, global_share, expected_cookie, mem->base.vk.size,
+      device_local, &resource, &allocation);
+
+   /* The creator can release its last tracker reference while this process is
+    * opening the payload. Preserve accounting in that race by creating a new
+    * full-size tracker in the imported memory's actual heap. Concurrent or
+    * repeated fallback owners can conservatively over-report. */
+   if (!retained) {
+      retained = vn_renderer_helios_vidmm_alloc(
+         dev->renderer, mem->base.vk.size, device_local, &resource,
+         &allocation, &retained_share, &retained_cookie);
+      if (!retained)
+         return false;
+      helios_diag("VidMm global tracker 0x%x unavailable; created fallback 0x%x",
+                  global_share, retained_share);
+   }
+
+   /* The bridge normally calls once per freshly imported memory. Keep the
+    * install serialized anyway: a duplicate concurrent call frees its local
+    * reference instead of overwriting and leaking the winner's handles. */
+   mtx_lock(&helios->dev_mutex);
+   const bool empty = !mem->helios_vidmm_resource &&
+                      !mem->helios_vidmm_allocation &&
+                      !mem->helios_vidmm_global_share &&
+                      !mem->helios_vidmm_cookie;
+   if (empty) {
+      mem->helios_vidmm_resource = resource;
+      mem->helios_vidmm_allocation = allocation;
+      mem->helios_vidmm_global_share = retained_share;
+      mem->helios_vidmm_cookie = retained_cookie;
+   }
+   const bool complete = mem->helios_vidmm_resource &&
+                         mem->helios_vidmm_allocation &&
+                         mem->helios_vidmm_global_share &&
+                         mem->helios_vidmm_cookie;
+   mtx_unlock(&helios->dev_mutex);
+   if (!empty)
+      vn_renderer_helios_vidmm_free(dev->renderer, resource, allocation);
+   return complete;
 }
 
 __declspec(dllexport) uint32_t
@@ -2589,9 +2688,8 @@ helios_open_d3dkmt(struct helios *helios)
 }
 
 static void
-helios_vidmm_destroy_locked(struct helios *helios,
-                            D3DKMT_HANDLE resource_handle,
-                            D3DKMT_HANDLE allocation_handle)
+helios_vidmm_evict_locked(struct helios *helios,
+                          D3DKMT_HANDLE allocation_handle)
 {
    if (allocation_handle && helios->device) {
       D3DKMT_EVICT evict;
@@ -2603,12 +2701,23 @@ helios_vidmm_destroy_locked(struct helios *helios,
       if (status != 0)
          helios_diag("VidMm Evict failed status=0x%08x", (unsigned)status);
    }
+}
 
-   if (resource_handle && helios->device) {
+static void
+helios_vidmm_destroy_locked(struct helios *helios,
+                            D3DKMT_HANDLE resource_handle,
+                            D3DKMT_HANDLE allocation_handle)
+{
+   if (helios->device && (resource_handle || allocation_handle)) {
       D3DKMT_DESTROYALLOCATION destroy;
       memset(&destroy, 0, sizeof(destroy));
       destroy.hDevice = helios->device;
-      destroy.hResource = resource_handle;
+      if (resource_handle) {
+         destroy.hResource = resource_handle;
+      } else {
+         destroy.phAllocationList = &allocation_handle;
+         destroy.AllocationCount = 1;
+      }
       const NTSTATUS status = D3DKMTDestroyAllocation(&destroy);
       if (status != 0)
          helios_diag("VidMm DestroyAllocation failed status=0x%08x",
@@ -2616,18 +2725,82 @@ helios_vidmm_destroy_locked(struct helios *helios,
    }
 }
 
+enum helios_vidmm_residency {
+   HELIOS_VIDMM_NOT_ACQUIRED,
+   HELIOS_VIDMM_RESIDENT,
+   HELIOS_VIDMM_RESIDENT_WAIT_FAILED,
+};
+
+static enum helios_vidmm_residency
+helios_vidmm_make_resident_locked(struct helios *helios,
+                                  D3DKMT_HANDLE allocation,
+                                  uint64_t size)
+{
+   UINT priority = D3DDDI_ALLOCATIONPRIORITY_MAXIMUM;
+   D3DDDI_MAKERESIDENT resident;
+   memset(&resident, 0, sizeof(resident));
+   resident.hPagingQueue = helios->paging_queue;
+   resident.NumAllocations = 1;
+   resident.AllocationList = &allocation;
+   resident.PriorityList = &priority;
+   NTSTATUS st = D3DKMTMakeResident(&resident);
+   if (st != 0 && st != HELIOS_STATUS_PENDING) {
+      helios_diag("VidMm MakeResident size=%llu failed status=0x%08x",
+                  (unsigned long long)size, (unsigned)st);
+      return HELIOS_VIDMM_NOT_ACQUIRED;
+   }
+
+   if (resident.PagingFenceValue) {
+      UINT64 value = resident.PagingFenceValue;
+      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
+      memset(&wait, 0, sizeof(wait));
+      wait.hDevice = helios->device;
+      wait.ObjectCount = 1;
+      wait.ObjectHandleArray = &helios->paging_sync;
+      wait.FenceValueArray = &value;
+      st = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
+      if (st != 0) {
+         helios_diag("VidMm paging wait size=%llu failed status=0x%08x",
+                     (unsigned long long)size, (unsigned)st);
+         return HELIOS_VIDMM_RESIDENT_WAIT_FAILED;
+      }
+   }
+   return HELIOS_VIDMM_RESIDENT;
+}
+
+static uint32_t
+helios_vidmm_new_cookie(struct helios *helios)
+{
+   static volatile LONG serial;
+   LARGE_INTEGER counter;
+   QueryPerformanceCounter(&counter);
+   uint64_t mixed = (uint64_t)counter.QuadPart ^
+                    ((uint64_t)GetCurrentProcessId() << 32) ^
+                    (uintptr_t)helios ^ (uint32_t)InterlockedIncrement(&serial);
+   mixed ^= mixed >> 33;
+   mixed *= UINT64_C(0xff51afd7ed558ccd);
+   mixed ^= mixed >> 33;
+   uint32_t cookie = (uint32_t)mixed;
+   return cookie ? cookie : 1;
+}
+
 bool
 vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
                                uint64_t size,
                                bool device_local,
                                uint32_t *resource_handle,
-                               uint32_t *allocation_handle)
+                               uint32_t *allocation_handle,
+                               uint32_t *global_share,
+                               uint32_t *tracker_cookie)
 {
    struct helios *helios = (struct helios *)renderer;
-   if (!resource_handle || !allocation_handle)
+   if (!resource_handle || !allocation_handle || !global_share ||
+       !tracker_cookie)
       return false;
    *resource_handle = 0;
    *allocation_handle = 0;
+   *global_share = 0;
+   *tracker_cookie = 0;
 
    if (!size || !helios->device || !helios->ctx_id ||
        !helios->paging_queue || !helios->paging_sync)
@@ -2640,6 +2813,7 @@ vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
    private_data.version = HELIOS_WDDM_VERSION;
    private_data.ctx_id = helios->ctx_id;
    private_data.kind = HELIOS_WDDM_ALLOC_KIND_TRACKING;
+   private_data.map_cache = helios_vidmm_new_cookie(helios);
    if (!device_local)
       private_data.blob_flags = HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING;
 
@@ -2652,6 +2826,9 @@ vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
    memset(&create, 0, sizeof(create));
    create.hDevice = helios->device;
    create.Flags.CreateResource = 1;
+   /* A legacy KMT global share names one WDDM resource system-wide. Importers
+    * open this same tracker rather than creating another full-size charge. */
+   create.Flags.CreateShared = 1;
    create.Flags.AllowNotZeroed = 1;
    create.NumAllocations = 1;
    create.pAllocationInfo2 = &allocation_info;
@@ -2666,44 +2843,151 @@ vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
    }
 
    D3DKMT_HANDLE allocation = allocation_info.hAllocation;
-   UINT priority = D3DDDI_ALLOCATIONPRIORITY_MAXIMUM;
-   D3DDDI_MAKERESIDENT resident;
-   memset(&resident, 0, sizeof(resident));
-   resident.hPagingQueue = helios->paging_queue;
-   resident.NumAllocations = 1;
-   resident.AllocationList = &allocation;
-   resident.PriorityList = &priority;
-   st = D3DKMTMakeResident(&resident);
-   if (st != 0 && st != HELIOS_STATUS_PENDING) {
+   enum helios_vidmm_residency residency = HELIOS_VIDMM_NOT_ACQUIRED;
+   if (create.hResource && allocation && create.hGlobalShare)
+      residency = helios_vidmm_make_resident_locked(helios, allocation, size);
+   if (!create.hResource || !allocation || !create.hGlobalShare ||
+       residency != HELIOS_VIDMM_RESIDENT) {
+      if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
+         helios_vidmm_evict_locked(helios, allocation);
       helios_vidmm_destroy_locked(helios, create.hResource, allocation);
       mtx_unlock(&helios->dev_mutex);
-      helios_diag("VidMm MakeResident size=%llu failed status=0x%08x",
-                  (unsigned long long)size, (unsigned)st);
+      helios_diag("VidMm shared tracker invalid resource=0x%x allocation=0x%x global=0x%x",
+                  (unsigned)create.hResource, (unsigned)allocation,
+                  (unsigned)create.hGlobalShare);
       return false;
-   }
-
-   if (resident.PagingFenceValue) {
-      UINT64 value = resident.PagingFenceValue;
-      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
-      memset(&wait, 0, sizeof(wait));
-      wait.hDevice = helios->device;
-      wait.ObjectCount = 1;
-      wait.ObjectHandleArray = &helios->paging_sync;
-      wait.FenceValueArray = &value;
-      st = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
-      if (st != 0) {
-         helios_vidmm_destroy_locked(helios, create.hResource, allocation);
-         mtx_unlock(&helios->dev_mutex);
-         helios_diag("VidMm paging wait size=%llu failed status=0x%08x",
-                     (unsigned long long)size, (unsigned)st);
-         return false;
-      }
    }
 
    *resource_handle = create.hResource;
    *allocation_handle = allocation;
+   *global_share = create.hGlobalShare;
+   *tracker_cookie = private_data.map_cache;
    mtx_unlock(&helios->dev_mutex);
    return true;
+}
+
+#define HELIOS_VIDMM_PRIVATE_DATA_LIMIT (1024u * 1024u)
+
+bool
+vn_renderer_helios_vidmm_open_shared(struct vn_renderer *renderer,
+                                     uint32_t global_share,
+                                     uint32_t expected_cookie,
+                                     uint64_t expected_size,
+                                     bool expected_device_local,
+                                     uint32_t *resource_handle,
+                                     uint32_t *allocation_handle)
+{
+   struct helios *helios = (struct helios *)renderer;
+   if (!global_share || !expected_cookie || !expected_size ||
+       !resource_handle || !allocation_handle)
+      return false;
+   *resource_handle = 0;
+   *allocation_handle = 0;
+   if (!helios->device || !helios->paging_queue || !helios->paging_sync)
+      return false;
+
+   D3DKMT_QUERYRESOURCEINFO query;
+   memset(&query, 0, sizeof(query));
+   query.hDevice = helios->device;
+   query.hGlobalShare = global_share;
+
+   mtx_lock(&helios->dev_mutex);
+   NTSTATUS st = D3DKMTQueryResourceInfo(&query);
+   if (st != 0 || query.NumAllocations != 1 ||
+       query.PrivateRuntimeDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+       query.ResourcePrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+       query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
+      mtx_unlock(&helios->dev_mutex);
+      helios_diag("VidMm QueryResourceInfo global=0x%x failed status=0x%08x allocs=%u private=%u/%u/%u",
+                  global_share, (unsigned)st, query.NumAllocations,
+                  query.PrivateRuntimeDataSize,
+                  query.ResourcePrivateDriverDataSize,
+                  query.TotalPrivateDriverDataSize);
+      return false;
+   }
+
+   void *runtime_data = query.PrivateRuntimeDataSize
+                           ? calloc(1, query.PrivateRuntimeDataSize) : NULL;
+   void *resource_private = query.ResourcePrivateDriverDataSize
+                              ? calloc(1, query.ResourcePrivateDriverDataSize) : NULL;
+   void *total_private = query.TotalPrivateDriverDataSize
+                           ? calloc(1, query.TotalPrivateDriverDataSize) : NULL;
+   if ((query.PrivateRuntimeDataSize && !runtime_data) ||
+       (query.ResourcePrivateDriverDataSize && !resource_private) ||
+       (query.TotalPrivateDriverDataSize && !total_private)) {
+      free(runtime_data);
+      free(resource_private);
+      free(total_private);
+      mtx_unlock(&helios->dev_mutex);
+      return false;
+   }
+
+   if (query.PrivateRuntimeDataSize) {
+      query.pPrivateRuntimeData = runtime_data;
+      st = D3DKMTQueryResourceInfo(&query);
+      if (st != 0) {
+         free(runtime_data);
+         free(resource_private);
+         free(total_private);
+         mtx_unlock(&helios->dev_mutex);
+         helios_diag("VidMm QueryResourceInfo data global=0x%x failed status=0x%08x",
+                     global_share, (unsigned)st);
+         return false;
+      }
+   }
+
+   D3DDDI_OPENALLOCATIONINFO allocation_info;
+   memset(&allocation_info, 0, sizeof(allocation_info));
+   D3DKMT_OPENRESOURCE open;
+   memset(&open, 0, sizeof(open));
+   open.hDevice = helios->device;
+   open.hGlobalShare = global_share;
+   open.NumAllocations = 1;
+   open.pOpenAllocationInfo = &allocation_info;
+   open.pPrivateRuntimeData = runtime_data;
+   open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
+   open.pResourcePrivateDriverData = resource_private;
+   open.ResourcePrivateDriverDataSize = query.ResourcePrivateDriverDataSize;
+   open.pTotalPrivateDriverDataBuffer = total_private;
+   open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
+   st = D3DKMTOpenResource(&open);
+   D3DKMT_HANDLE allocation = allocation_info.hAllocation;
+   struct helios_wddm_alloc_private private_data;
+   memset(&private_data, 0, sizeof(private_data));
+   if (allocation_info.PrivateDriverDataSize >= sizeof(private_data) &&
+       allocation_info.pPrivateDriverData)
+      memcpy(&private_data, allocation_info.pPrivateDriverData,
+             sizeof(private_data));
+   const bool expected_nonlocal = !expected_device_local;
+   const bool tracker_matches =
+      private_data.magic == HELIOS_WDDM_MAGIC &&
+      private_data.version == HELIOS_WDDM_VERSION &&
+      private_data.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING &&
+      private_data.map_cache == expected_cookie &&
+      private_data.size == expected_size &&
+      !!(private_data.blob_flags & HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING) ==
+         expected_nonlocal;
+   enum helios_vidmm_residency residency = HELIOS_VIDMM_NOT_ACQUIRED;
+   if (st == 0 && open.hResource && allocation && tracker_matches)
+      residency = helios_vidmm_make_resident_locked(
+         helios, allocation, expected_size);
+   if (residency == HELIOS_VIDMM_RESIDENT) {
+      *resource_handle = open.hResource;
+      *allocation_handle = allocation;
+   } else {
+      if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
+         helios_vidmm_evict_locked(helios, allocation);
+      if (open.hResource || allocation)
+         helios_vidmm_destroy_locked(helios, open.hResource, allocation);
+      helios_diag("VidMm OpenResource global=0x%x failed/mismatched status=0x%08x resource=0x%x allocation=0x%x",
+                  global_share, (unsigned)st, (unsigned)open.hResource,
+                  (unsigned)allocation);
+   }
+   free(runtime_data);
+   free(resource_private);
+   free(total_private);
+   mtx_unlock(&helios->dev_mutex);
+   return *resource_handle != 0 && *allocation_handle != 0;
 }
 
 void
@@ -2716,6 +3000,7 @@ vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
       return;
 
    mtx_lock(&helios->dev_mutex);
+   helios_vidmm_evict_locked(helios, allocation_handle);
    helios_vidmm_destroy_locked(helios, resource_handle, allocation_handle);
    mtx_unlock(&helios->dev_mutex);
 }
