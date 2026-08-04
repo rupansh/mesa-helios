@@ -132,6 +132,7 @@ struct helios_unicode_string {
 #define HELIOS_WDDM_MAGIC               0x4857444Du /* 'HWDM' */
 #define HELIOS_WDDM_VERSION             1u
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
+#define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
 
 /* virtio-gpu constants the backend needs (protocol/src/virtio_gpu.rs) */
@@ -621,6 +622,7 @@ __declspec(dllexport) uint32_t helios_venus_memory_transfer_resource_ownership(V
 __declspec(dllexport) bool helios_venus_memory_alloc_info(VkDeviceMemory memory,
                                                           uint64_t *out_alloc_size,
                                                           uint32_t *out_memory_type_index);
+__declspec(dllexport) bool helios_venus_memory_vidmm_tracked(VkDeviceMemory memory);
 __declspec(dllexport) bool helios_venus_query_scanout(
    VkInstance instance, struct helios_venus_scanout_info *out_info);
 
@@ -685,6 +687,21 @@ helios_venus_memory_alloc_info(VkDeviceMemory memory,
    if (out_memory_type_index)
       *out_memory_type_index = mem->base.vk.memory_type_index;
    return true;
+}
+
+/* True only while this exact VkDeviceMemory owns a successfully created,
+ * resident VidMm mirror. The UMD carries this attestation into the adopted
+ * WDDM allocation so a missing export or any best-effort tracking failure
+ * falls back to a full-size adopted charge instead of under-reporting. */
+__declspec(dllexport) bool
+helios_venus_memory_vidmm_tracked(VkDeviceMemory memory)
+{
+   if (memory == VK_NULL_HANDLE)
+      return false;
+
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   return mem->helios_vidmm_resource != 0 &&
+          mem->helios_vidmm_allocation != 0;
 }
 
 __declspec(dllexport) uint32_t
@@ -2602,6 +2619,7 @@ helios_vidmm_destroy_locked(struct helios *helios,
 bool
 vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
                                uint64_t size,
+                               bool device_local,
                                uint32_t *resource_handle,
                                uint32_t *allocation_handle)
 {
@@ -2622,6 +2640,8 @@ vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
    private_data.version = HELIOS_WDDM_VERSION;
    private_data.ctx_id = helios->ctx_id;
    private_data.kind = HELIOS_WDDM_ALLOC_KIND_TRACKING;
+   if (!device_local)
+      private_data.blob_flags = HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING;
 
    D3DDDI_ALLOCATIONINFO2 allocation_info;
    memset(&allocation_info, 0, sizeof(allocation_info));

@@ -337,6 +337,7 @@ vn_renderer_create_helios(struct vn_instance *instance,
 bool
 vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
                                uint64_t size,
+                               bool device_local,
                                uint32_t *resource_handle,
                                uint32_t *allocation_handle);
 
