@@ -612,7 +612,8 @@ vn_AllocateMemory(VkDevice device,
          memory_heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
       (void)vn_renderer_helios_vidmm_alloc(
          dev->renderer, mem->base.vk.size, device_local,
-         &mem->helios_vidmm_resource, &mem->helios_vidmm_allocation);
+         &mem->helios_vidmm_resource, &mem->helios_vidmm_allocation,
+         &mem->helios_vidmm_global_share, &mem->helios_vidmm_cookie);
    }
 #endif
 

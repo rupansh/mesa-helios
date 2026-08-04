@@ -339,7 +339,18 @@ vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
                                uint64_t size,
                                bool device_local,
                                uint32_t *resource_handle,
-                               uint32_t *allocation_handle);
+                               uint32_t *allocation_handle,
+                               uint32_t *global_share,
+                               uint32_t *tracker_cookie);
+
+bool
+vn_renderer_helios_vidmm_open_shared(struct vn_renderer *renderer,
+                                     uint32_t global_share,
+                                     uint32_t expected_cookie,
+                                     uint64_t expected_size,
+                                     bool expected_device_local,
+                                     uint32_t *resource_handle,
+                                     uint32_t *allocation_handle);
 
 void
 vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
