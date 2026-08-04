@@ -316,9 +316,9 @@ struct wsi_win32_vehicle {
    helios_umd_wait_last_present_fn wait_present;
    helios_umd_get_present_result_fn get_result;
 
-   /* Acquire-side recycle gate: the VEHICLE device's named present fence
-    * (Global\HeliosPresentFence_<pid>_<release_fence_id> — UMD low-half id
-    * space, distinct from fence_id below), imported ONCE per chain as a
+   /* Acquire-side recycle gate: the VEHICLE device's generation-qualified
+    * named present fence (Global\HeliosPresentFence_<pid>_<start>_<release_fence_id>
+    * — UMD low-half id space, distinct from fence_id below), imported ONCE per chain as a
     * timeline semaphore at the first present that returned a result. Image
     * reuse then gates on (release_sem, per-image release_value) at ACQUIRE
     * — fully pipelined — instead of the worker-serial wait_last_present.
@@ -332,10 +332,10 @@ struct wsi_win32_vehicle {
     * GDI blits keep painting the hwnd, so content flows from frame 1. */
    bool content_bound;
 
-   /* Discriminator of this chain's named present-order fence
-    * (Global\HeliosPresentFence_<pid>_<fence_id>; ICD id space = high bit
-    * set — the UMD's own producer counter lives in another DLL and a name
-    * collision fails the second create, proven live). */
+   /* Discriminator of this chain's generation-qualified named present-order
+    * fence (Global\HeliosPresentFence_<pid>_<start>_<fence_id>; ICD id space
+    * = high bit set — the UMD's own producer counter lives in another DLL and
+    * a name collision fails the second create, proven live). */
    uint32_t fence_id;
 
    /* Stale-frame triage c1 (27th session): Present() returns SUCCESS
@@ -1004,10 +1004,18 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
     * latches the chain to the sw path. */
    {
       v->fence_id = wsi_helios_present_sync_alloc_fence_id();
+      const uint64_t producer_start =
+         wsi_helios_present_sync_process_start();
+      if (!producer_start) {
+         InterlockedIncrement(&helios_vehicle_create_fails);
+         v->state = WSI_VEHICLE_FAILED;
+         return;
+      }
       WCHAR sem_name[96];
       _snwprintf(sem_name, ARRAY_SIZE(sem_name),
-                 L"Global\\HeliosPresentFence_%lu_%u",
-                 (unsigned long)GetCurrentProcessId(), v->fence_id);
+                 L"Global\\HeliosPresentFence_%lu_%llu_%u",
+                 (unsigned long)GetCurrentProcessId(),
+                 (unsigned long long)producer_start, v->fence_id);
       const VkSemaphoreTypeCreateInfo type_info = {
          VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
          NULL,
@@ -1947,9 +1955,10 @@ wsi_win32_vehicle_latch_present_fail(struct wsi_win32_swapchain *chain)
    wsi_win32_vehicle_unbind_content(chain);
 }
 
-/* Arm the acquire-side recycle gate: import the VEHICLE device's named
- * present fence (Global\HeliosPresentFence_<pid>_<fence_id>, UMD low-half
- * id space) as a timeline semaphore, once per chain, on the present worker.
+/* Arm the acquire-side recycle gate: import the VEHICLE device's
+ * generation-qualified named present fence
+ * (Global\HeliosPresentFence_<pid>_<start>_<fence_id>, UMD low-half id space)
+ * as a timeline semaphore, once per chain, on the present worker.
  * The d5d698aaec5 import-by-name machinery (D3DKMTOpenSyncObjectNtHandle-
  * FromName) is probe-proven at LIMITED IL. Any failure latches
  * release_unavailable — the worker-serial wait fallback serves the chain,
@@ -2007,9 +2016,20 @@ wsi_win32_vehicle_arm_release_gate(struct wsi_win32_swapchain *chain,
    }
 
    WCHAR sem_name[96];
+   const uint64_t producer_start =
+      wsi_helios_present_sync_process_start();
+   if (!producer_start) {
+      wsi->DestroySemaphore(chain->base.device, sem, &chain->base.alloc);
+      helios_wsi_vehicle_diag(
+         "release-gate UNAVAILABLE chain=%p: process generation unavailable",
+         (void *)chain);
+      v->release_unavailable = true;
+      return false;
+   }
    _snwprintf(sem_name, ARRAY_SIZE(sem_name),
-              L"Global\\HeliosPresentFence_%lu_%u",
-              (unsigned long)GetCurrentProcessId(), fence_id);
+              L"Global\\HeliosPresentFence_%lu_%llu_%u",
+              (unsigned long)GetCurrentProcessId(),
+              (unsigned long long)producer_start, fence_id);
    const VkImportSemaphoreWin32HandleInfoKHR import_info = {
       VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
       NULL,

@@ -287,7 +287,7 @@ struct wsi_swapchain {
 
    /* Helios dcomp present vehicle (win32): when the backend created a
     * present-order semaphore (timeline, exported under a
-    * Global\HeliosPresentFence_<pid>_<id> kernel name), every present's
+    * Global\HeliosPresentFence_<pid>_<start>_<id> kernel name), every present's
     * pre-present submit signals value = ++next_value and stamps it into
     * wsi_image::helios_present_value. The publish of (frame resid -> pid,
     * fence id, value) pairs the vehicle's copy-time consumer wait with this
