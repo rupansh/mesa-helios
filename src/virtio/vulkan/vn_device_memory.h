@@ -53,6 +53,14 @@ struct vn_device_memory {
    bool wsi_buffer_blit_dst;
    struct list_head coherent_cached_link;
 
+#ifdef _WIN32
+   /* VidMm mirror for an ordinary, non-imported Venus allocation.  The real
+    * bytes stay renderer-owned; these handles exist only for Windows budget
+    * and Task Manager accounting. */
+   uint32_t helios_vidmm_resource;
+   uint32_t helios_vidmm_allocation;
+#endif
+
    /* only valid when wsi platform is used */
    struct vn_image *dedicated_img;
 };

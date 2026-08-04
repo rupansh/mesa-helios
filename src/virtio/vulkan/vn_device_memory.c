@@ -596,6 +596,18 @@ vn_AllocateMemory(VkDevice device,
       return vn_error(dev->instance, result);
    }
 
+#ifdef _WIN32
+   /* Imported allocations already have an owner and must not be charged as a
+    * second physical allocation.  Ordinary and exportable allocations are
+    * owned by this VkDeviceMemory and receive one matching VidMm lifetime. */
+   if (!mem->base.vk.import_handle_type && !import_resource_info &&
+       !import_fd_info && !mem->base.vk.ahardware_buffer) {
+      (void)vn_renderer_helios_vidmm_alloc(
+         dev->renderer, mem->base.vk.size, &mem->helios_vidmm_resource,
+         &mem->helios_vidmm_allocation);
+   }
+#endif
+
    *pMemory = vn_device_memory_to_handle(mem);
 
    return VK_SUCCESS;
@@ -625,6 +637,12 @@ vn_FreeMemory(VkDevice device,
       vn_ring_wait_roundtrip(dev->primary_ring, mem->bo_roundtrip_seqno);
 
    vn_device_memory_free_simple(dev, mem);
+#ifdef _WIN32
+   if (mem->helios_vidmm_allocation)
+      vn_renderer_helios_vidmm_free(dev->renderer,
+                                    mem->helios_vidmm_resource,
+                                    mem->helios_vidmm_allocation);
+#endif
    vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
 }
 

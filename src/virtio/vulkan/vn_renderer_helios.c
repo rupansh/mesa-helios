@@ -129,6 +129,11 @@ struct helios_unicode_string {
 #define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
 #define HELIOS_MAP_CACHE_WC        0x00000003u
 
+#define HELIOS_WDDM_MAGIC               0x4857444Du /* 'HWDM' */
+#define HELIOS_WDDM_VERSION             1u
+#define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
+#define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
+
 /* virtio-gpu constants the backend needs (protocol/src/virtio_gpu.rs) */
 #define VIRTIO_GPU_CAPSET_VENUS          4u
 #define VIRTIO_GPU_BLOB_MEM_HOST3D       2u
@@ -199,6 +204,19 @@ struct helios_escape_attach_resource {
    struct helios_escape_header hdr;
    uint32_t ctx_id;
    uint32_t resource_id;
+};
+
+struct helios_wddm_alloc_private {
+   uint64_t blob_id;
+   uint64_t size;
+   uint32_t magic;
+   uint32_t version;
+   uint32_t blob_mem;
+   uint32_t blob_flags;
+   uint32_t ctx_id;
+   uint32_t map_cache;
+   uint32_t kind;
+   uint32_t adopt_resource_id;
 };
 
 /* C3/M3.4 async transport: WAIT_FENCE v2 (40 bytes). `fence_id` is the WIRE
@@ -274,6 +292,8 @@ _Static_assert(sizeof(struct helios_escape_wait_fence) == 40, "wait_fence size")
 _Static_assert(sizeof(struct helios_escape_fence_event) == 40, "fence_event size");
 _Static_assert(sizeof(struct helios_escape_query_scanout) == 64, "query_scanout size");
 _Static_assert(sizeof(struct helios_venus_scanout_info) == 40, "scanout_info size");
+_Static_assert(sizeof(struct helios_wddm_alloc_private) == 48,
+               "wddm alloc private size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -441,6 +461,8 @@ struct helios {
    D3DKMT_HANDLE adapter;
    D3DKMT_HANDLE device;
    D3DKMT_HANDLE context;
+   D3DKMT_HANDLE paging_queue;
+   D3DKMT_HANDLE paging_sync;
    LUID adapter_luid;
 
    uint32_t ctx_id;
@@ -2523,6 +2545,22 @@ helios_open_d3dkmt(struct helios *helios)
    helios->device = chosen_device;
    helios->context = chosen_context;
    helios->adapter_luid = chosen_luid;
+
+   D3DKMT_CREATEPAGINGQUEUE create_queue;
+   memset(&create_queue, 0, sizeof(create_queue));
+   create_queue.hDevice = helios->device;
+   create_queue.Priority = D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL;
+   st = D3DKMTCreatePagingQueue(&create_queue);
+   if (st == 0) {
+      helios->paging_queue = create_queue.hPagingQueue;
+      helios->paging_sync = create_queue.hSyncObject;
+   } else {
+      /* Accounting is diagnostic metadata, never a reason to make Vulkan
+       * initialization fail against an older KMD/OS. */
+      helios_diag("D3DKMTCreatePagingQueue failed status=0x%08x; "
+                  "VidMm usage tracking disabled",
+                  (unsigned)st);
+   }
    /* Gate 5a bring-up breadcrumb (stderr): adapter opened by LUID. */
    fprintf(stderr, "HELIOS[gate5a]: opened Helios WDDM adapter hAdapter=0x%x luid=%08lx:%08lx\n",
            (unsigned)chosen_adapter, (unsigned long)chosen_luid.HighPart,
@@ -2531,6 +2569,135 @@ helios_open_d3dkmt(struct helios *helios)
    fprintf(stderr, "HELIOS[gate5a]: D3DKMT device=0x%x context=0x%x\n",
            (unsigned)helios->device, (unsigned)helios->context);
    return true;
+}
+
+static void
+helios_vidmm_destroy_locked(struct helios *helios,
+                            D3DKMT_HANDLE resource_handle,
+                            D3DKMT_HANDLE allocation_handle)
+{
+   if (allocation_handle && helios->device) {
+      D3DKMT_EVICT evict;
+      memset(&evict, 0, sizeof(evict));
+      evict.hDevice = helios->device;
+      evict.NumAllocations = 1;
+      evict.AllocationList = &allocation_handle;
+      const NTSTATUS status = D3DKMTEvict(&evict);
+      if (status != 0)
+         helios_diag("VidMm Evict failed status=0x%08x", (unsigned)status);
+   }
+
+   if (resource_handle && helios->device) {
+      D3DKMT_DESTROYALLOCATION destroy;
+      memset(&destroy, 0, sizeof(destroy));
+      destroy.hDevice = helios->device;
+      destroy.hResource = resource_handle;
+      const NTSTATUS status = D3DKMTDestroyAllocation(&destroy);
+      if (status != 0)
+         helios_diag("VidMm DestroyAllocation failed status=0x%08x",
+                     (unsigned)status);
+   }
+}
+
+bool
+vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
+                               uint64_t size,
+                               uint32_t *resource_handle,
+                               uint32_t *allocation_handle)
+{
+   struct helios *helios = (struct helios *)renderer;
+   if (!resource_handle || !allocation_handle)
+      return false;
+   *resource_handle = 0;
+   *allocation_handle = 0;
+
+   if (!size || !helios->device || !helios->ctx_id ||
+       !helios->paging_queue || !helios->paging_sync)
+      return false;
+
+   struct helios_wddm_alloc_private private_data;
+   memset(&private_data, 0, sizeof(private_data));
+   private_data.size = size;
+   private_data.magic = HELIOS_WDDM_MAGIC;
+   private_data.version = HELIOS_WDDM_VERSION;
+   private_data.ctx_id = helios->ctx_id;
+   private_data.kind = HELIOS_WDDM_ALLOC_KIND_TRACKING;
+
+   D3DDDI_ALLOCATIONINFO2 allocation_info;
+   memset(&allocation_info, 0, sizeof(allocation_info));
+   allocation_info.pPrivateDriverData = &private_data;
+   allocation_info.PrivateDriverDataSize = sizeof(private_data);
+
+   D3DKMT_CREATEALLOCATION create;
+   memset(&create, 0, sizeof(create));
+   create.hDevice = helios->device;
+   create.Flags.CreateResource = 1;
+   create.Flags.AllowNotZeroed = 1;
+   create.NumAllocations = 1;
+   create.pAllocationInfo2 = &allocation_info;
+
+   mtx_lock(&helios->dev_mutex);
+   NTSTATUS st = D3DKMTCreateAllocation2(&create);
+   if (st != 0) {
+      mtx_unlock(&helios->dev_mutex);
+      helios_diag("VidMm CreateAllocation2 size=%llu failed status=0x%08x",
+                  (unsigned long long)size, (unsigned)st);
+      return false;
+   }
+
+   D3DKMT_HANDLE allocation = allocation_info.hAllocation;
+   UINT priority = D3DDDI_ALLOCATIONPRIORITY_MAXIMUM;
+   D3DDDI_MAKERESIDENT resident;
+   memset(&resident, 0, sizeof(resident));
+   resident.hPagingQueue = helios->paging_queue;
+   resident.NumAllocations = 1;
+   resident.AllocationList = &allocation;
+   resident.PriorityList = &priority;
+   st = D3DKMTMakeResident(&resident);
+   if (st != 0 && st != HELIOS_STATUS_PENDING) {
+      helios_vidmm_destroy_locked(helios, create.hResource, allocation);
+      mtx_unlock(&helios->dev_mutex);
+      helios_diag("VidMm MakeResident size=%llu failed status=0x%08x",
+                  (unsigned long long)size, (unsigned)st);
+      return false;
+   }
+
+   if (resident.PagingFenceValue) {
+      UINT64 value = resident.PagingFenceValue;
+      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
+      memset(&wait, 0, sizeof(wait));
+      wait.hDevice = helios->device;
+      wait.ObjectCount = 1;
+      wait.ObjectHandleArray = &helios->paging_sync;
+      wait.FenceValueArray = &value;
+      st = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
+      if (st != 0) {
+         helios_vidmm_destroy_locked(helios, create.hResource, allocation);
+         mtx_unlock(&helios->dev_mutex);
+         helios_diag("VidMm paging wait size=%llu failed status=0x%08x",
+                     (unsigned long long)size, (unsigned)st);
+         return false;
+      }
+   }
+
+   *resource_handle = create.hResource;
+   *allocation_handle = allocation;
+   mtx_unlock(&helios->dev_mutex);
+   return true;
+}
+
+void
+vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
+                              uint32_t resource_handle,
+                              uint32_t allocation_handle)
+{
+   struct helios *helios = (struct helios *)renderer;
+   if (!resource_handle || !allocation_handle)
+      return;
+
+   mtx_lock(&helios->dev_mutex);
+   helios_vidmm_destroy_locked(helios, resource_handle, allocation_handle);
+   mtx_unlock(&helios->dev_mutex);
 }
 
 /* ── ops ───────────────────────────────────────────────────────────────────── */
@@ -3589,6 +3756,15 @@ helios_destroy(struct vn_renderer *renderer, const VkAllocationCallbacks *alloc)
       helios_calling_thread_ctx_id = 0;
 
    /* WDDM D3DKMT teardown (reverse of helios_open_d3dkmt). */
+   if (helios->paging_queue) {
+      D3DDDI_DESTROYPAGINGQUEUE destroy_queue;
+      memset(&destroy_queue, 0, sizeof(destroy_queue));
+      destroy_queue.hPagingQueue = helios->paging_queue;
+      const NTSTATUS status = D3DKMTDestroyPagingQueue(&destroy_queue);
+      if (status != 0)
+         helios_diag("D3DKMTDestroyPagingQueue failed status=0x%08x",
+                     (unsigned)status);
+   }
    if (helios->context) {
       D3DKMT_DESTROYCONTEXT dc;
       memset(&dc, 0, sizeof(dc));
