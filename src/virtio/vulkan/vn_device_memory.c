@@ -31,6 +31,25 @@ vn_helios_env_enabled(const char *name)
    return value && strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0;
 }
 
+/* True when the memory type the app allocated from advertises
+ * HOST_VISIBLE|HOST_COHERENT|HOST_CACHED. Such a type PROMISES the app cached
+ * CPU access, and because it is also COHERENT no explicit cache maintenance is
+ * owed for it — helios_bo_needs_cache_ops() exempts exactly this combination.
+ */
+static bool
+vn_device_memory_type_is_coherent_cached(const struct vn_device *dev,
+                                         const struct vn_device_memory *mem)
+{
+   const struct vk_device_memory *mem_vk = &mem->base.vk;
+   const VkMemoryType *mem_type = &dev->physical_device->memory_properties
+                                      .memoryTypes[mem_vk->memory_type_index];
+   const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+   return (mem_type->propertyFlags & want) == want;
+}
+
 static bool
 vn_device_memory_is_coherent_cached(struct vn_device *dev,
                                     struct vn_device_memory *mem)
@@ -38,17 +57,7 @@ vn_device_memory_is_coherent_cached(struct vn_device *dev,
    if (!mem->base_bo || !mem->base_bo->prefer_cached_map)
       return false;
 
-   const struct vk_device_memory *mem_vk = &mem->base.vk;
-   const VkMemoryType *mem_type = &dev->physical_device->memory_properties
-                                      .memoryTypes[mem_vk->memory_type_index];
-   const VkMemoryPropertyFlags flags = mem_type->propertyFlags;
-
-   return (flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                    VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) ==
-          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-           VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+   return vn_device_memory_type_is_coherent_cached(dev, mem);
 }
 
 static void
@@ -699,7 +708,34 @@ vn_MapMemory2(VkDevice device,
          return vn_error(dev->instance, result);
    }
 
-   mem->base_bo->prefer_cached_map = mem->wsi_buffer_blit_dst;
+   /* A memory type that advertises HOST_CACHED must actually be mapped cached.
+    * An app picks that type precisely to get fast CPU reads — DXVK does so for
+    * every D3D11_USAGE_STAGING resource (d3d11_texture.cpp:1015) — and a WC
+    * mapping silently breaks the promise, because an ordinary memcpy out of WC
+    * memory is uncached and crawls.
+    *
+    * Measured, not assumed. In an RDP session the desktop-capture consumer
+    * (RDPIDD, hosted in WUDFHost) runs CopyResource -> Map(READ) -> memcpy over
+    * a 1920x1080 BGRA frame. tools/d3d11_rdp_capture_probe.cpp on that exact
+    * resource desc, before this change:
+    *
+    *   memcpy from the WC mapping     25.209 ms     313.8 MB/s
+    *   MOVNTDQA from the same pages    0.839 ms    9428.1 MB/s   <- WC signature
+    *   memcpy, ordinary cached heap    0.202 ms   39081.8 MB/s
+    *
+    * ~25 ms of pure CPU per captured frame: it saturated a core and capped RDP
+    * capture near 40 fps, which is what made the desktop lag whenever anything
+    * on it was actually changing.
+    *
+    * The host already reports CACHED for these types; it was this override that
+    * forced WC, since effective_map_cache() honours the ICD's request over the
+    * host's. Cache maintenance stays free: the type is COHERENT, so guest WB
+    * over host WB is hardware-coherent under KVM and helios_bo_needs_cache_ops()
+    * returns false for exactly this flag combination.
+    */
+   mem->base_bo->prefer_cached_map =
+      mem->wsi_buffer_blit_dst ||
+      vn_device_memory_type_is_coherent_cached(dev, mem);
 
    if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
       const VkMemoryMapPlacedInfoEXT *placed_info = vk_find_struct_const(
