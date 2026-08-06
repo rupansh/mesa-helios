@@ -324,14 +324,19 @@ struct helios_bo {
 #define HELIOS_SYNC_PENDING_MAX 256
 #define HELIOS_WAIT_FENCE_STACK_MAX 256
 
-/* One helios_venus_queue_gpu_fence cache slot per venus per-queue host
- * timeline. MUST stay >= helios_init_renderer_info's info->max_timeline_count
- * (64), because that value is the upper bound vn_instance_acquire_ring_idx
- * hands out (vn_instance.h:106) — a ring_idx at or above this bound is
- * refused rather than aliased onto slot 0. 64 also stays inside the KMD's
- * `ring_idx.min(u8::MAX) as u8` truncation (`enqueue_submit_inner`, kmd_render gpu/mod.rs:3523), so a
- * value that passes the bound check reaches the wire unchanged. */
-#define HELIOS_QUEUE_GPU_FENCE_SLOTS 64
+/* Upper bound on the venus ring_idx helios_venus_queue_gpu_fence will put on
+ * the wire. It is EQUAL to helios_init_renderer_info's info->max_timeline_count
+ * (64), which is the bound vn_instance_acquire_ring_idx enforces
+ * (vn_instance.h:106) — so a ring_idx at or above this is not a live timeline
+ * and is refused rather than submitted. 64 also stays inside the KMD's
+ * `ring_idx.min(u8::MAX as u32) as u8` truncation (`enqueue_submit_inner`,
+ * kmd_render gpu/mod.rs:3541), so a value that passes the bound check reaches
+ * the wire unchanged.
+ *
+ * ⚠ This used to be `_SLOTS` and size a per-ring fence cache on `struct
+ * helios`. That cache was deleted (see helios_venus_queue_gpu_fence): its key
+ * could never match. The BOUND is the part that was load-bearing. */
+#define HELIOS_QUEUE_GPU_FENCE_RING_LIMIT 64
 
 struct helios_sync_pending {
    uint64_t val;
@@ -487,25 +492,14 @@ struct helios {
    uint32_t ctx_id;
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
 
-   /* helios_venus_queue_gpu_fence's per-timeline cache, indexed by the venus
-    * ring_idx, written and read under dev_mutex (the same lock the submit it
-    * feeds already needs).
+   /* Reused D3DKMTEscape staging for helios_ioctl_submit_cs. dev_mutex
+    * serializes every ops.submit, and the thunk consumes the private buffer
+    * synchronously before returning.
     *
-    * WHY HERE AND NOT ON struct vn_queue: ring_idx is allocated from a
-    * per-INSTANCE mask (vn_instance_acquire_ring_idx, vn_instance.h:101-116)
-    * and the ring seqno namespace is the per-instance primary ring
-    * (vn_device.c:513 — dev->primary_ring is always instance->ring.ring, never
-    * a TLS ring), while `struct helios` is exactly one per instance. So
-    * ring_idx is a collision-free key here, this needs no venus-core struct
-    * change, and it inherits the mutex instead of introducing a second one. */
-   struct {
-      /* Guest ring seqno this slot's fence was ordered behind. */
-      uint32_t ring_seqno;
-      bool valid;
-      uint64_t wire_fence_id;
-   } queue_gpu_fence[HELIOS_QUEUE_GPU_FENCE_SLOTS];
-   /* Reused D3DKMTEscape staging. dev_mutex serializes every submit, and the
-    * thunk consumes the private buffer synchronously before returning. */
+    * ⚠ THIS BUFFER IS THE REASON helios_ioctl_submit_cs REQUIRES THE MUTEX —
+    * not any wire ordering. helios_venus_queue_gpu_fence deliberately does NOT
+    * use it (it stages ~104 bytes on its own stack) precisely so it can issue
+    * its escape with dev_mutex dropped; see the argument there. */
    uint8_t *submit_buf;
    size_t submit_buf_capacity;
 
@@ -1344,9 +1338,18 @@ helios_ioctl(struct helios *helios,
 /* One D3DKMTEscape round-trip carrying a Helios escape struct as adapter-scoped
  * driver-private data. The escape buffer is in/out: the KMD's DxgkDdiEscape
  * validates the helios_escape_header and writes any out-fields (e.g. out_ctx_id)
- * back into the same buffer, which the runtime reflects to user mode. Caller
- * MUST hold dev_mutex (except WAIT_FENCE — see helios_escape_no_hw). Returns
+ * back into the same buffer, which the runtime reflects to user mode. Returns
  * false on a D3DKMT failure.
+ *
+ * LOCKING. helios_escape_ex itself needs no lock: it reads only
+ * helios->{adapter,device,context}, written at renderer create. Callers that
+ * stage into helios->submit_buf, or that mutate renderer state across the
+ * round-trip, hold dev_mutex for THAT reason. The callers which stage on their
+ * own stack take no lock — helios_wait_fence_blocking, helios_escape_fence_event
+ * and helios_submit_gpu_fence_cs.
+ * ⚠ This used to read "Caller MUST hold dev_mutex (except WAIT_FENCE — see
+ * helios_escape_no_hw)". There has never been a helios_escape_no_hw in this
+ * file, and by then two callers already took no lock.
  *
  * `hardware_access` maps to D3DDDI_ESCAPEFLAGS.HardwareAccess. HardwareAccess=1
  * escapes serialize EXCLUSIVELY on the dxgkrnl adapter lock — that is the lock
@@ -1800,14 +1803,23 @@ helios_qgf_should_log(uint32_t n)
  * invisible to the gate scripts. The ICD has no registry-counter channel and
  * inventing one (a new escape) for a refusal path would dwarf the export.
  *
- * What IS observable adapter-side is the SUCCESS path: every fence issued here
- * is a SUBMIT_VENUS with ring_idx != 0, so it increments the KMD's
- * RING_SUBMIT_COUNT (gpu/mod.rs:3541-3542). ⚠ That reading is CONFOUNDED — the
- * KMD's own scanout/windowed-BLT copies use SCANOUT_RING_IDX = 1
- * (gpu/mod.rs:406) and land in the same counter. Attributing ring>=1 traffic to
- * this export requires differencing against an otherwise identical run with the
- * caller's boundary disabled (its gpu_wire_fence == 0 arm), not a single
- * before/after read. */
+ * What IS observable adapter-side is the SUCCESS path, and it has TWO readings.
+ * The better one is `EscSubRing` (ESCAPE_SUBMIT_RING_COUNT, kmd_render
+ * virtio/ctrl.rs:1447-1449): it is incremented only on the escape path, so it
+ * is guest-originated by construction, unlike the adapter-wide
+ * RING_SUBMIT_COUNT/`RngSub` (gpu/mod.rs:3560) which three internal KMD
+ * producers also reach (scanout/windowed-BLT copies use SCANOUT_RING_IDX = 1,
+ * gpu/mod.rs:409).
+ * ⚠ `EscSubRing` is still not specific to THIS export — venus's own external
+ * semaphore-signal batches (vn_queue.c:1719-1734, vn_queue.c:3018-3033) are
+ * ring>=1 escapes too — so attributing a delta to this export requires
+ * differencing against an otherwise identical run with the caller's boundary
+ * disabled (its gpu_wire_fence == 0 arm), not a single before/after read.
+ *
+ * ⚠ `helios_qgf_issued` HAD NO SINK AT ALL until the decayed success log below
+ * was added: it was incremented and never printed, i.e. it was not an
+ * instrument. The comment above claimed the diag log was the sink for all of
+ * these; that was true only of the refusal counters. */
 static uint32_t helios_qgf_refused_args;
 static uint32_t helios_qgf_refused_object;
 static uint32_t helios_qgf_refused_ring0;
@@ -1816,7 +1828,113 @@ static uint32_t helios_qgf_refused_encode;
 static uint32_t helios_qgf_refused_submit;
 static uint32_t helios_qgf_refused_unassigned;
 static uint32_t helios_qgf_issued;
-static uint32_t helios_qgf_cache_hits;
+
+/* Bound on the barrier cs. One vkWaitRingSeqnoMESA encodes far inside this;
+ * it sizes BOTH the encoder's local buffer and the escape's stack staging, so
+ * the two cannot drift apart. */
+#define HELIOS_QGF_CS_MAX_BYTES 64u
+
+/* Inbound fence_id for the barrier submit — see helios_submit_gpu_fence_cs. */
+#define HELIOS_QGF_FENCE_SENTINEL UINT64_MAX
+
+/* The wire-fence submit for the export below: ONE SUBMIT_VENUS escape staged
+ * entirely on the STACK, so it needs no lock.
+ *
+ * ⛔ WHY NOT helios_ioctl_submit_cs. That function stages into the SHARED
+ * helios->submit_buf and bumps the shared helios->next_fence_id, so its
+ * contract is "caller holds dev_mutex" — and dev_mutex serialises EVERY venus
+ * submit in the process. Holding it across this escape is defect A3
+ * (docs/dx12/PENDING.md §1): on backpressure the KMD retries the enqueue in
+ * 1 ms slices for up to ENQUEUE_RETRY_MAX_MS = 5_000 ms
+ * (kmd_render/src/virtio/ctrl.rs:100, :1414-1464) before it will even report
+ * QueueFull, and QueueFull is reachable at frame rate — CTRL_QUEUE_SIZE = 64
+ * descriptors (gpu/mod.rs:83) with >= 2 per chain, while every fence minted
+ * here stays in flight until host GPU COMPLETION by design. The symptom is a
+ * process-wide venus stall and no error anywhere.
+ *
+ * WHAT dev_mutex ACTUALLY PROTECTS ON THE SUBMIT PATH, item by item, because
+ * "(ordering)" in helios_ioctl_submit_cs's header is too vague to reason from:
+ *   1. helios->submit_buf / submit_buf_capacity — reused, realloc'd staging.
+ *      Not touched here: this stages on the stack.
+ *   2. helios->next_fence_id — `++`. Not touched here: see the sentinel below.
+ *   3. helios->{adapter,device,context,ctx_id} read by helios_escape_ex.
+ *      Written at renderer create and by the init-time probe path
+ *      (helios_probe_* — before any VkQueue exists); never on a live device.
+ *      Their lifetime here is the CALLER's: umd12 holds the vkd3d
+ *      ID3D12CommandQueue, hence the VkDevice, hence the VkInstance and its
+ *      one `struct helios`, live across this call.
+ *   4. Wire ORDER between this escape and any other SUBMIT_VENUS. NOT a
+ *      requirement, and the barrier is why: the cs is a vkWaitRingSeqnoMESA
+ *      that makes the host's ctx dispatch thread consume the guest ring up to
+ *      `ring_seqno` BEFORE the fence attaches to the VkQueue. Whatever else is
+ *      queued ahead of or behind us on that ctx cannot shrink the set covered
+ *      by our seqno. Reordering can only ever make a fence cover MORE.
+ *   5. Nothing about the seqno read. The venus ring is written under
+ *      ring->mutex (vn_ring.c:493, :879, :926), never dev_mutex — so holding
+ *      dev_mutex across the read never ordered us against a ring writer
+ *      either.
+ *
+ * PRECEDENT, not novelty: helios_wait_fence_blocking and
+ * helios_escape_fence_event already issue stack-staged escapes with no
+ * dev_mutex, from arbitrary threads, concurrently with ops.submit.
+ *
+ * ⭐ LEGACY-KMD DETECTION IS EXACT HERE. The KMD ignores the inbound fence_id
+ * whenever present_value32 == 0 (`escape_submit_venus`, kmd_render
+ * ddi/escape.rs:1228-1259) and always writes its assigned wire fence back on
+ * the success path, so an UNCHANGED sentinel means "this KMD assigned no wire
+ * fence". UINT64_MAX is unreachable as a real id: they are
+ * `1 + instance*2^32 + k` (NEXT_WIRE_FENCE_BASE = 1, WIRE_FENCE_INSTANCE_STRIDE
+ * = 1 << 32 — gpu/mod.rs:1377, :1388), so aliasing needs 2^32 transport inits
+ * AND 2^32 fences inside one of them. This replaces a comparison against
+ * helios->next_fence_id which needed the mutex, could false-refuse on numeric
+ * aliasing, and — the point — read shared state.
+ *
+ * Returns whether the ESCAPE itself succeeded. *out_fence_id receives whatever
+ * the KMD left in the header — which is still HELIOS_QGF_FENCE_SENTINEL if it
+ * assigned nothing, and 0 if the escape failed. Keeping the raw value is what
+ * lets the caller keep "escape failed" and "no wire fence assigned" in separate
+ * counters instead of collapsing them. */
+static bool
+helios_submit_gpu_fence_cs(struct helios *helios,
+                           const void *cs_data,
+                           uint32_t cs_size,
+                           uint32_t ring_idx,
+                           uint64_t *out_fence_id)
+{
+   *out_fence_id = 0;
+   if (cs_size == 0 || cs_size > HELIOS_QGF_CS_MAX_BYTES)
+      return false;
+
+   struct helios_escape_submit_venus hdr = { 0 };
+   helios_hdr_init(&hdr.hdr, HELIOS_ESCAPE_SUBMIT_VENUS, sizeof(hdr));
+   hdr.fence_id = HELIOS_QGF_FENCE_SENTINEL;
+   hdr.ctx_id = helios->ctx_id;
+   hdr.buffer_size = cs_size;
+   hdr.ring_idx = ring_idx;
+   hdr.present_value32 = 0; /* untagged: the KMD ignores the inbound fence_id */
+
+   /* header + barrier cs, contiguous. Over D3DKMTEscape the venus stream rides
+    * INSIDE the escape buffer directly after the fixed header (the KMD reads it
+    * at buf[sizeof(hdr)..]); there is no IN_DIRECT side buffer. */
+   uint8_t buf[sizeof(struct helios_escape_submit_venus) +
+               HELIOS_QGF_CS_MAX_BYTES];
+   memcpy(buf, &hdr, sizeof(hdr));
+   memcpy(buf + sizeof(hdr), cs_data, cs_size);
+
+   const bool ok = helios_escape(helios, buf, (uint32_t)(sizeof(hdr) + cs_size));
+   if (ok) {
+      struct helios_escape_submit_venus out;
+      memcpy(&out, buf, sizeof(out));
+      *out_fence_id = out.fence_id;
+   }
+
+   /* Traced AFTER the escape, unlike helios_ioctl_submit_cs, so the line
+    * carries the ASSIGNED id and correlates with the KMD's wire fence. A failed
+    * escape traces fence=0; a KMD that assigned nothing traces the sentinel,
+    * which is itself the recognisable signature of that case. */
+   helios_trace_submit(helios, cs_data, cs_size, ring_idx, *out_fence_id);
+   return ok;
+}
 
 /* Mint a wire fence that retires at host GPU COMPLETION of everything so far
  * submitted to `queue`, and hand back its id so a caller can order a WDDM DMA
@@ -1826,7 +1944,7 @@ static uint32_t helios_qgf_cache_hits;
  * WHY THIS HAS TO EXIST — a ring-0 wire fence is not a GPU boundary, and for
  * vkd3d's D3D12 traffic it is not even a venus-decode boundary:
  *   - The KMD sets VIRTIO_GPU_FLAG_INFO_RING_IDX only for ring_idx != 0
- *     (`enqueue_submit_inner`, kmd_render gpu/mod.rs:3521-3524), so a ring-0
+ *     (`enqueue_submit_inner`, kmd_render gpu/mod.rs:3539-3542), so a ring-0
  *     submit takes QEMU's LEGACY fence branch (qemu-helios
  *     hw/display/virtio-gpu-virgl.c:1186) —
  *     virgl_renderer_create_fence, which IGNORES ctx_id and routes to
@@ -1851,6 +1969,15 @@ static uint32_t helios_qgf_cache_hits;
  * covers less than the caller believes. Reading a LARGER seqno is harmless
  * (it only over-orders); reading a stale smaller one is the correctness
  * hazard, and only the caller's own ordering prevents it.
+ *
+ * COST, STATED PLAINLY: one SUBMIT_VENUS escape and one wire fence PER CALL.
+ * There is no cache and no coalescing — see the argument at the submit below.
+ * At 3 queues × 2 ExecuteCommandLists × 200 fps that is ~1200 in-flight-until-
+ * GPU-completion fences per second, which is the pressure `PENDING.md` §4 names
+ * as "per-fence completion unbatched at ~1800/s". If that becomes the limit, the
+ * lever is rate-limiting in the CALLER (one boundary per frame) or a wider
+ * descriptor budget in the KMD — not a seqno-keyed cache here, which cannot be
+ * made sound.
  *
  * Every refusal returns false without touching the wire. *out_wire_fence is
  * always written (0 on failure) and 0 is a legal "no boundary" value for the
@@ -1947,13 +2074,13 @@ helios_venus_queue_gpu_fence(VkQueue queue, uint64_t *out_wire_fence)
     * not an assert(), because assert() is compiled out of the shipping ICD and
     * assurance that vanishes in release is not assurance. */
    const uint32_t ring_idx = vnq->ring_idx;
-   if (ring_idx == 0 || ring_idx >= HELIOS_QUEUE_GPU_FENCE_SLOTS) {
+   if (ring_idx == 0 || ring_idx >= HELIOS_QUEUE_GPU_FENCE_RING_LIMIT) {
       const uint32_t n = p_atomic_inc_return(&helios_qgf_refused_ring0);
       if (helios_qgf_should_log(n))
          helios_diag("queue_gpu_fence refused: ring_idx=%u out of range "
                      "[1,%u) — a ring-0 fence would be a DECODE boundary and "
                      "an unbound ring would wedge the WDDM FIFO (x%u)",
-                     ring_idx, (unsigned)HELIOS_QUEUE_GPU_FENCE_SLOTS, n);
+                     ring_idx, (unsigned)HELIOS_QUEUE_GPU_FENCE_RING_LIMIT, n);
       return false;
    }
 
@@ -1981,10 +2108,10 @@ helios_venus_queue_gpu_fence(VkQueue queue, uint64_t *out_wire_fence)
       return false;
    }
 
-   /* A NON-EMPTY cs is MANDATORY. helios_ioctl_submit_cs rejects cs_size == 0
-    * and helios_submit skips the escape entirely for an empty batch, so an
-    * empty cs yields NO wire fence at all — the caller would get success with
-    * a zero id.
+   /* A NON-EMPTY cs is MANDATORY. helios_submit_gpu_fence_cs refuses cs_size
+    * == 0, and the KMD's escape handler refuses a zero payload too
+    * (`escape_submit_venus`, kmd_render ddi/escape.rs:1224-1226), so an empty
+    * cs yields NO wire fence at all.
     *
     * vkWaitRingSeqnoMESA is not filler. Our cs is decoded on the host's
     * CONTEXT dispatch thread while the guest's vkQueueSubmit sits in the
@@ -1996,7 +2123,7 @@ helios_venus_queue_gpu_fence(VkQueue queue, uint64_t *out_wire_fence)
     * waiting, which is what makes the barrier safe against the suppressed
     * doorbell above: it wakes the very ring it is about to wait on, so a
     * parked ring cannot deadlock the wait. */
-   uint32_t local_data[16];
+   uint32_t local_data[HELIOS_QGF_CS_MAX_BYTES / sizeof(uint32_t)];
    struct vn_cs_encoder local_enc =
       VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
    vn_encode_vkWaitRingSeqnoMESA(&local_enc, 0,
@@ -2013,82 +2140,67 @@ helios_venus_queue_gpu_fence(VkQueue queue, uint64_t *out_wire_fence)
       return false;
    }
 
-   /* dev_mutex is mtx_plain — NON-RECURSIVE (see its declaration). This is the
-    * only lock taken here and it is taken exactly once, so this function must
-    * never be called from anything already holding it.
+   /* ⛔ NO LOCK IS TAKEN FROM HERE ON, and NO FENCE IS CACHED. Both are
+    * deliberate; the full argument is on helios_submit_gpu_fence_cs.
     *
-    * ⚠ WHY THIS BYPASSES THE ops VTABLE: helios_submit DISCARDS the KMD's
-    * assigned wire fence id unless the batch carries a vn_renderer_sync to
-    * record it against, and there is no sync here — the fence id IS the
-    * product. helios_ioctl_submit_cs's *out_fence_id is the only way to get
-    * it, and its contract is that the caller already holds dev_mutex. */
-   mtx_lock(&helios->dev_mutex);
-
-   /* Cache hit: the ring has not advanced since this timeline's last fence, so
-    * no new work can have reached the queue — work reaches a VkQueue only
-    * through this ring — and the previous fence already covers everything.
-    * Returning it is exact, not an approximation. An already-RETIRED previous
-    * fence is equally fine: the KMD's watermark check (`note_wddm_submission`,
-    * gpu/mod.rs:5675-5686) accepts any id below next_wire_fence, and "already
-    * complete" is the truthful answer for work that has already finished.
-    * Without this a
-    * submit-once-then-wait queue would mint a fence per ExecuteCommandLists
-    * forever. */
-   if (helios->queue_gpu_fence[ring_idx].valid &&
-       helios->queue_gpu_fence[ring_idx].ring_seqno == ring_seqno) {
-      *out_wire_fence = helios->queue_gpu_fence[ring_idx].wire_fence_id;
-      mtx_unlock(&helios->dev_mutex);
-      (void)p_atomic_inc_return(&helios_qgf_cache_hits);
-      return true;
-   }
-
+    * WHY THERE IS NO CACHE (defect A2, docs/dx12/PENDING.md §1). A per-timeline
+    * cache keyed on `ring_seqno` used to live here, justified as sparing a
+    * "submit-once-then-wait queue" a fence per ExecuteCommandLists. It could
+    * never hit, and the key is why:
+    *   - vn_ring_current_seqno returns the ring's shared TAIL (vn_ring.c:373-383)
+    *     — a byte counter for the whole per-instance primary ring.
+    *   - vkd3d_release_vk_queue issues a REAL vkQueueSubmit2 (one
+    *     signalSemaphoreInfo, no command buffers — vkd3d-proton-helios
+    *     libs/vkd3d/command.c:25591-25620) immediately AFTER the UMD samples
+    *     this fence. Its cs is encoded into that same ring, advancing the tail.
+    *   ⇒ ECL N+1 always reads a larger seqno than ECL N cached. Zero hits, ever.
+    * ⛔ And the key cannot be made tolerant soundly. The tail is RING-GLOBAL, so
+    * "advanced by only the release's empty batch" is indistinguishable from
+    * "advanced by another VkQueue's real work on the same ring": accepting a
+    * near-miss would return a fence that UNDER-orders, the one hazard this
+    * export exists to prevent. The sound key would be a per-VkQueue submission
+    * count, and venus core has none (struct vn_queue, vn_queue.h) — adding one
+    * is a venus-core change, not an ICD-renderer change.
+    * ⚠ Deleting it also removes a LATENT bug: ring_idx is recycled
+    * (vn_instance_release_ring_idx, vn_instance.h:118-127) and nothing
+    * invalidated the slot, so a hit condition that ever started working would
+    * hand out a fence minted on a destroyed queue's timeline. */
    uint64_t fence_id = 0;
-   const bool ok = helios_ioctl_submit_cs(helios, local_data, cs_size, ring_idx,
-                                          0 /* present_cookie */,
-                                          0 /* present_value32 */, &fence_id);
-   /* ⚠ Against a LEGACY synchronous KMD that does not write the assigned wire
-    * fence back into the escape header, helios_ioctl_submit_cs returns its own
-    * guest-local id (helios->next_fence_id) instead. That id means nothing to
-    * the KMD, and because NEXT_WIRE_FENCE_BASE starts at 1
-    * (`NEXT_WIRE_FENCE_BASE`, gpu/mod.rs:1377) a small local id can still slip
-    * past the KMD's
-    * `gpu_fence_id < next_wire_fence` validation and be treated as an
-    * already-retired boundary — fake success, exactly what must not happen
-    * here. It is detectable at zero cost while we still hold the mutex:
-    * helios_ioctl_submit_cs assigns local ids as `++helios->next_fence_id`, so
-    * an unmodified return equals the counter's current value. Refuse then. The
-    * converse aliasing (a genuine wire fence numerically equal to the local
-    * counter) costs one spurious refusal on an early submit, which is the safe
-    * direction. */
-   const bool kmd_assigned = fence_id != helios->next_fence_id;
-   if (ok && fence_id && kmd_assigned) {
-      helios->queue_gpu_fence[ring_idx].ring_seqno = ring_seqno;
-      helios->queue_gpu_fence[ring_idx].wire_fence_id = fence_id;
-      helios->queue_gpu_fence[ring_idx].valid = true;
-   }
-   mtx_unlock(&helios->dev_mutex);
-
-   if (!ok || !fence_id) {
+   if (!helios_submit_gpu_fence_cs(helios, local_data, (uint32_t)cs_size,
+                                   ring_idx, &fence_id)) {
       const uint32_t n = p_atomic_inc_return(&helios_qgf_refused_submit);
       if (helios_qgf_should_log(n))
-         helios_diag("queue_gpu_fence refused: SUBMIT_VENUS ring_idx=%u "
-                     "seqno=%u failed (ok=%u fence=%llu) (x%u)",
-                     ring_idx, ring_seqno, ok ? 1u : 0u,
-                     (unsigned long long)fence_id, n);
+         helios_diag("queue_gpu_fence refused: SUBMIT_VENUS escape failed "
+                     "ring_idx=%u seqno=%u (x%u)",
+                     ring_idx, ring_seqno, n);
       return false;
    }
-   if (!kmd_assigned) {
+   if (fence_id == HELIOS_QGF_FENCE_SENTINEL || !fence_id) {
+      /* The escape succeeded but the KMD wrote no wire fence back — a legacy
+       * synchronous KMD. ⚠ It must NOT be papered over with a guest-local id:
+       * a small local id can slip past the KMD's
+       * `gpu_fence_id < next_wire_fence` validation and read as an
+       * already-retired boundary — fake success, the one outcome this export
+       * must never produce. Refuse instead; the caller's zero arm absorbs it. */
       const uint32_t n = p_atomic_inc_return(&helios_qgf_refused_unassigned);
       if (helios_qgf_should_log(n))
-         helios_diag("queue_gpu_fence refused: fence id %llu is the ICD's "
-                     "LOCAL id — this KMD did not assign a wire fence, so it "
-                     "is not a GPU boundary (x%u)",
-                     (unsigned long long)fence_id, n);
+         helios_diag("queue_gpu_fence refused: this KMD assigned no wire fence "
+                     "(header came back %s) — not a GPU boundary (x%u)",
+                     fence_id ? "unchanged" : "zeroed", n);
       return false;
    }
 
    *out_wire_fence = fence_id;
-   (void)p_atomic_inc_return(&helios_qgf_issued);
+   const uint32_t issued = p_atomic_inc_return(&helios_qgf_issued);
+   /* The ONLY sink for helios_qgf_issued. Power-of-two decayed like every other
+    * line here, so the cost is ~log2(N) lines for the WHOLE process — ~17 for a
+    * minute at 1200 fences/s, then one more per doubling — and it prints the id
+    * so a boundary can be correlated with the KMD's wire fence and with
+    * helios_icd_submit.log. ⚠ Being a decayed log and not an accumulator, the
+    * last line's `(xN)` is the count; do not read line COUNT as fence count. */
+   if (helios_qgf_should_log(issued))
+      helios_diag("queue_gpu_fence issued: ring_idx=%u seqno=%u fence=%llu (x%u)",
+                  ring_idx, ring_seqno, (unsigned long long)fence_id, issued);
    return true;
 }
 
