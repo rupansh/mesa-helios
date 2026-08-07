@@ -51,6 +51,9 @@ struct vn_renderer_info {
       uint16_t device_id;
 
       bool has_bus_info;
+      /* A renderer-side PCI address describes the host GPU and must not be
+       * exposed when the transport has its own guest-visible topology. */
+      bool hide_renderer_bus_info;
       VkPhysicalDevicePCIBusInfoPropertiesEXT props;
    } pci;
 

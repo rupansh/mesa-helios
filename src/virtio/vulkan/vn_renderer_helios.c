@@ -526,6 +526,8 @@ struct helios {
    D3DKMT_HANDLE paging_queue;
    D3DKMT_HANDLE paging_sync;
    LUID adapter_luid;
+   bool has_adapter_address;
+   D3DKMT_ADAPTERADDRESS adapter_address;
 
    uint32_t ctx_id;
    uint64_t next_fence_id; /* monotonic, under dev_mutex */
@@ -2721,6 +2723,39 @@ helios_open_d3dkmt(struct helios *helios)
    helios->context = chosen_context;
    helios->adapter_luid = chosen_luid;
 
+   /* A renderer physical device reports the host GPU's PCI address.  That
+    * address is not part of the guest topology and cannot be used to match
+    * this Vulkan device with the WDDM adapter.  Query the guest address from
+    * Dxgkrnl so VK_EXT_pci_bus_info (and OpenCL implementations layered on
+    * Vulkan) identify the same adapter as DXGI.  Render-only adapters use the
+    * WDDM 2.4 query; retain the legacy query as a compatibility fallback. */
+   const KMTQUERYADAPTERINFOTYPE address_types[] = {
+      KMTQAITYPE_ADAPTERADDRESS_RENDER,
+      KMTQAITYPE_ADAPTERADDRESS,
+   };
+   for (uint32_t i = 0; i < ARRAY_SIZE(address_types); i++) {
+      D3DKMT_ADAPTERADDRESS address;
+      memset(&address, 0, sizeof(address));
+      D3DKMT_QUERYADAPTERINFO address_query;
+      memset(&address_query, 0, sizeof(address_query));
+      address_query.hAdapter = chosen_adapter;
+      address_query.Type = address_types[i];
+      address_query.pPrivateDriverData = &address;
+      address_query.PrivateDriverDataSize = sizeof(address);
+      st = D3DKMTQueryAdapterInfo(&address_query);
+      helios_diag("adapter address query type=%u status=0x%08x",
+                  (unsigned)address_types[i], (unsigned)st);
+      if (st == 0) {
+         helios->adapter_address = address;
+         helios->has_adapter_address = true;
+         helios_diag("guest adapter PCI address 0000:%02x:%02x.%u",
+                     (unsigned)address.BusNumber,
+                     (unsigned)address.DeviceNumber,
+                     (unsigned)address.FunctionNumber);
+         break;
+      }
+   }
+
    D3DKMT_CREATEPAGINGQUEUE create_queue;
    memset(&create_queue, 0, sizeof(create_queue));
    create_queue.hDevice = helios->device;
@@ -4454,7 +4489,21 @@ helios_init_renderer_info(struct helios *helios)
 
    info->pci.vendor_id = 0x1af4;
    info->pci.device_id = 0x1050;
-   info->pci.has_bus_info = false;
+   /* Never fall back to the renderer's host PCI address.  Use the WDDM
+    * adapter address when Dxgkrnl supplied it; otherwise hide the extension
+    * because no address is more truthful than leaking an unrelated host BDF. */
+   info->pci.hide_renderer_bus_info = true;
+   info->pci.has_bus_info = helios->has_adapter_address;
+   if (helios->has_adapter_address) {
+      info->pci.props = (VkPhysicalDevicePCIBusInfoPropertiesEXT){
+         .sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT,
+         .pciDomain = 0,
+         .pciBus = helios->adapter_address.BusNumber,
+         .pciDevice = helios->adapter_address.DeviceNumber,
+         .pciFunction = helios->adapter_address.FunctionNumber,
+      };
+   }
 
    /* Report the guest WDDM adapter's LUID as VkPhysicalDeviceIDProperties::
     * deviceLUID, exactly as a native Windows Vulkan driver does. helios->adapter_luid

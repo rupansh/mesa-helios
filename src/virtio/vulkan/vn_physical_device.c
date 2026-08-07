@@ -1372,7 +1372,8 @@ vn_physical_device_get_native_extensions(
     */
    exts->EXT_pci_bus_info =
       physical_dev->instance->renderer->info.pci.has_bus_info ||
-      renderer_exts->EXT_pci_bus_info;
+      (!physical_dev->instance->renderer->info.pci.hide_renderer_bus_info &&
+       renderer_exts->EXT_pci_bus_info);
 #endif /* VN_USE_WSI_PLATFORM */
 
    /* Use common implementation but enable only when the renderer supports
