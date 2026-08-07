@@ -312,13 +312,20 @@ vn_device_fix_create_info(const struct vn_device *dev,
    }
 
    if (app_exts->KHR_external_memory_fd ||
-       app_exts->EXT_external_memory_dma_buf || has_wsi) {
+       app_exts->EXT_external_memory_dma_buf ||
+       app_exts->KHR_external_memory_win32 || has_wsi) {
       if (physical_dev->external_memory.renderer_handle_type ==
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
          if (!app_exts->EXT_external_memory_dma_buf) {
             extra_exts[extra_count++] =
                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
          }
+         if (!app_exts->KHR_external_memory_fd) {
+            extra_exts[extra_count++] =
+               VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+         }
+      } else if (physical_dev->external_memory.renderer_handle_type ==
+                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
          if (!app_exts->KHR_external_memory_fd) {
             extra_exts[extra_count++] =
                VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
@@ -349,6 +356,13 @@ vn_device_fix_create_info(const struct vn_device *dev,
    }
 
 #if DETECT_OS_WINDOWS
+   if (app_exts->KHR_external_memory_win32) {
+      /* Native WDDM frontend extension.  The renderer device receives the
+       * fd/dma-buf wire extension selected above, never a Win32 name. */
+      block_exts[block_count++] =
+         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME;
+   }
+
    if (app_exts->KHR_external_semaphore_win32) {
       /* This is implemented by the Windows Venus frontend with D3DKMT sync
        * objects.  The Linux virglrenderer/Venus renderer does not advertise

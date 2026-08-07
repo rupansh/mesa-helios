@@ -332,6 +332,47 @@ vn_renderer_create_helios(struct vn_instance *instance,
                           const VkAllocationCallbacks *alloc,
                           struct vn_renderer **renderer);
 
+struct vn_renderer_helios_external_memory;
+
+/* Native VK_KHR_external_memory_win32 payloads.  A payload is a WDDM
+ * allocation which owns (export) or retains (import) the matching Venus
+ * resource id.  The Linux renderer still sees its normal fd/dma-buf wire
+ * handle; no Win32 handle crosses the Venus protocol. */
+VkResult
+vn_renderer_helios_external_memory_create(
+   struct vn_renderer *renderer,
+   struct vn_renderer_bo *bo,
+   uint64_t memory_id,
+   uint64_t allocation_size,
+   uint32_t memory_type_index,
+   struct vn_renderer_helios_external_memory **out_external);
+
+VkResult
+vn_renderer_helios_external_memory_open(
+   struct vn_renderer *renderer,
+   const VkImportMemoryWin32HandleInfoKHR *import_info,
+   uint64_t allocation_size,
+   uint32_t memory_type_index,
+   uint32_t *out_resource_id,
+   struct vn_renderer_helios_external_memory **out_external);
+
+VkResult
+vn_renderer_helios_external_memory_prepare_export(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external,
+   const VkExportMemoryWin32HandleInfoKHR *export_info);
+
+VkResult
+vn_renderer_helios_external_memory_get_handle(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external,
+   void **out_handle);
+
+void
+vn_renderer_helios_external_memory_destroy(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external);
+
 /* Mirror a Venus VkDeviceMemory lifetime into Windows VidMm accounting.  The
  * returned handles are opaque D3DKMT identities owned by the renderer. */
 bool

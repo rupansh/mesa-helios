@@ -133,9 +133,19 @@ struct helios_unicode_string {
 
 #define HELIOS_WDDM_MAGIC               0x4857444Du /* 'HWDM' */
 #define HELIOS_WDDM_VERSION             1u
+#define HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY 1u
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
 #define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
+#define HELIOS_WDDM_IDENTITY_MAGIC      0x4849444Eu /* 'HIDN' */
+#define HELIOS_WDDM_IDENTITY_VERSION    1u
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
+
+#ifndef OBJ_INHERIT
+#define OBJ_INHERIT 0x00000002L
+#endif
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE 0x00000040L
+#endif
 
 /* virtio-gpu constants the backend needs (protocol/src/virtio_gpu.rs) */
 #define VIRTIO_GPU_CAPSET_VENUS          4u
@@ -222,6 +232,36 @@ struct helios_wddm_alloc_private {
    uint32_t adopt_resource_id;
 };
 
+struct helios_wddm_alloc_meta {
+   uint32_t width;
+   uint32_t height;
+   uint32_t format;
+   uint32_t pitch;
+   uint32_t bind_flags;
+   uint32_t misc_flags;
+   uint64_t venus_alloc_size;
+   uint32_t memory_type_index;
+   uint32_t dxgi_format;
+   uint64_t plane_offset;
+};
+
+struct helios_wddm_open_identity {
+   uint64_t venus_alloc_size;
+   uint64_t blob_size;
+   uint32_t magic;
+   uint32_t version;
+   uint32_t resource_id;
+   uint32_t memory_type_index;
+   uint32_t ctx_id;
+   uint32_t kind;
+   uint32_t reserved[2];
+};
+
+struct helios_wddm_external_private {
+   struct helios_wddm_alloc_private alloc;
+   struct helios_wddm_alloc_meta meta;
+};
+
 /* C3/M3.4 async transport: WAIT_FENCE v2 (40 bytes). `fence_id` is the WIRE
  * fence id the KMD wrote back into the SUBMIT_VENUS escape buffer. The caller
  * MUST pre-set out_completed = 1: the old synchronous KMD validates the shape
@@ -297,6 +337,12 @@ _Static_assert(sizeof(struct helios_escape_query_scanout) == 64, "query_scanout 
 _Static_assert(sizeof(struct helios_venus_scanout_info) == 40, "scanout_info size");
 _Static_assert(sizeof(struct helios_wddm_alloc_private) == 48,
                "wddm alloc private size");
+_Static_assert(sizeof(struct helios_wddm_alloc_meta) == 48,
+               "wddm alloc meta size");
+_Static_assert(sizeof(struct helios_wddm_open_identity) == 48,
+               "wddm open identity size");
+_Static_assert(sizeof(struct helios_wddm_external_private) == 96,
+               "wddm external private size");
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -313,6 +359,19 @@ struct helios_bo {
    VkMemoryPropertyFlags memory_flags;
    bool resource_released;
 };
+
+struct vn_renderer_helios_external_memory {
+   D3DKMT_HANDLE resource;
+   D3DKMT_HANDLE allocation;
+   HANDLE export_handle;
+   bool export_handle_inheritable;
+};
+
+static bool
+helios_nt_object_path(const WCHAR *name,
+                      WCHAR *buf,
+                      size_t buf_chars,
+                      struct helios_unicode_string *out_us);
 
 #define HELIOS_SYNC_PENDING_MAX 256
 #define HELIOS_WAIT_FENCE_STACK_MAX 256
@@ -3005,6 +3064,401 @@ vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
    mtx_unlock(&helios->dev_mutex);
 }
 
+static void
+helios_external_memory_destroy_locked(
+   struct helios *helios,
+   struct vn_renderer_helios_external_memory *external)
+{
+   if (external->export_handle) {
+      CloseHandle(external->export_handle);
+      external->export_handle = NULL;
+   }
+
+   if (external->resource || external->allocation) {
+      helios_vidmm_destroy_locked(helios, external->resource,
+                                  external->allocation);
+      external->resource = 0;
+      external->allocation = 0;
+   }
+}
+
+VkResult
+vn_renderer_helios_external_memory_create(
+   struct vn_renderer *renderer,
+   struct vn_renderer_bo *_bo,
+   uint64_t memory_id,
+   uint64_t allocation_size,
+   uint32_t memory_type_index,
+   struct vn_renderer_helios_external_memory **out_external)
+{
+   struct helios *helios = (struct helios *)renderer;
+   struct helios_bo *bo = (struct helios_bo *)_bo;
+   *out_external = NULL;
+
+   if (!helios->device || !helios->ctx_id || !bo || !bo->base.res_id ||
+       !memory_id || !allocation_size)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct vn_renderer_helios_external_memory *external =
+      calloc(1, sizeof(*external));
+   if (!external)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   struct helios_wddm_external_private private_data;
+   memset(&private_data, 0, sizeof(private_data));
+   private_data.alloc.blob_id = memory_id;
+   private_data.alloc.size = allocation_size;
+   private_data.alloc.magic = HELIOS_WDDM_MAGIC;
+   private_data.alloc.version = HELIOS_WDDM_VERSION;
+   private_data.alloc.blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
+   private_data.alloc.blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
+   private_data.alloc.ctx_id = helios->ctx_id;
+   private_data.alloc.map_cache = HELIOS_MAP_CACHE_CACHED;
+   private_data.alloc.kind = HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
+   private_data.alloc.adopt_resource_id = bo->base.res_id;
+   private_data.meta.venus_alloc_size = allocation_size;
+   private_data.meta.memory_type_index = memory_type_index;
+
+   D3DDDI_ALLOCATIONINFO2 allocation_info;
+   memset(&allocation_info, 0, sizeof(allocation_info));
+   allocation_info.pPrivateDriverData = &private_data;
+   allocation_info.PrivateDriverDataSize = sizeof(private_data);
+
+   D3DKMT_CREATEALLOCATION create;
+   memset(&create, 0, sizeof(create));
+   create.hDevice = helios->device;
+   create.Flags.CreateResource = 1;
+   create.Flags.CreateShared = 1;
+   create.Flags.NtSecuritySharing = 1;
+   create.Flags.AllowNotZeroed = 1;
+   create.NumAllocations = 1;
+   create.pAllocationInfo2 = &allocation_info;
+
+   mtx_lock(&helios->dev_mutex);
+   const NTSTATUS st = D3DKMTCreateAllocation2(&create);
+   if (st == 0 && create.hResource && allocation_info.hAllocation) {
+      /* The KMD atomically re-owns this resource id for the allocation.  The
+       * BO must never send RELEASE_BLOB after this point. */
+      bo->resource_released = true;
+      external->resource = create.hResource;
+      external->allocation = allocation_info.hAllocation;
+   } else {
+      if (st == 0) {
+         /* A successful call with incomplete output has still passed through
+          * the KMD adoption path, so treat the BO lifetime as transferred. */
+         bo->resource_released = true;
+         external->resource = create.hResource;
+         external->allocation = allocation_info.hAllocation;
+         helios_external_memory_destroy_locked(helios, external);
+      }
+      helios_diag("external memory CreateAllocation2 failed status=0x%08x resource=0x%x allocation=0x%x res_id=%u",
+                  (unsigned)st, (unsigned)create.hResource,
+                  (unsigned)allocation_info.hAllocation, bo->base.res_id);
+   }
+   mtx_unlock(&helios->dev_mutex);
+
+   if (!external->resource || !external->allocation) {
+      free(external);
+      return st == 0 ? VK_ERROR_INVALID_EXTERNAL_HANDLE
+                     : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+
+   helios_diag("external memory adopted res=%u resource=0x%x allocation=0x%x size=%llu type=%u",
+               bo->base.res_id, (unsigned)external->resource,
+               (unsigned)external->allocation,
+               (unsigned long long)allocation_size, memory_type_index);
+   *out_external = external;
+   return VK_SUCCESS;
+}
+
+static void
+helios_external_memory_destroy_aux_handles(
+   D3DKMT_HANDLE keyed_mutex,
+   D3DKMT_HANDLE sync_object)
+{
+   if (keyed_mutex) {
+      D3DKMT_DESTROYKEYEDMUTEX destroy;
+      memset(&destroy, 0, sizeof(destroy));
+      destroy.hKeyedMutex = keyed_mutex;
+      const NTSTATUS st = D3DKMTDestroyKeyedMutex(&destroy);
+      if (st != 0)
+         helios_diag("external memory keyed-mutex destroy failed status=0x%08x handle=0x%x",
+                     (unsigned)st, (unsigned)keyed_mutex);
+   }
+   if (sync_object) {
+      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy;
+      memset(&destroy, 0, sizeof(destroy));
+      destroy.hSyncObject = sync_object;
+      const NTSTATUS st = D3DKMTDestroySynchronizationObject(&destroy);
+      if (st != 0)
+         helios_diag("external memory sync-object destroy failed status=0x%08x handle=0x%x",
+                     (unsigned)st, (unsigned)sync_object);
+   }
+}
+
+VkResult
+vn_renderer_helios_external_memory_open(
+   struct vn_renderer *renderer,
+   const VkImportMemoryWin32HandleInfoKHR *import_info,
+   uint64_t allocation_size,
+   uint32_t memory_type_index,
+   uint32_t *out_resource_id,
+   struct vn_renderer_helios_external_memory **out_external)
+{
+   struct helios *helios = (struct helios *)renderer;
+   *out_resource_id = 0;
+   *out_external = NULL;
+
+   if (!helios->device || !import_info ||
+       import_info->handleType !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       (!import_info->handle && !import_info->name))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   HANDLE nt_handle = import_info->handle;
+   bool close_nt_handle = false;
+   WCHAR path[512];
+   struct helios_unicode_string us;
+   OBJECT_ATTRIBUTES attr;
+   memset(&attr, 0, sizeof(attr));
+
+   mtx_lock(&helios->dev_mutex);
+   if (!nt_handle) {
+      if (!helios_nt_object_path(import_info->name, path, ARRAY_SIZE(path),
+                                 &us)) {
+         mtx_unlock(&helios->dev_mutex);
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      attr.Length = sizeof(attr);
+      attr.ObjectName = &us;
+      attr.Attributes = OBJ_CASE_INSENSITIVE;
+      D3DKMT_OPENNTHANDLEFROMNAME open_name;
+      memset(&open_name, 0, sizeof(open_name));
+      open_name.dwDesiredAccess = SHARED_ALLOCATION_ALL_ACCESS;
+      open_name.pObjAttrib = &attr;
+      const NTSTATUS name_st = D3DKMTOpenNtHandleFromName(&open_name);
+      if (name_st != 0 || !open_name.hNtHandle) {
+         mtx_unlock(&helios->dev_mutex);
+         helios_diag("external memory open name failed status=0x%08x",
+                     (unsigned)name_st);
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+      nt_handle = open_name.hNtHandle;
+      close_nt_handle = true;
+   }
+
+   D3DKMT_QUERYRESOURCEINFOFROMNTHANDLE query;
+   memset(&query, 0, sizeof(query));
+   query.hDevice = helios->device;
+   query.hNtHandle = nt_handle;
+   NTSTATUS st = D3DKMTQueryResourceInfoFromNtHandle(&query);
+   if (st != 0 || query.NumAllocations != 1 ||
+       query.PrivateRuntimeDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+       query.ResourcePrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
+       query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
+      if (close_nt_handle)
+         CloseHandle(nt_handle);
+      mtx_unlock(&helios->dev_mutex);
+      helios_diag("external memory query failed status=0x%08x allocs=%u private=%u/%u/%u",
+                  (unsigned)st, query.NumAllocations,
+                  query.PrivateRuntimeDataSize,
+                  query.ResourcePrivateDriverDataSize,
+                  query.TotalPrivateDriverDataSize);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   void *runtime_data = query.PrivateRuntimeDataSize
+                           ? calloc(1, query.PrivateRuntimeDataSize) : NULL;
+   void *resource_private = query.ResourcePrivateDriverDataSize
+                              ? calloc(1, query.ResourcePrivateDriverDataSize)
+                              : NULL;
+   void *total_private = query.TotalPrivateDriverDataSize
+                           ? calloc(1, query.TotalPrivateDriverDataSize) : NULL;
+   if ((query.PrivateRuntimeDataSize && !runtime_data) ||
+       (query.ResourcePrivateDriverDataSize && !resource_private) ||
+       (query.TotalPrivateDriverDataSize && !total_private)) {
+      free(runtime_data);
+      free(resource_private);
+      free(total_private);
+      if (close_nt_handle)
+         CloseHandle(nt_handle);
+      mtx_unlock(&helios->dev_mutex);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   if (query.PrivateRuntimeDataSize) {
+      query.pPrivateRuntimeData = runtime_data;
+      st = D3DKMTQueryResourceInfoFromNtHandle(&query);
+   }
+
+   D3DDDI_OPENALLOCATIONINFO2 allocation_info;
+   memset(&allocation_info, 0, sizeof(allocation_info));
+   D3DKMT_OPENRESOURCEFROMNTHANDLE open;
+   memset(&open, 0, sizeof(open));
+   open.hDevice = helios->device;
+   open.hNtHandle = nt_handle;
+   open.NumAllocations = 1;
+   open.pOpenAllocationInfo2 = &allocation_info;
+   open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
+   open.pPrivateRuntimeData = runtime_data;
+   open.ResourcePrivateDriverDataSize =
+      query.ResourcePrivateDriverDataSize;
+   open.pResourcePrivateDriverData = resource_private;
+   open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
+   open.pTotalPrivateDriverDataBuffer = total_private;
+   if (st == 0)
+      st = D3DKMTOpenResourceFromNtHandle(&open);
+
+   struct helios_wddm_open_identity identity;
+   memset(&identity, 0, sizeof(identity));
+   if (st == 0 && allocation_info.pPrivateDriverData &&
+       allocation_info.PrivateDriverDataSize >= sizeof(identity)) {
+      memcpy(&identity, allocation_info.pPrivateDriverData, sizeof(identity));
+   }
+
+   const bool identity_valid =
+      identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
+      identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
+      identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
+      identity.resource_id != 0 && identity.blob_size >= allocation_size &&
+      identity.venus_alloc_size == allocation_size &&
+      identity.memory_type_index == memory_type_index;
+
+   struct vn_renderer_helios_external_memory *external = NULL;
+   if (st == 0 && open.hResource && allocation_info.hAllocation &&
+       identity_valid) {
+      external = calloc(1, sizeof(*external));
+      if (external) {
+         external->resource = open.hResource;
+         external->allocation = allocation_info.hAllocation;
+      }
+   }
+
+   if (!external && (open.hResource || allocation_info.hAllocation))
+      helios_vidmm_destroy_locked(helios, open.hResource,
+                                  allocation_info.hAllocation);
+   helios_external_memory_destroy_aux_handles(open.hKeyedMutex,
+                                              open.hSyncObject);
+   free(runtime_data);
+   free(resource_private);
+   free(total_private);
+   if (close_nt_handle)
+      CloseHandle(nt_handle);
+   mtx_unlock(&helios->dev_mutex);
+
+   if (!external) {
+      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u size=%llu/%llu type=%u/%u",
+                  (unsigned)st, (unsigned)open.hResource,
+                  (unsigned)allocation_info.hAllocation, identity.magic,
+                  identity.version, identity.resource_id,
+                  (unsigned long long)identity.venus_alloc_size,
+                  (unsigned long long)allocation_size,
+                  identity.memory_type_index, memory_type_index);
+      return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
+                                      : VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   helios_diag("external memory opened res=%u resource=0x%x allocation=0x%x size=%llu type=%u",
+               identity.resource_id, (unsigned)external->resource,
+               (unsigned)external->allocation,
+               (unsigned long long)allocation_size, memory_type_index);
+   *out_resource_id = identity.resource_id;
+   *out_external = external;
+   return VK_SUCCESS;
+}
+
+VkResult
+vn_renderer_helios_external_memory_prepare_export(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external,
+   const VkExportMemoryWin32HandleInfoKHR *export_info)
+{
+   struct helios *helios = (struct helios *)renderer;
+   if (!external || !external->allocation)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   if (external->export_handle)
+      return VK_SUCCESS;
+
+   WCHAR path[512];
+   struct helios_unicode_string us;
+   OBJECT_ATTRIBUTES attr;
+   memset(&attr, 0, sizeof(attr));
+   attr.Length = sizeof(attr);
+   attr.Attributes = OBJ_CASE_INSENSITIVE;
+
+   if (export_info && export_info->name) {
+      if (!helios_nt_object_path(export_info->name, path, ARRAY_SIZE(path),
+                                 &us))
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      attr.ObjectName = &us;
+   }
+   if (export_info && export_info->pAttributes) {
+      attr.SecurityDescriptor =
+         export_info->pAttributes->lpSecurityDescriptor;
+      if (export_info->pAttributes->bInheritHandle)
+         attr.Attributes |= OBJ_INHERIT;
+   }
+
+   const DWORD access = export_info ? export_info->dwAccess
+                                    : SHARED_ALLOCATION_ALL_ACCESS;
+   HANDLE handle = NULL;
+   mtx_lock(&helios->dev_mutex);
+   const NTSTATUS st =
+      D3DKMTShareObjects(1, &external->resource, &attr, access, &handle);
+   if (st == 0 && handle) {
+      external->export_handle = handle;
+      external->export_handle_inheritable =
+         export_info && export_info->pAttributes &&
+         export_info->pAttributes->bInheritHandle;
+   }
+   mtx_unlock(&helios->dev_mutex);
+
+   if (st != 0 || !handle) {
+      helios_diag("external memory ShareObjects failed status=0x%08x resource=0x%x",
+                  (unsigned)st, (unsigned)external->resource);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+vn_renderer_helios_external_memory_get_handle(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external,
+   void **out_handle)
+{
+   (void)renderer;
+   *out_handle = NULL;
+   if (!external || !external->export_handle)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   HANDLE duplicate = NULL;
+   if (!DuplicateHandle(GetCurrentProcess(), external->export_handle,
+                        GetCurrentProcess(), &duplicate, 0,
+                        external->export_handle_inheritable,
+                        DUPLICATE_SAME_ACCESS))
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   *out_handle = duplicate;
+   return VK_SUCCESS;
+}
+
+void
+vn_renderer_helios_external_memory_destroy(
+   struct vn_renderer *renderer,
+   struct vn_renderer_helios_external_memory *external)
+{
+   if (!external)
+      return;
+
+   struct helios *helios = (struct helios *)renderer;
+   mtx_lock(&helios->dev_mutex);
+   helios_external_memory_destroy_locked(helios, external);
+   mtx_unlock(&helios->dev_mutex);
+   free(external);
+}
+
 /* ── ops ───────────────────────────────────────────────────────────────────── */
 
 static VkResult
@@ -3755,21 +4209,23 @@ vn_renderer_helios_sync_create_from_win32(
    return VK_SUCCESS;
 }
 
-/* Translate a Win32-style kernel object name into the NT object-manager path
- * OBJECT_ATTRIBUTES wants. Only the explicit forms are accepted:
- *   L"Global\\X"  -> L"\\BaseNamedObjects\\X"   (cross-session; creator needs
- *                                                SeCreateGlobalPrivilege)
- *   L"\\...":     -> used verbatim (caller knows the object directory)
- * Anything else is refused loudly — an unqualified name would silently land
- * in the creator's per-session directory and never be visible to a session-0
- * consumer, which is exactly the class of quiet failure this path exists to
- * avoid. */
+/* Translate Win32 kernel-object names into the NT object-manager paths used by
+ * D3DKMTShareObjects/D3DKMTOpenNtHandleFromName:
+ *   Global\\X -> \\BaseNamedObjects\\X
+ *   Local\\X  -> \\Sessions\\<id>\\BaseNamedObjects\\X (or
+ *                \\BaseNamedObjects\\X for session 0)
+ *   X         -> the same current-session directory as Local\\X
+ *   \\...     -> used verbatim.
+ * This matches Win32 named-object namespace rules and makes Vulkan's optional
+ * name field work for ordinary desktop applications as well as services. */
 static bool
 helios_nt_object_path(const WCHAR *name, WCHAR *buf, size_t buf_chars,
                       struct helios_unicode_string *out_us)
 {
    static const WCHAR global_prefix[] = L"Global\\";
+   static const WCHAR local_prefix[] = L"Local\\";
    const size_t global_prefix_len = ARRAY_SIZE(global_prefix) - 1;
+   const size_t local_prefix_len = ARRAY_SIZE(local_prefix) - 1;
    size_t len;
 
    if (!name)
@@ -3791,8 +4247,27 @@ helios_nt_object_path(const WCHAR *name, WCHAR *buf, size_t buf_chars,
          return false;
       memcpy(buf, name, (len + 1) * sizeof(WCHAR));
    } else {
-      return false;
+      const WCHAR *rest = name;
+      if (wcsncmp(name, local_prefix, local_prefix_len) == 0)
+         rest += local_prefix_len;
+      const size_t rest_len = wcslen(rest);
+      DWORD session_id = 0;
+      if (!rest_len ||
+          !ProcessIdToSessionId(GetCurrentProcessId(), &session_id))
+         return false;
+      const int prefix_len = session_id == 0
+         ? swprintf(buf, buf_chars, L"\\BaseNamedObjects\\")
+         : swprintf(buf, buf_chars,
+                    L"\\Sessions\\%lu\\BaseNamedObjects\\",
+                    (unsigned long)session_id);
+      if (prefix_len < 0 || (size_t)prefix_len + rest_len + 1 > buf_chars)
+         return false;
+      memcpy(buf + prefix_len, rest, (rest_len + 1) * sizeof(WCHAR));
+      len = (size_t)prefix_len + rest_len;
    }
+
+   if (len > UINT16_MAX / sizeof(WCHAR) - 1)
+      return false;
 
    out_us->Buffer = buf;
    out_us->Length = (USHORT)(len * sizeof(WCHAR));
@@ -3818,8 +4293,7 @@ vn_renderer_helios_sync_share_named(struct vn_renderer *renderer,
    struct helios_unicode_string us;
    if (!helios_nt_object_path((const WCHAR *)name, path,
                               ARRAY_SIZE(path), &us)) {
-      helios_diag("sync_share_named: refused name (must be Global\\* or an "
-                  "absolute NT path)");
+      helios_diag("sync_share_named: invalid or overlong object name");
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 

@@ -54,6 +54,14 @@ struct vn_device_memory {
    struct list_head coherent_cached_link;
 
 #ifdef _WIN32
+   /* Guest-visible export types must remain distinct from the renderer-side
+    * fd/dma-buf type used to create the Venus blob. */
+   VkExternalMemoryHandleTypeFlags renderer_export_handle_types;
+
+   /* Native OPAQUE_WIN32 payload.  It owns/retains the Venus resource after
+    * the BO has transferred that lifetime to WDDM. */
+   struct vn_renderer_helios_external_memory *helios_external_memory;
+
    /* VidMm mirror for an ordinary, non-imported Venus allocation.  The real
     * bytes stay renderer-owned; these handles exist only for Windows budget
     * and Task Manager accounting. */

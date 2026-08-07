@@ -1115,6 +1115,16 @@ vn_physical_device_init_external_memory(
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
    }
 
+#if DETECT_OS_WINDOWS
+   /* WSI/scanout prefers DMA_BUF, but native OPAQUE_WIN32 memory needs the
+    * opaque object-identity semantics that also work for optimal-tiled images.
+    * Keep the contracts separate and fall back only when OPAQUE_FD is absent. */
+   physical_dev->external_memory.win32_renderer_handle_type =
+      opaque_fd_exportable
+         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+         : physical_dev->external_memory.renderer_handle_type;
+#endif
+
    if (physical_dev->external_memory.renderer_handle_type) {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       physical_dev->external_memory.supported_handle_types |=
@@ -1123,6 +1133,10 @@ vn_physical_device_init_external_memory(
       physical_dev->external_memory.supported_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+#if DETECT_OS_WINDOWS
+      physical_dev->external_memory.supported_handle_types |=
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#endif
 #endif
    }
 }
@@ -1326,6 +1340,9 @@ vn_physical_device_get_native_extensions(
        */
       exts->KHR_external_memory_fd = true;
       exts->EXT_external_memory_dma_buf = true;
+      /* Native guest ABI: NT handles are backed by shareable WDDM
+       * allocations which retain/adopt the renderer's Venus resource id. */
+      exts->KHR_external_memory_win32 = true;
 #endif /* !DETECT_OS_WINDOWS */
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
@@ -2790,10 +2807,15 @@ vn_sanitize_image_format_properties(
    const VkPhysicalDeviceExternalImageFormatInfo *external_info,
    VkImageFormatProperties2 *props)
 {
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      physical_dev->external_memory.renderer_handle_type;
    const VkExternalMemoryHandleTypeFlags supported_handle_types =
       physical_dev->external_memory.supported_handle_types;
+   const bool native_win32 =
+      external_info &&
+      external_info->handleType ==
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         physical_dev, external_info ? external_info->handleType : 0);
 
    /* TODO drop this after supporting VK_EXT_rgba10x6_formats */
    if (info->format == VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16) {
@@ -2807,16 +2829,28 @@ vn_sanitize_image_format_properties(
       VkExternalMemoryProperties *mem_props =
          &external_props->externalMemoryProperties;
       /* export support is via virtgpu but import relies on the renderer */
-      if (!physical_dev->instance->renderer->info.has_dma_buf_import) {
+      if (!native_win32 &&
+          !physical_dev->instance->renderer->info.has_dma_buf_import) {
          mem_props->externalMemoryFeatures &=
             ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
       }
 
-      mem_props->compatibleHandleTypes = supported_handle_types;
-      mem_props->exportFromImportedHandleTypes =
-         (mem_props->exportFromImportedHandleTypes & renderer_handle_type)
-            ? supported_handle_types
-            : 0;
+      if (native_win32) {
+         mem_props->compatibleHandleTypes =
+            mem_props->externalMemoryFeatures
+               ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+               : 0;
+         mem_props->exportFromImportedHandleTypes =
+            (mem_props->exportFromImportedHandleTypes & renderer_handle_type)
+               ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+               : 0;
+      } else {
+         mem_props->compatibleHandleTypes = supported_handle_types;
+         mem_props->exportFromImportedHandleTypes =
+            (mem_props->exportFromImportedHandleTypes & renderer_handle_type)
+               ? supported_handle_types
+               : 0;
+      }
    }
 }
 
@@ -2898,8 +2932,6 @@ vn_GetPhysicalDeviceImageFormatProperties2(
    struct vn_physical_device *physical_dev =
       vn_physical_device_from_handle(physicalDevice);
    struct vn_ring *ring = physical_dev->instance->ring.ring;
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      physical_dev->external_memory.renderer_handle_type;
    const VkExternalMemoryHandleTypeFlags supported_handle_types =
       physical_dev->external_memory.supported_handle_types;
 
@@ -2929,6 +2961,10 @@ vn_GetPhysicalDeviceImageFormatProperties2(
                                        pImageFormatProperties);
       }
    }
+
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         physical_dev, external_info ? external_info->handleType : 0);
 
    struct vn_physical_device_image_format_info local_info;
    if (external_info) {
@@ -2989,8 +3025,14 @@ vn_GetPhysicalDeviceImageFormatProperties2(
 
    /* Check if image format props is in the cache. */
    uint8_t key[BLAKE3_KEY_LEN] = { 0 };
-   const bool cacheable = vn_image_get_image_format_key(
-      physical_dev, pImageFormatInfo, pImageFormatProperties, key);
+   const bool native_win32 =
+      external_info &&
+      external_info->handleType ==
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   const bool cacheable =
+      !native_win32 &&
+      vn_image_get_image_format_key(
+         physical_dev, pImageFormatInfo, pImageFormatProperties, key);
 
    VkResult result = VK_SUCCESS;
    if (!(cacheable &&
@@ -3051,13 +3093,17 @@ vn_GetPhysicalDeviceExternalBufferProperties(
    struct vn_physical_device *physical_dev =
       vn_physical_device_from_handle(physicalDevice);
    struct vn_ring *ring = physical_dev->instance->ring.ring;
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      physical_dev->external_memory.renderer_handle_type;
    const VkExternalMemoryHandleTypeFlags supported_handle_types =
       physical_dev->external_memory.supported_handle_types;
    const bool is_ahb =
       pExternalBufferInfo->handleType ==
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+   const bool native_win32 =
+      pExternalBufferInfo->handleType ==
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         physical_dev, pExternalBufferInfo->handleType);
 
    VkExternalMemoryProperties *props =
       &pExternalBufferProperties->externalMemoryProperties;
@@ -3086,18 +3132,29 @@ vn_GetPhysicalDeviceExternalBufferProperties(
    vn_call_vkGetPhysicalDeviceExternalBufferProperties(
       ring, physicalDevice, pExternalBufferInfo, pExternalBufferProperties);
 
-   if (renderer_handle_type ==
+   if (!native_win32 && renderer_handle_type ==
           VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT &&
        !physical_dev->instance->renderer->info.has_dma_buf_import) {
       props->externalMemoryFeatures &=
          ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
    }
 
-   props->compatibleHandleTypes = supported_handle_types;
-   props->exportFromImportedHandleTypes =
-      (props->exportFromImportedHandleTypes & renderer_handle_type)
-         ? supported_handle_types
-         : 0;
+   if (native_win32) {
+      props->compatibleHandleTypes =
+         props->externalMemoryFeatures
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+            : 0;
+      props->exportFromImportedHandleTypes =
+         (props->exportFromImportedHandleTypes & renderer_handle_type)
+            ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+            : 0;
+   } else {
+      props->compatibleHandleTypes = supported_handle_types;
+      props->exportFromImportedHandleTypes =
+         (props->exportFromImportedHandleTypes & renderer_handle_type)
+            ? supported_handle_types
+            : 0;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

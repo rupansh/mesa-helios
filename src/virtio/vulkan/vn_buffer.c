@@ -401,13 +401,14 @@ vn_CreateBuffer(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
       pAllocator ? pAllocator : &dev->base.vk.alloc;
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      dev->physical_device->external_memory.renderer_handle_type;
-
    struct vn_buffer_create_info local_info;
    const VkExternalMemoryBufferCreateInfo *external_info =
       vk_find_struct_const(pCreateInfo->pNext,
                            EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         dev->physical_device,
+         external_info ? external_info->handleTypes : 0);
    if (renderer_handle_type &&
        (!external_info || !external_info->handleTypes ||
         external_info->handleTypes != renderer_handle_type)) {
@@ -571,11 +572,13 @@ vn_GetDeviceBufferMemoryRequirements(
     * and every such chunk's global-buffer creation failed — leaving
     * buffer-less allocations whose CPU writes no VkBuffer ever aliases
     * (dwm's all-zero composition: dynamic vertex/constant data lost). */
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      dev->physical_device->external_memory.renderer_handle_type;
    const VkExternalMemoryBufferCreateInfo *external_info =
       vk_find_struct_const(pInfo->pCreateInfo->pNext,
                            EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         dev->physical_device,
+         external_info ? external_info->handleTypes : 0);
    struct vn_buffer_create_info local_info;
    VkDeviceBufferMemoryRequirements fixed_info;
    if (renderer_handle_type &&

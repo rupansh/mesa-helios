@@ -115,6 +115,10 @@ struct vn_physical_device {
 
    struct {
       VkExternalMemoryHandleTypeFlagBits renderer_handle_type;
+      /* Native Win32 opaque sharing is an object-identity contract, not a
+       * scanout contract.  Keep its renderer-side handle independent from
+       * renderer_handle_type, which may be DMA_BUF for WSI. */
+      VkExternalMemoryHandleTypeFlagBits win32_renderer_handle_type;
       VkExternalMemoryHandleTypeFlags supported_handle_types;
    } external_memory;
 
@@ -169,6 +173,23 @@ vn_preserve_explicit_dmabuf_handle_types(
    (void)handle_types;
    return false;
 #endif
+}
+
+static inline VkExternalMemoryHandleTypeFlagBits
+vn_renderer_handle_type_for_guest(
+   const struct vn_physical_device *physical_dev,
+   const VkExternalMemoryHandleTypeFlags guest_handle_types)
+{
+#if DETECT_OS_WINDOWS
+   if (guest_handle_types ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
+       physical_dev->external_memory.win32_renderer_handle_type) {
+      return physical_dev->external_memory.win32_renderer_handle_type;
+   }
+#else
+   (void)guest_handle_types;
+#endif
+   return physical_dev->external_memory.renderer_handle_type;
 }
 
 void
