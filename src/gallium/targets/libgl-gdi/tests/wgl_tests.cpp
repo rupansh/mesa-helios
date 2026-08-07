@@ -145,6 +145,34 @@ TEST(wgl, basic_create)
    ASSERT_NE(strstr(version, "Mesa"), nullptr);
 }
 
+TEST(wgl, pixel_format_color_bits_exclude_alpha)
+{
+   window wnd;
+   ASSERT_TRUE(wnd.valid());
+
+   PIXELFORMATDESCRIPTOR pfd = {};
+   int count = DescribePixelFormat(wnd.get_hdc(), 1, sizeof(pfd), &pfd);
+   ASSERT_GT(count, 0);
+
+   for (int format = 1; format <= count; ++format) {
+      ASSERT_NE(DescribePixelFormat(wnd.get_hdc(), format, sizeof(pfd), &pfd), 0);
+      EXPECT_EQ(pfd.cColorBits,
+                pfd.cRedBits + pfd.cGreenBits + pfd.cBlueBits);
+   }
+}
+
+TEST(wgl, legacy_choose_does_not_add_unrequested_alpha)
+{
+   window wnd;
+   ASSERT_TRUE(wnd.valid());
+
+   PIXELFORMATDESCRIPTOR pfd = {};
+   int format = GetPixelFormat(wnd.get_hdc());
+   ASSERT_GT(format, 0);
+   ASSERT_NE(DescribePixelFormat(wnd.get_hdc(), format, sizeof(pfd), &pfd), 0);
+   EXPECT_EQ(pfd.cAlphaBits, 0);
+}
+
 #ifdef GALLIUM_D3D12
 /* Fixture for tests for the d3d12 backend. Will be skipped if
  * the environment isn't set up to run them.
