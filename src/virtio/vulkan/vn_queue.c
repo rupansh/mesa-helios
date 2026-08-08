@@ -1794,6 +1794,33 @@ helios_venus_register_present_stream(VkDevice device,
    *out_cookie = cookie;
    return true;
 }
+
+/* Reserve a KMD-owned standard buffer for a read that will finish when this
+ * exact registered timeline reaches value. The caller records the matching
+ * queue-family acquire/copy/release and semaphore signal only after success. */
+__declspec(dllexport) bool
+helios_venus_claim_present_buffer_read(VkDevice device,
+                                      VkSemaphore semaphore,
+                                      uint32_t resource_id,
+                                      uint32_t value);
+
+__declspec(dllexport) bool
+helios_venus_claim_present_buffer_read(VkDevice device,
+                                      VkSemaphore semaphore,
+                                      uint32_t resource_id,
+                                      uint32_t value)
+{
+   if (!device || !semaphore || !resource_id || !value)
+      return false;
+
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_semaphore *sem = vn_semaphore_from_handle(semaphore);
+   if (!dev || !sem || !sem->helios_present_stream_cookie)
+      return false;
+
+   return vn_renderer_helios_present_buffer_read(
+      dev->renderer, sem->helios_present_stream_cookie, resource_id, value);
+}
 #endif
 
 static VkResult
