@@ -135,13 +135,18 @@ static_assert(sizeof(struct kopper_vk_surface_create_storage) >= sizeof(VkWin32S
 static void
 stw_st_fill_private_loader_data(struct stw_st_framebuffer *stwfb, struct kopper_loader_info *out)
 {
+   memset(out, 0, sizeof(*out));
+
    VkWin32SurfaceCreateInfoKHR *win32 = (VkWin32SurfaceCreateInfoKHR *)&out->bos;
    win32->sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
    win32->pNext = NULL;
    win32->flags = 0;
    win32->hinstance = GetModuleHandle(NULL);
    win32->hwnd = stwfb->fb->hWnd;
-   out->has_alpha = true;
+   out->has_alpha = stwfb->fb->pfi->pfd.cAlphaBits != 0;
+   out->initial_swap_interval = stwfb->fb->swap_interval == -1
+                              ? stw_dev->swap_interval
+                              : stwfb->fb->swap_interval;
 }
 #endif
 /**

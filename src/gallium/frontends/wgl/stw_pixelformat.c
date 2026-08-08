@@ -167,8 +167,12 @@ stw_pixelformat_add(struct stw_device *stw_dev,
 
    pfi->pfd.iPixelType = PFD_TYPE_RGBA;
 
+   /* cColorBits excludes alpha according to PIXELFORMATDESCRIPTOR and
+    * WGL_ARB_pixel_format.  Keeping the values separate is also important
+    * when an application requests color bits without requesting alpha.
+    */
    pfi->pfd.cColorBits =
-      color->bits.red + color->bits.green + color->bits.blue + color->bits.alpha;
+      color->bits.red + color->bits.green + color->bits.blue;
    pfi->pfd.cRedBits = color->bits.red;
    pfi->pfd.cRedShift = color->shift.red;
    pfi->pfd.cGreenBits = color->bits.green;

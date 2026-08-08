@@ -219,9 +219,14 @@ vn_device_memory_bo_init(struct vn_device *dev, struct vn_device_memory *mem)
    const struct vk_device_memory *mem_vk = &mem->base.vk;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
                                       .memoryTypes[mem_vk->memory_type_index];
+   VkExternalMemoryHandleTypeFlags renderer_export_handle_types =
+      mem_vk->export_handle_types;
+#ifdef _WIN32
+   renderer_export_handle_types = mem->renderer_export_handle_types;
+#endif
    return vn_renderer_bo_create_from_device_memory(
       dev->renderer, batch, mem_vk->size, mem->base.id,
-      mem_type->propertyFlags, mem_vk->export_handle_types, &mem->base_bo);
+      mem_type->propertyFlags, renderer_export_handle_types, &mem->base_bo);
 }
 
 static inline void
@@ -250,9 +255,9 @@ static VkResult
 vn_device_memory_import_resource_id(struct vn_device *dev,
                                     struct vn_device_memory *mem,
                                     const VkMemoryAllocateInfo *alloc_info,
-                                    const VkImportMemoryResourceInfoMESA *import_info)
+                                    uint32_t resource_id)
 {
-   if (!import_info->resourceId)
+   if (!resource_id)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    const struct vk_device_memory *mem_vk = &mem->base.vk;
@@ -260,14 +265,19 @@ vn_device_memory_import_resource_id(struct vn_device *dev,
                                       .memoryTypes[mem_vk->memory_type_index];
 
    VkResult result = vn_renderer_bo_create_from_resource_id(
-      dev->renderer, mem_vk->size, import_info->resourceId,
+      dev->renderer, mem_vk->size, resource_id,
       mem_type->propertyFlags, &mem->base_bo);
    if (result != VK_SUCCESS)
       return result;
 
+   const VkImportMemoryResourceInfoMESA import_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+      .pNext = alloc_info->pNext,
+      .resourceId = resource_id,
+   };
    const VkMemoryAllocateInfo memory_allocate_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = alloc_info->pNext,
+      .pNext = &import_info,
       .allocationSize = alloc_info->allocationSize,
       .memoryTypeIndex = alloc_info->memoryTypeIndex,
    };
@@ -346,18 +356,23 @@ vn_device_memory_alloc_guest_vram(struct vn_device *dev,
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
                                       .memoryTypes[mem_vk->memory_type_index];
    VkMemoryPropertyFlags flags = mem_type->propertyFlags;
+   VkExternalMemoryHandleTypeFlags renderer_export_handle_types =
+      mem_vk->export_handle_types;
+#ifdef _WIN32
+   renderer_export_handle_types = mem->renderer_export_handle_types;
+#endif
 
    /* For external allocation handles, it's possible scenario when requested
     * non-mappable memory. To make sure that virtio-gpu driver will send to
     * the host the address of allocated blob using RESOURCE_MAP_BLOB command
     * a flag VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT must be set.
     */
-   if (mem_vk->export_handle_types)
+   if (renderer_export_handle_types)
       flags |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 
    VkResult result = vn_renderer_bo_create_from_device_memory(
       dev->renderer, NULL, mem_vk->size, mem->base.id, flags,
-      mem_vk->export_handle_types, &mem->base_bo);
+      renderer_export_handle_types, &mem->base_bo);
    if (result != VK_SUCCESS) {
       return result;
    }
@@ -499,21 +514,28 @@ vn_device_memory_alloc(struct vn_device *dev,
    const bool export_alloc = mem_vk->export_handle_types;
 
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      dev->physical_device->external_memory.renderer_handle_type;
+      vn_renderer_handle_type_for_guest(dev->physical_device,
+                                        mem_vk->export_handle_types);
    struct vn_device_memory_alloc_info local_info;
    /* Preserve the caller's explicit DMA_BUF export handle exactly, matching
     * the image-side policy. */
    const bool preserve_export =
       vn_preserve_explicit_dmabuf_handle_types(
          dev->physical_device, mem_vk->export_handle_types);
+#ifdef _WIN32
+   mem->renderer_export_handle_types =
+      mem_vk->export_handle_types
+         ? (preserve_export ? mem_vk->export_handle_types
+                            : vn_renderer_handle_type_for_guest(
+                                 dev->physical_device,
+                                 mem_vk->export_handle_types))
+         : 0;
+#endif
    if (!preserve_export &&
        mem_vk->export_handle_types &&
        mem_vk->export_handle_types != renderer_handle_type) {
       alloc_info = vn_device_memory_fix_alloc_info(
          alloc_info, renderer_handle_type, has_guest_vram, &local_info);
-
-      /* ensure correct blob flags */
-      mem_vk->export_handle_types = renderer_handle_type;
    }
 
    if (has_guest_vram && (host_visible || export_alloc)) {
@@ -524,6 +546,59 @@ vn_device_memory_alloc(struct vn_device *dev,
       return vn_device_memory_alloc_simple(dev, mem, alloc_info);
    }
 }
+
+#ifdef _WIN32
+static VkResult
+vn_device_memory_import_win32(
+   struct vn_device *dev,
+   struct vn_device_memory *mem,
+   const VkMemoryAllocateInfo *alloc_info,
+   const VkImportMemoryWin32HandleInfoKHR *import_info)
+{
+   uint32_t resource_id = 0;
+   struct vn_renderer_helios_external_memory *external = NULL;
+   VkResult result = vn_renderer_helios_external_memory_open(
+      dev->renderer, import_info, alloc_info->allocationSize,
+      alloc_info->memoryTypeIndex, &resource_id, &external);
+   if (result != VK_SUCCESS)
+      return result;
+
+   struct vn_device_memory_alloc_info local_info;
+   const VkMemoryAllocateInfo *renderer_alloc_info =
+      vn_device_memory_fix_alloc_info(
+         alloc_info,
+         vn_renderer_handle_type_for_guest(
+            dev->physical_device,
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT),
+         false, &local_info);
+   result = vn_device_memory_import_resource_id(
+      dev, mem, renderer_alloc_info, resource_id);
+   if (result != VK_SUCCESS) {
+      vn_renderer_helios_external_memory_destroy(dev->renderer, external);
+      return result;
+   }
+
+   mem->helios_external_memory = external;
+   return VK_SUCCESS;
+}
+
+static void
+vn_device_memory_unwind_external(struct vn_device *dev,
+                                 struct vn_device_memory *mem)
+{
+   vn_device_memory_bo_fini(dev, mem);
+   if (mem->bo_roundtrip_seqno_valid)
+      vn_ring_wait_roundtrip(dev->primary_ring, mem->bo_roundtrip_seqno);
+   vn_device_memory_free_simple(dev, mem);
+
+   /* vkFreeMemory is asynchronous.  The WDDM allocation owns the resource id,
+    * so keep it alive until the renderer has consumed the host free. */
+   vn_ring_roundtrip(dev->primary_ring);
+   vn_renderer_helios_external_memory_destroy(
+      dev->renderer, mem->helios_external_memory);
+   mem->helios_external_memory = NULL;
+}
+#endif
 
 static void
 vn_device_memory_emit_report(struct vn_device *dev,
@@ -550,7 +625,8 @@ vn_device_memory_emit_report(struct vn_device *dev,
                 : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
    }
    const uint64_t mem_obj_id =
-      (mem_vk->import_handle_type | mem_vk->export_handle_types)
+      (mem_vk->import_handle_type | mem_vk->export_handle_types) &&
+            mem->base_bo
          ? mem->base_bo->res_id
          : mem->base.id;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
@@ -576,19 +652,61 @@ vn_AllocateMemory(VkDevice device,
    list_inithead(&mem->coherent_cached_link);
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
+#ifdef _WIN32
+   const bool preserve_export =
+      vn_preserve_explicit_dmabuf_handle_types(
+         dev->physical_device, mem->base.vk.export_handle_types);
+   mem->renderer_export_handle_types =
+      mem->base.vk.export_handle_types
+         ? (preserve_export
+               ? mem->base.vk.export_handle_types
+               : vn_renderer_handle_type_for_guest(
+                    dev->physical_device,
+                    mem->base.vk.export_handle_types))
+         : 0;
+#endif
+
    const VkImportMemoryFdInfoKHR *import_fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    const VkImportMemoryResourceInfoMESA *import_resource_info =
       (const VkImportMemoryResourceInfoMESA *)__vk_find_struct(
          (void *)pAllocateInfo->pNext,
          VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+#ifdef _WIN32
+   const VkImportMemoryWin32HandleInfoKHR *import_win32_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+   const VkExportMemoryWin32HandleInfoKHR *export_win32_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           EXPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+#endif
 
    VkResult result;
    if (mem->base.vk.ahardware_buffer) {
       result = vn_android_device_import_ahb(dev, mem, pAllocateInfo);
+#ifdef _WIN32
+   } else if (import_win32_info) {
+      result = vn_device_memory_import_win32(dev, mem, pAllocateInfo,
+                                             import_win32_info);
+#endif
    } else if (import_resource_info) {
-      result = vn_device_memory_import_resource_id(dev, mem, pAllocateInfo,
-                                                   import_resource_info);
+      struct vn_device_memory_alloc_info local_info;
+      const bool preserve_resource_export =
+         vn_preserve_explicit_dmabuf_handle_types(
+            dev->physical_device, mem->base.vk.export_handle_types);
+      const VkExternalMemoryHandleTypeFlagBits resource_export_type =
+         preserve_resource_export && mem->base.vk.export_handle_types
+            ? (VkExternalMemoryHandleTypeFlagBits)
+                 mem->base.vk.export_handle_types
+            : vn_renderer_handle_type_for_guest(
+                 dev->physical_device,
+                 mem->base.vk.export_handle_types);
+      const VkMemoryAllocateInfo *renderer_alloc_info =
+         vn_device_memory_fix_alloc_info(pAllocateInfo,
+                                         resource_export_type, false,
+                                         &local_info);
+      result = vn_device_memory_import_resource_id(
+         dev, mem, renderer_alloc_info, import_resource_info->resourceId);
    } else if (import_fd_info) {
       result = vn_device_memory_import_dma_buf(dev, mem, pAllocateInfo,
                                                import_fd_info->fd);
@@ -597,6 +715,27 @@ vn_AllocateMemory(VkDevice device,
       if (result == VK_SUCCESS)
          vn_wsi_memory_info_init(mem, pAllocateInfo);
    }
+
+#ifdef _WIN32
+   const bool export_win32 =
+      mem->base.vk.export_handle_types &
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   if (result == VK_SUCCESS && export_win32) {
+      if (!mem->helios_external_memory) {
+         result = vn_renderer_helios_external_memory_create(
+            dev->renderer, mem->base_bo, mem->base.id,
+            mem->base.vk.size, mem->base.vk.memory_type_index,
+            &mem->helios_external_memory);
+      }
+      if (result == VK_SUCCESS) {
+         result = vn_renderer_helios_external_memory_prepare_export(
+            dev->renderer, mem->helios_external_memory,
+            export_win32_info);
+      }
+      if (result != VK_SUCCESS)
+         vn_device_memory_unwind_external(dev, mem);
+   }
+#endif
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ true, result);
 
@@ -610,7 +749,8 @@ vn_AllocateMemory(VkDevice device,
     * second physical allocation.  Ordinary and exportable allocations are
     * owned by this VkDeviceMemory and receive one matching VidMm lifetime. */
    if (!mem->base.vk.import_handle_type && !import_resource_info &&
-       !import_fd_info && !mem->base.vk.ahardware_buffer) {
+       !import_fd_info && !mem->base.vk.ahardware_buffer &&
+       !mem->helios_external_memory) {
       const VkMemoryType *memory_type =
          &dev->physical_device->memory_properties
              .memoryTypes[mem->base.vk.memory_type_index];
@@ -656,6 +796,15 @@ vn_FreeMemory(VkDevice device,
 
    vn_device_memory_free_simple(dev, mem);
 #ifdef _WIN32
+   if (mem->helios_external_memory) {
+      /* The opened/adopted WDDM allocation is the last resource-id owner.
+       * Wait until the asynchronous renderer vkFreeMemory has consumed its
+       * imported payload before dropping that owner. */
+      vn_ring_roundtrip(dev->primary_ring);
+      vn_renderer_helios_external_memory_destroy(
+         dev->renderer, mem->helios_external_memory);
+      mem->helios_external_memory = NULL;
+   }
    if (mem->helios_vidmm_allocation)
       vn_renderer_helios_vidmm_free(dev->renderer,
                                     mem->helios_vidmm_resource,
@@ -663,6 +812,53 @@ vn_FreeMemory(VkDevice device,
 #endif
    vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
 }
+
+#ifdef _WIN32
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetMemoryWin32HandleKHR(
+   VkDevice device,
+   const VkMemoryGetWin32HandleInfoKHR *pGetWin32HandleInfo,
+   HANDLE *pHandle)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_device_memory *mem =
+      vn_device_memory_from_handle(pGetWin32HandleInfo->memory);
+
+   *pHandle = NULL;
+   if (!mem ||
+       pGetWin32HandleInfo->handleType !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       !(mem->base.vk.export_handle_types &
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT) ||
+       !mem->helios_external_memory) {
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+
+   VkResult result = vn_renderer_helios_external_memory_get_handle(
+      dev->renderer, mem->helios_external_memory, (void **)pHandle);
+   return vn_result(dev->instance, result);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetMemoryWin32HandlePropertiesKHR(
+   VkDevice device,
+   VkExternalMemoryHandleTypeFlagBits handleType,
+   HANDLE handle,
+   VkMemoryWin32HandlePropertiesKHR *pMemoryWin32HandleProperties)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   (void)handleType;
+   (void)handle;
+   pMemoryWin32HandleProperties->memoryTypeBits = 0;
+
+   /* Vulkan forbids this query for opaque Win32 handle types.  No D3D11,
+    * D3D12, or host-allocation handle type is advertised yet, so there is no
+    * non-opaque payload this entrypoint can truthfully describe. */
+   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+}
+#endif
 
 VKAPI_ATTR uint64_t VKAPI_CALL
 vn_GetDeviceMemoryOpaqueCaptureAddress(

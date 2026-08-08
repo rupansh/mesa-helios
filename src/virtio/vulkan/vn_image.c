@@ -551,8 +551,6 @@ vn_CreateImage(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    const VkAllocationCallbacks *alloc =
       pAllocator ? pAllocator : &dev->base.vk.alloc;
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      dev->physical_device->external_memory.renderer_handle_type;
    struct vn_image *img;
    VkResult result;
 
@@ -589,6 +587,11 @@ vn_CreateImage(VkDevice device,
       }
    }
 
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         dev->physical_device,
+         external_info ? external_info->handleTypes : 0);
+
    /* No need to fix external handle type for:
     * - common wsi image: dma_buf is hard-coded in wsi_configure_native_image
     * - common wsi image alias: it aligns with wsi_info on external handle
@@ -598,7 +601,8 @@ vn_CreateImage(VkDevice device,
     * Must fix the external handle type for:
     * - non-AHB external image requesting handle types different from renderer
     *
-    * Will have to fix more when renderer handle type is no longer dma_buf.
+    * Native Win32 opaque memory deliberately selects its own renderer-side
+    * handle type here, independently of the DMA_BUF scanout contract.
     */
    if (wsi_info) {
       result = vn_wsi_create_image(dev, pCreateInfo, wsi_info, alloc, &img);
@@ -1038,10 +1042,12 @@ vn_GetDeviceImageMemoryRequirements(
     * (VUID 02964/01615/01617) from dwm's composition images. The predicate
     * must match vn_CreateImage's exactly. Mirrors the
     * vn_GetDeviceBufferMemoryRequirements fix (55e3bda40b7). */
-   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
-      dev->physical_device->external_memory.renderer_handle_type;
    const VkExternalMemoryImageCreateInfo *external_info = vk_find_struct_const(
       pInfo->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      vn_renderer_handle_type_for_guest(
+         dev->physical_device,
+         external_info ? external_info->handleTypes : 0);
    const bool preserve_external =
       external_info &&
       vn_preserve_explicit_dmabuf_handle_types(
