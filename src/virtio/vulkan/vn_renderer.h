@@ -302,10 +302,15 @@ vn_renderer_helios_retire_feedback_enabled(void);
  * whose VkSemaphore owner did not destroy them first. */
 bool
 vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
-                                           uint64_t *out_cookie);
+                                            uint64_t *out_cookie);
 void
 vn_renderer_helios_present_stream_unregister(struct vn_renderer *renderer,
-                                             uint64_t cookie);
+                                              uint64_t cookie);
+bool
+vn_renderer_helios_present_buffer_read(struct vn_renderer *renderer,
+                                       uint64_t cookie,
+                                       uint32_t resource_id,
+                                       uint32_t value);
 #endif
 
 struct vn_renderer {

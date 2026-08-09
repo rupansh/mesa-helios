@@ -114,9 +114,11 @@ struct helios_unicode_string {
 #define HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT 0x000Cu
 #define HELIOS_ESCAPE_QUERY_SCANOUT           0x000Du
 #define HELIOS_ESCAPE_PRESENT_STREAM           0x0010u
+#define HELIOS_ESCAPE_PRESENT_BUFFER_READ      0x0012u
 
 #define HELIOS_PRESENT_STREAM_OP_REGISTER   1u
 #define HELIOS_PRESENT_STREAM_OP_UNREGISTER 2u
+#define HELIOS_PRESENT_BUFFER_READ_ACCEPTED 0u
 
 /* helios_escape_fence_event.out_state values (protocol/src/escape.rs). */
 #define HELIOS_FENCE_EVENT_REGISTERED       0u
@@ -186,6 +188,15 @@ struct helios_escape_present_stream {
    uint64_t cookie; /* out on REGISTER; exact in on UNREGISTER */
    uint32_t ctx_id;
    uint32_t op;
+};
+
+struct helios_escape_present_buffer_read {
+   struct helios_escape_header hdr;
+   uint64_t cookie;
+   uint32_t resource_id;
+   uint32_t ctx_id;
+   uint32_t value;
+   uint32_t out_state;
 };
 
 struct helios_escape_alloc_blob {
@@ -327,6 +338,8 @@ _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size
 _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
 _Static_assert(sizeof(struct helios_escape_present_stream) == 32,
                "present_stream size");
+_Static_assert(sizeof(struct helios_escape_present_buffer_read) == 40,
+               "present_buffer_read size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
@@ -1515,14 +1528,11 @@ vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
    struct helios *helios = (struct helios *)renderer;
    uint64_t cookie = 0;
    mtx_lock(&helios->dev_mutex);
-   /* One Venus context has one UMD-created present timeline.  Reject a
-    * different semaphore rather than trying to infer a winner or allowing
-    * two cookies to make the marker's stream identity ambiguous.  Once its
-    * VkSemaphore is destroyed, unregister clears this record and a later
-    * explicit registration is possible. */
-   const bool ok = !helios->present_streams &&
-      helios_ioctl_present_stream(helios, HELIOS_PRESENT_STREAM_OP_REGISTER,
-                                  &cookie);
+   /* Each semaphore has an exact cookie and every per-frame marker carries
+    * that cookie, so multiple timelines in one Venus context remain
+    * unambiguous. The KMD's fixed stream table is the admission bound. */
+   const bool ok = helios_ioctl_present_stream(
+      helios, HELIOS_PRESENT_STREAM_OP_REGISTER, &cookie);
    if (ok) {
       entry->cookie = cookie;
       entry->next = helios->present_streams;
@@ -1534,6 +1544,38 @@ vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
    if (!ok)
       free(entry);
    return ok;
+}
+
+bool
+vn_renderer_helios_present_buffer_read(struct vn_renderer *renderer,
+                                       uint64_t cookie,
+                                       uint32_t resource_id,
+                                       uint32_t value)
+{
+   if (!renderer || !cookie || !resource_id || !value)
+      return false;
+
+   struct helios *helios = (struct helios *)renderer;
+   bool accepted = false;
+   mtx_lock(&helios->dev_mutex);
+
+   const struct helios_present_stream *entry = helios->present_streams;
+   while (entry && entry->cookie != cookie)
+      entry = entry->next;
+
+   if (entry && helios->ctx_id) {
+      struct helios_escape_present_buffer_read req = { 0 };
+      helios_hdr_init(&req.hdr, HELIOS_ESCAPE_PRESENT_BUFFER_READ, sizeof(req));
+      req.cookie = cookie;
+      req.resource_id = resource_id;
+      req.ctx_id = helios->ctx_id;
+      req.value = value;
+      accepted = helios_escape(helios, &req, sizeof(req)) &&
+         req.out_state == HELIOS_PRESENT_BUFFER_READ_ACCEPTED;
+   }
+
+   mtx_unlock(&helios->dev_mutex);
+   return accepted;
 }
 
 void
