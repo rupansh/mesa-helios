@@ -1263,8 +1263,15 @@ vn_physical_device_init_external_semaphore_handles(
        * (VkImportSemaphoreWin32HandleInfoKHR::name). */
       physical_dev->external_binary_semaphore_handles =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      /* D3D12_FENCE_BIT is TIMELINE ONLY. A D3D12 fence is a monotonically
+       * increasing 64-bit value, which is a timeline semaphore and not a
+       * binary one; §10.3 imports Ready/Release as
+       * VkSemaphoreTypeCreateInfo{TIMELINE, initialValue=0}, and vkd3d exports
+       * its timeline semaphores under this type. Advertising it for binary
+       * semaphores would claim a payload nothing produces. */
       physical_dev->external_timeline_semaphore_handles =
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
 #endif
    }
 }

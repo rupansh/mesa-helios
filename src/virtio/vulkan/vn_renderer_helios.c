@@ -4716,6 +4716,15 @@ vn_renderer_helios_sync_create_from_win32(
    VkResult result;
    switch (handle_type) {
    case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+   /* A D3D12 fence on this stack IS a Helios WDDM monitored fence: vkd3d
+    * creates ID3D12Fence as a Vulkan timeline semaphore and shares it through
+    * this ICD's own Win32 export (libs/vkd3d/command.c:626-644,
+    * device.c:7687). So the NT handle a D3D12_FENCE_BIT import receives is the
+    * same object an OPAQUE_WIN32 import receives, and the same open applies.
+    * That identity is a property of Helios, not of Vulkan — an NT handle from
+    * a different D3D12 implementation would not be one of ours, and
+    * helios_wddm_sync_open_nt refuses it. */
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT:
       result = helios_wddm_sync_open_nt(renderer, handle, &sync->wddm_local,
                                         &sync->wddm_cpu_va);
       break;
@@ -4936,6 +4945,11 @@ vn_renderer_helios_sync_export_win32(
 
    switch (handle_type) {
    case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+   /* The NT share is the same for a D3D12 fence: the exported object is this
+    * WDDM monitored fence either way, and the handle type only records what
+    * the importer will call it. This is the export half vkd3d requires before
+    * it will create a shared ID3D12Fence at all. */
+   case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT:
       return helios_wddm_sync_share_nt(renderer, sync->wddm_local, out_handle);
    case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
       if (!sync->wddm_global)

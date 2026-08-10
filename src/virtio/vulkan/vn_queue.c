@@ -3144,9 +3144,15 @@ vn_semaphore_init_payloads(struct vn_device *dev,
    sem->payload = &sem->permanent;
 
 #if DETECT_OS_WINDOWS
+   /* D3D12_FENCE_BIT joins the two opaque types: all three are backed by the
+    * same shareable WDDM monitored fence. vkd3d creates every shared
+    * ID3D12Fence with D3D12_FENCE_BIT and refuses if it is not exportable
+    * (libs/vkd3d/command.c:636), so without it here ID3D12Fence::
+    * CreateSharedHandle cannot work at all — independently of the WSI layer. */
    if (sem->external_handle_types &
        (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)) {
       const VkExportSemaphoreWin32HandleInfoKHR *win32_export_info =
          win32_export_info_pnext;
       VkResult result = vn_renderer_sync_create(
