@@ -608,23 +608,62 @@ wsi_win32_hwnd_comp_release(struct wsi_win32_vehicle_runtime *rt,
       free(comp);
 }
 
-/* Vulkan surface format -> vehicle backbuffer format. Flip-model swapchains
- * refuse SRGB formats; UNORM + raw bytes matches what the sw path presents
- * today (the bits are sRGB-encoded either way, dwm treats composition
- * surfaces as sRGB content). Unsupported -> DXGI_FORMAT_UNKNOWN = the chain
- * latches FAILED (counted), sw path serves it. */
-static DXGI_FORMAT
-wsi_win32_vehicle_dxgi_format(VkFormat format)
+/* One source of truth for every Win32 presentation path.  The DXGI format is
+ * used by native and vehicle swapchains; the masks describe the same bytes to
+ * GDI when a software present is required.  Keep formats here only when all
+ * three paths can preserve their component layout.
+ *
+ * Flip-model swapchains refuse SRGB DXGI formats.  Mapping the Vulkan SRGB
+ * format to UNORM preserves the bytes: the surface color space still tells
+ * DWM that the encoded values are nonlinear. */
+struct wsi_win32_present_format {
+   VkFormat vk_format;
+   DXGI_FORMAT dxgi_format;
+   DWORD red_mask;
+   DWORD green_mask;
+   DWORD blue_mask;
+   DWORD alpha_mask;
+};
+
+static const struct wsi_win32_present_format wsi_win32_present_formats[] = {
+   { VK_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+     0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000 },
+   { VK_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+     0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000 },
+   { VK_FORMAT_B8G8R8A8_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
+     0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000 },
+   { VK_FORMAT_A2B10G10R10_UNORM_PACK32, DXGI_FORMAT_R10G10B10A2_UNORM,
+     0x000003ff, 0x000ffc00, 0x3ff00000, 0xc0000000 },
+};
+
+static const struct wsi_win32_present_format *
+wsi_win32_find_present_format(VkFormat format)
 {
-   switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-      return DXGI_FORMAT_B8G8R8A8_UNORM;
-   case VK_FORMAT_R8G8B8A8_UNORM:
-      return DXGI_FORMAT_R8G8B8A8_UNORM;
-   default:
-      return DXGI_FORMAT_UNKNOWN;
+   for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++) {
+      if (wsi_win32_present_formats[i].vk_format == format)
+         return &wsi_win32_present_formats[i];
    }
+
+   return NULL;
+}
+
+static BITMAPV5HEADER
+wsi_win32_bitmap_header(const struct wsi_win32_present_format *format,
+                        LONG width, LONG height)
+{
+   BITMAPV5HEADER header = {};
+   header.bV5Size = sizeof(header);
+   header.bV5Width = width;
+   header.bV5Height = -height;
+   header.bV5Planes = 1;
+   header.bV5BitCount = 32;
+   header.bV5Compression = BI_BITFIELDS;
+   header.bV5RedMask = format->red_mask;
+   header.bV5GreenMask = format->green_mask;
+   header.bV5BlueMask = format->blue_mask;
+   header.bV5AlphaMask = format->alpha_mask;
+   header.bV5CSType = LCS_sRGB;
+   return header;
 }
 
 enum wsi_win32_image_state {
@@ -963,8 +1002,9 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
    if (!wsi_win32_vehicle_enabled() || chain->dxgi)
       return;
 
-   DXGI_FORMAT format = wsi_win32_vehicle_dxgi_format(create_info->imageFormat);
-   if (format == DXGI_FORMAT_UNKNOWN) {
+   const struct wsi_win32_present_format *format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!format) {
       helios_wsi_vehicle_diag("REFUSED chain=%p unsupported VkFormat %u",
                               (void *)chain, (unsigned)create_info->imageFormat);
       InterlockedIncrement(&helios_vehicle_create_fails);
@@ -976,7 +1016,7 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
    v->hwnd = win32_surface->hwnd;
    v->width = MAX2(create_info->imageExtent.width, 1u);
    v->height = MAX2(create_info->imageExtent.height, 1u);
-   v->format = format;
+   v->format = format->dxgi_format;
    /* BufferCount >= 3: flip-model needs headroom so Present never blocks on
     * the compositor holding a buffer (design note, road 4). */
    v->buffer_count = MAX2(3u, create_info->minImageCount);
@@ -1317,23 +1357,14 @@ wsi_win32_surface_get_capabilities2(VkIcdSurfaceBase *surface,
 }
 
 
-static const struct {
-   VkFormat     format;
-} available_surface_formats[] = {
-   { VK_FORMAT_B8G8R8A8_UNORM },
-   { VK_FORMAT_R8G8B8A8_UNORM },
-   { VK_FORMAT_B8G8R8A8_SRGB },
-};
-
-
 static void
 get_sorted_vk_formats(struct wsi_device *wsi_device, VkFormat *sorted_formats)
 {
-   for (unsigned i = 0; i < ARRAY_SIZE(available_surface_formats); i++)
-      sorted_formats[i] = available_surface_formats[i].format;
+   for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++)
+      sorted_formats[i] = wsi_win32_present_formats[i].vk_format;
 
    if (wsi_device->force_bgra8_unorm_first) {
-      for (unsigned i = 0; i < ARRAY_SIZE(available_surface_formats); i++) {
+      for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++) {
          if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
             sorted_formats[i] = sorted_formats[0];
             sorted_formats[0] = VK_FORMAT_B8G8R8A8_UNORM;
@@ -1351,7 +1382,7 @@ wsi_win32_surface_get_formats(VkIcdSurfaceBase *icd_surface,
 {
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
-   VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
+   VkFormat sorted_formats[ARRAY_SIZE(wsi_win32_present_formats)];
    get_sorted_vk_formats(wsi_device, sorted_formats);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
@@ -1373,7 +1404,7 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
 {
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
-   VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
+   VkFormat sorted_formats[ARRAY_SIZE(wsi_win32_present_formats)];
    get_sorted_vk_formats(wsi_device, sorted_formats);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
@@ -1562,6 +1593,11 @@ wsi_win32_image_init(VkDevice device_h,
                      const VkAllocationCallbacks *allocator,
                      struct wsi_win32_image *image)
 {
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!present_format)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    VkResult result = wsi_create_image(&chain->base, &chain->base.image_info,
                                       &image->base);
    if (result != VK_SUCCESS)
@@ -1575,27 +1611,35 @@ wsi_win32_image_init(VkDevice device_h,
       return VK_SUCCESS;
 
    HDC wnd_dc = GetDC(chain->wnd);
-   if (!wnd_dc)
+   if (!wnd_dc) {
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_SURFACE_LOST_KHR;
+   }
 
    image->sw.dc = CreateCompatibleDC(wnd_dc);
    ReleaseDC(chain->wnd, wnd_dc);
-   if (!image->sw.dc)
+   if (!image->sw.dc) {
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    HBITMAP bmp = NULL;
 
-   BITMAPINFO info = { 0 };
-   info.bmiHeader.biSize = sizeof(BITMAPINFO);
-   info.bmiHeader.biWidth = create_info->imageExtent.width;
-   info.bmiHeader.biHeight = -create_info->imageExtent.height;
-   info.bmiHeader.biPlanes = 1;
-   info.bmiHeader.biBitCount = 32;
-   info.bmiHeader.biCompression = BI_RGB;
+   BITMAPV5HEADER info =
+      wsi_win32_bitmap_header(present_format,
+                              (LONG)create_info->imageExtent.width,
+                              (LONG)create_info->imageExtent.height);
 
-   bmp = CreateDIBSection(image->sw.dc, &info, DIB_RGB_COLORS, &image->sw.ppvBits, NULL, 0);
-   if (!bmp || !image->sw.ppvBits)
+   bmp = CreateDIBSection(image->sw.dc, (BITMAPINFO *)&info, DIB_RGB_COLORS,
+                          &image->sw.ppvBits, NULL, 0);
+   if (!bmp || !image->sw.ppvBits) {
+      if (bmp)
+         DeleteObject(bmp);
+      DeleteDC(image->sw.dc);
+      image->sw.dc = NULL;
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    SelectObject(image->sw.dc, bmp);
 
@@ -2353,13 +2397,12 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
       return chain->status;
    }
 
-   BITMAPINFO info = { 0 };
-   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-   info.bmiHeader.biWidth = present_bitmap_width;
-   info.bmiHeader.biHeight = -(LONG)chain->extent.height;
-   info.bmiHeader.biPlanes = 1;
-   info.bmiHeader.biBitCount = 32;
-   info.bmiHeader.biCompression = BI_RGB;
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(chain->base.image_info.create.format);
+   assert(present_format);
+   BITMAPV5HEADER info =
+      wsi_win32_bitmap_header(present_format, present_bitmap_width,
+                              (LONG)chain->extent.height);
 
    helios_start_ns = os_time_get_nano();
    int copied;
@@ -2369,7 +2412,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    } else {
       copied = StretchDIBits(wnd_dc, 0, 0, chain->extent.width,
                              chain->extent.height, 0, 0, chain->extent.width,
-                             chain->extent.height, present_bits, &info,
+                             chain->extent.height, present_bits,
+                             (BITMAPINFO *)&info,
                              DIB_RGB_COLORS, SRCCOPY);
    }
    helios_stretch_ns = os_time_get_nano() - helios_start_ns;
@@ -2398,6 +2442,11 @@ wsi_win32_surface_create_swapchain_dxgi(
    const VkSwapchainCreateInfoKHR *create_info,
    struct wsi_win32_swapchain *chain)
 {
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!present_format)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    IDXGIFactory4 *factory = wsi->dxgi.factory;
    ID3D12CommandQueue *queue =
       (ID3D12CommandQueue *)wsi->wsi->win32.get_d3d12_command_queue(device);
@@ -2421,7 +2470,7 @@ wsi_win32_surface_create_swapchain_dxgi(
    DXGI_SWAP_CHAIN_DESC1 desc = {
       create_info->imageExtent.width,
       create_info->imageExtent.height,
-      DXGI_FORMAT_B8G8R8A8_UNORM,
+      present_format->dxgi_format,
       create_info->imageArrayLayers > 1,  // Stereo
       { 1 },                              // SampleDesc
       0,                                  // Usage (filled in below)
@@ -2478,6 +2527,9 @@ wsi_win32_surface_create_swapchain(
       (struct wsi_win32 *) wsi_device->wsi[VK_ICD_WSI_PLATFORM_WIN32];
 
    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+
+   if (!wsi_win32_find_present_format(create_info->imageFormat))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /* Win32 requires the swapchain extent to match the current client area.
     * Reject stale and zero-area extents before image setup so invalid
