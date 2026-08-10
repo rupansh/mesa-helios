@@ -128,6 +128,10 @@ if with_platform_windows
   # protocol/src/wddm.rs's validator and must be reviewable against it without
   # 5000 lines of transport in the way.
   libvn_files += files('vn_helios_hwa2.c')
+  # A1: the HTS1 translation session (raw KMT device, HVC1 control context,
+  # role-1 reply pool, finite INIT, C51 reply). Its own TU because A2 and A3
+  # both build on it and it is single-owner per the lane brief.
+  libvn_files += files('vn_helios_translation_session.c')
   vn_deps += cc.find_library('setupapi')
   vn_deps += cc.find_library('gdi32')
   # mingw-w64 ships no D3DKMT headers; use the real WDK ones (d3dkmthk.h +
