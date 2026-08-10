@@ -18,6 +18,19 @@
  * `protocol/include/helios_wddm.h` pin the LAYOUT, and nothing pins the RULES.
  * `tools/retirement-gates.sh` is the right place for a diff gate over these two
  * bodies; until it has one, this pairing is maintained by review.
+ *
+ * ⚠⚠ AND IT HAS ALREADY DRIFTED ONCE. This is not a hypothetical residual risk;
+ * it is a measured one. Review round 3 found this body missing the `create_input`
+ * term on C44's PRIMARY_VIDPN_SOURCE_NOT_CONCRETE rule — transcribed from the
+ * Rust before the seam review added that term, and not re-transcribed after. The
+ * other two stage-dependent rules were guarded, so the gap was invisible to a
+ * skim. The failure was latent only because the sole `..._validate_create_input`
+ * caller in this ICD (`vn_renderer_helios_external_memory_create`) builds a
+ * KIND_BUFFER descriptor with no PRIMARY flag; primaries are authored by the KMD
+ * and the D3D11 UMD, neither of which runs this C. A future caller that does
+ * author a primary would have hit it. Until the diff gate exists, re-derive
+ * BOTH bodies rule by rule — the reject ORDER matching is necessary and not
+ * sufficient, because it matched here too while the predicate differed.
  */
 
 #ifndef NOMINMAX
@@ -250,7 +263,16 @@ helios_hwa2_validate_common(const HeliosWddmAllocationDescV2 *desc,
       return helios_hwa2_reject(out_reject, HELIOS_HWA2_REJECT_PACKAGE_GENERATION,
                                 desc->package_generation, package_generation, NULL);
 
-   /* ── generations: the one field whose rule differs by stage ───────────── */
+   /* ── generations: the first of the two stage-dependent rules ─────────────
+    *
+    * The two stages differ in exactly three places, and the Rust's `Hwa2Stage`
+    * doc enumerates them in this order: (1) `allocation_generation`, zero in and
+    * nonzero out — here; (2) the two `HELIOS_HWA2_FLAG_KMD_OWNED_MASK` bits,
+    * clear in and KMD-decided out — below, with the flag mask; (3) C44's
+    * primary/VidPn rule, which those bits make stage-dependent — in the C44
+    * block further down. All three are guarded by `create_input`; if you find a
+    * fourth `create_input` test here, or only two, this file has drifted from
+    * `protocol/src/wddm.rs`. */
    if (create_input) {
       if (desc->allocation_generation != 0)
          return helios_hwa2_reject(
@@ -416,7 +438,38 @@ helios_hwa2_validate_common(const HeliosWddmAllocationDescV2 *desc,
             out_reject, HELIOS_HWA2_REJECT_D3D12_RUNTIME_PRIMARY_NOT_SENTINEL,
             desc->vidpn_source, HELIOS_D3DDDI_ID_UNINITIALIZED, NULL);
    } else if (primary) {
-      if (desc->vidpn_source == HELIOS_D3DDDI_ID_UNINITIALIZED)
+      /* ⚠ THE THIRD AND LAST STAGE-DEPENDENT RULE, and the one that is easiest
+       * to "fix" back out. `!create_input` is load-bearing; do not delete it.
+       *
+       * Output: a primary without the bit is a D3D11 primary and must name its
+       * concrete source — the sentinel here would mean the KMD echoed a D3D12
+       * primary back without stamping it, and every opener would then read a
+       * primary belonging to no source at all.
+       *
+       * Input: the same bytes are the D3D12 request awaiting that stamp.
+       * D3D12_RUNTIME_PRIMARY is KMD-owned, so the create *input* for a D3D12
+       * runtime primary is necessarily PRIMARY + the sentinel + the bit CLEAR;
+       * the KMD-owned-mask rule above refuses the bit by name, so a D3D12 UMD
+       * has no other shape available to it. Demanding a concrete VidPn source of
+       * every bit-less primary on the input stage therefore refuses the only
+       * legal D3D12 request, and — worse than a refusal — makes the kernel's own
+       * stamp unreachable by construction, because the create never survives
+       * long enough for the KMD to decide the bit.
+       *
+       * That is not hypothetical. `protocol/src/wddm.rs` did exactly this until
+       * the seam review enumerated the four reachable shapes against it: a D3D12
+       * primary input with the bit clear returned PRIMARY_VIDPN_SOURCE_NOT_
+       * CONCRETE, the same input with the bit set returned KMD_OWNED_FLAG_SET_
+       * ON_INPUT, and `ok` was reachable *only* for a record that had already
+       * been stamped — i.e. only ever from the KMD's own output, never from a
+       * UMD. This file was transcribed from the pre-fix Rust and kept the
+       * defect after the Rust lost it; see `HeliosWddmAllocationDescV2::
+       * validate_stage` and the `Hwa2Stage` doc, which are authoritative.
+       *
+       * Nothing is weakened on the side every opener reads: on create-output the
+       * pair is still cross-validated in both directions. */
+      if (!create_input &&
+          desc->vidpn_source == HELIOS_D3DDDI_ID_UNINITIALIZED)
          return helios_hwa2_reject(
             out_reject, HELIOS_HWA2_REJECT_PRIMARY_VIDPN_SOURCE_NOT_CONCRETE,
             desc->vidpn_source, 0, NULL);
