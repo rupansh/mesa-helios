@@ -79,26 +79,39 @@ D3DKMT_HANDLE helios_session_device_handle(
  *
  * `reply_status` receives HVR1's signed status (VK_INCOMPLETE and friends are
  * legal outcomes of a bounded rule, not errors). A result larger than
- * `reply_capacity` is continued by the caller calling again with the returned
- * `snapshot_generation`/offset -- see helios_session_control_continue.
+ * `reply_capacity` is continued by calling helios_session_control_continue with
+ * the returned `snapshot_generation` and `total_bytes` and the accumulated
+ * offset -- all three are checked against the next reply's own header, so a
+ * caller that loses track is refused rather than spliced.
  *
  * ⛔ The payload may not name an outer D3D allocation. The only allocation this
  * carrier ever lists is the session's own reply slot.
+ *
+ * ⚠ BLOCKS when all four reply slots are checked out (§10.7: "the caller drops
+ * the lock and event-waits ... then retries"). It is not a resource failure --
+ * several entry points that reach it return `void` and could not report one.
  */
 VkResult helios_session_control(struct helios_translation_session *s,
                                 const void *payload, uint64_t payload_bytes,
                                 void *reply, uint64_t reply_capacity,
-                                uint64_t *reply_bytes, int32_t *reply_status,
+                                uint64_t *reply_bytes, uint64_t *total_bytes,
+                                int32_t *reply_status,
                                 uint64_t *snapshot_generation, bool *more);
 
 /*
  * Fetch the next chunk of an already-computed result. Never re-executes the
  * original operation and only ever asks for the exact next offset (§C66).
+ *
+ * `expected_offset` and `expected_total_bytes` are what the previous chunk
+ * produced, and both are required: slot generation and batch token prove only
+ * that a reply belongs to THIS Render, never that it is the requested range of
+ * the requested snapshot.
  */
 VkResult helios_session_control_continue(struct helios_translation_session *s,
                                          uint64_t snapshot_generation,
-                                         uint64_t expected_offset, void *reply,
-                                         uint64_t reply_capacity,
+                                         uint64_t expected_offset,
+                                         uint64_t expected_total_bytes,
+                                         void *reply, uint64_t reply_capacity,
                                          uint64_t *reply_bytes,
                                          int32_t *reply_status, bool *more);
 

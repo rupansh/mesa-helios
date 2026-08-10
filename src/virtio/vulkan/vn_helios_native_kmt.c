@@ -884,6 +884,25 @@ helios_native_context_submit(struct helios_native_context *c,
 
       const uint32_t allocation_count =
          helios_hnr2_fragment_allocation_count(batch, &plan, f);
+      /* Re-checked against the CURRENTLY ADOPTED list, not the one the gate
+       * above saw: `NewAllocationListSize` is "in: requested / out: actual"
+       * (d3dkmthk.h), the fragment loop re-adopts after every Render, and §10.7
+       * itself speaks of "a smaller list actually returned by Dxgkrnl". If that
+       * ever happens mid-batch the manifest write below would run off the end of
+       * a dxgkrnl-mapped buffer, so it is a context loss rather than a resize:
+       * fragments 0..f-1 are already in the KMD's one open assembler. */
+      if (allocation_count > c->allocation_list_entries ||
+          allocation_count > c->patch_list_entries) {
+         char why[128];
+         snprintf(why, sizeof(why),
+                  "list shrank mid-batch: COMMIT needs %u, adopted alloc=%u patch=%u",
+                  allocation_count, c->allocation_list_entries,
+                  c->patch_list_entries);
+         const VkResult r =
+            helios_native_lose(c, HELIOS_NATIVE_REFUSE_LIST_CAPACITY, why, 0);
+         LeaveCriticalSection(&c->lock);
+         return r;
+      }
       for (uint32_t i = 0; i < allocation_count; i++) {
          c->allocation_list[i].Value = 0;
          c->allocation_list[i].hAllocation = batch->allocations[i].handle;

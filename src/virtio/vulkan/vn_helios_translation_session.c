@@ -113,8 +113,13 @@ struct helios_translation_session {
 
    struct helios_reply_slot slots[HELIOS_HVM1_REPLY_SLOT_COUNT];
    uint64_t next_slot_generation;
+   /* §10.7: "Reset poisons all slots and wakes device-lost; it never marks a
+    * reply complete." Set once the carrier is gone, so a waiter cannot sleep on
+    * a slot whose owner will never publish. */
+   bool poisoned;
 
    CRITICAL_SECTION lock;
+   CONDITION_VARIABLE slot_free;
 
    uint64_t session_generation;
    uint64_t capability_low;
@@ -125,22 +130,48 @@ struct helios_translation_session {
 
 /* ── slot checkout ──────────────────────────────────────────────────────────*/
 
+/*
+ * §10.7: "When all four are busy, the caller drops the lock and event-waits only
+ * for the oldest exact slot needed, then retries."
+ *
+ * ⛔ NOT a resource failure. The fifth concurrent control call is an ordinary
+ * workload -- five DXVK/vkd3d worker threads reach it with two pipeline creates
+ * and a requirements query -- and several of the entry points that get here
+ * return `void`, so they have no channel to report one. `SleepConditionVariableCS`
+ * releases the session lock for the duration of the wait, which is also §10.7's
+ * "one short session lock protects only checkout/publication, never ... an event
+ * wait", and it wakes on a completion rather than polling.
+ */
 static bool
 helios_slot_acquire(struct helios_translation_session *s, unsigned *out_index,
                     uint64_t *out_generation)
 {
    bool got = false;
+   unsigned waits = 0;
    EnterCriticalSection(&s->lock);
-   for (unsigned i = 0; i < HELIOS_HVM1_REPLY_SLOT_COUNT; i++) {
-      if (s->slots[i].in_use)
-         continue;
-      s->slots[i].in_use = true;
-      s->slots[i].generation = s->next_slot_generation++;
-      *out_index = i;
-      *out_generation = s->slots[i].generation;
-      got = true;
-      break;
+   while (!s->poisoned) {
+      for (unsigned i = 0; i < HELIOS_HVM1_REPLY_SLOT_COUNT; i++) {
+         if (s->slots[i].in_use)
+            continue;
+         s->slots[i].in_use = true;
+         s->slots[i].generation = s->next_slot_generation++;
+         *out_index = i;
+         *out_generation = s->slots[i].generation;
+         got = true;
+         break;
+      }
+      if (got)
+         break;
+      /* Bounded slices only so a leaked slot reports itself; the wait itself is
+       * unbounded, because the owner either publishes or poisons. */
+      if (!SleepConditionVariableCS(&s->slot_free, &s->lock, 5000) &&
+          GetLastError() == ERROR_TIMEOUT && ++waits % 4 == 0)
+         helios_session_refuse(HELIOS_SESSION_REFUSE_SLOT_EXHAUSTED,
+                               "still waiting for a reply slot after 20s", 0);
    }
+   if (!got && s->poisoned)
+      helios_session_refuse(HELIOS_SESSION_REFUSE_SLOT_EXHAUSTED,
+                            "session poisoned while waiting for a slot", 0);
    LeaveCriticalSection(&s->lock);
    return got;
 }
@@ -152,6 +183,18 @@ helios_slot_release(struct helios_translation_session *s, unsigned index)
    if (index < HELIOS_HVM1_REPLY_SLOT_COUNT)
       s->slots[index].in_use = false;
    LeaveCriticalSection(&s->lock);
+   WakeAllConditionVariable(&s->slot_free);
+}
+
+/* The carrier is gone: no slot will ever be published again, so wake every
+ * waiter with failure rather than leaving them asleep on a dead context. */
+static void
+helios_session_poison(struct helios_translation_session *s)
+{
+   EnterCriticalSection(&s->lock);
+   s->poisoned = true;
+   LeaveCriticalSection(&s->lock);
+   WakeAllConditionVariable(&s->slot_free);
 }
 
 /* ── the finite HNR2 control transaction ────────────────────────────────────
@@ -160,10 +203,25 @@ helios_slot_release(struct helios_translation_session *s, unsigned index)
  * reply slot writable, zero patch records. ⛔ This carrier may never name an
  * outer D3D allocation (§10.4): the slot is the only entry it ever lists.
  */
+/*
+ * Everything `HeliosVenusReplyV1::validate` calls `Hvr1Expect` that this side
+ * cannot derive from the transaction itself. A first chunk knows neither the
+ * snapshot nor its size; a continuation must repeat both exactly.
+ */
+struct helios_reply_expect {
+   bool have_snapshot;
+   uint64_t snapshot_generation;
+   bool have_total;
+   uint64_t total_bytes;
+   uint64_t chunk_offset;
+};
+
 static VkResult
 helios_transact(struct helios_translation_session *s, const void *payload,
-                uint64_t payload_bytes, void *reply, uint64_t reply_capacity,
-                uint64_t *reply_bytes, int32_t *reply_status,
+                uint64_t payload_bytes,
+                const struct helios_reply_expect *expect, void *reply,
+                uint64_t reply_capacity, uint64_t *reply_bytes,
+                uint64_t *total_bytes, int32_t *reply_status,
                 uint64_t *snapshot_generation, bool *more,
                 enum helios_session_refusal_site render_site,
                 enum helios_session_refusal_site wait_site,
@@ -171,6 +229,8 @@ helios_transact(struct helios_translation_session *s, const void *payload,
 {
    if (reply_bytes)
       *reply_bytes = 0;
+   if (total_bytes)
+      *total_bytes = 0;
    if (more)
       *more = false;
 
@@ -193,12 +253,8 @@ helios_transact(struct helios_translation_session *s, const void *payload,
 
    unsigned slot_index = 0;
    uint64_t slot_generation = 0;
-   if (!helios_slot_acquire(s, &slot_index, &slot_generation)) {
-      /* §10.7: exhaustion returns resource failure and never waits or spills. */
-      helios_session_refuse(HELIOS_SESSION_REFUSE_SLOT_EXHAUSTED,
-                            "all four reply slots outstanding", 0);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
+   if (!helios_slot_acquire(s, &slot_index, &slot_generation))
+      return VK_ERROR_DEVICE_LOST; /* poisoned: the carrier is gone */
 
    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
 
@@ -231,6 +287,8 @@ helios_transact(struct helios_translation_session *s, const void *payload,
        * A2 has already marked it so, and there is no other transport. */
       helios_session_refuse(render_site, "native submit", (unsigned)vr);
       helios_slot_release(s, slot_index);
+      if (vr == VK_ERROR_DEVICE_LOST)
+         helios_session_poison(s);
       return vr;
    }
 
@@ -241,6 +299,8 @@ helios_transact(struct helios_translation_session *s, const void *payload,
    if (vr != VK_SUCCESS) {
       helios_session_refuse(wait_site, "C51 wait", (unsigned)vr);
       helios_slot_release(s, slot_index);
+      if (vr == VK_ERROR_DEVICE_LOST)
+         helios_session_poison(s);
       return vr;
    }
 
@@ -270,6 +330,47 @@ helios_transact(struct helios_translation_session *s, const void *payload,
       snprintf(why, sizeof(why), "session generation mismatch");
       goto reply_refused;
    }
+   /* ⛔ Below this line is a transcription of protocol/src/native_render.rs
+    * `HeliosVenusReplyV1::validate`, arm for arm and in its order. It is not a
+    * selection of the interesting checks: the three arms a shorter version
+    * dropped turn a malformed reply into a non-terminating continuation loop
+    * (MORE with an empty chunk), into a prefix reported as a complete result
+    * (FINAL short of total_bytes), or into bytes spliced at the wrong offset
+    * (chunk_offset unread). */
+   if (r.snapshot_generation == 0 ||
+       (expect->have_snapshot &&
+        r.snapshot_generation != expect->snapshot_generation)) {
+      snprintf(why, sizeof(why), "snapshot generation %llu is not %llu",
+               (unsigned long long)r.snapshot_generation,
+               (unsigned long long)expect->snapshot_generation);
+      goto reply_refused;
+   }
+   if (r.total_bytes > HELIOS_HVR1_MAX_SNAPSHOT_BYTES ||
+       (expect->have_total && r.total_bytes != expect->total_bytes)) {
+      snprintf(why, sizeof(why), "total_bytes=%llu (expected %llu)",
+               (unsigned long long)r.total_bytes,
+               (unsigned long long)expect->total_bytes);
+      goto reply_refused;
+   }
+   if (r.chunk_offset != expect->chunk_offset) {
+      snprintf(why, sizeof(why), "chunk_offset=%llu is not the requested %llu",
+               (unsigned long long)r.chunk_offset,
+               (unsigned long long)expect->chunk_offset);
+      goto reply_refused;
+   }
+   if ((uint64_t)r.chunk_bytes > HELIOS_HVR1_MAX_CHUNK_BYTES ||
+       (uint64_t)r.chunk_bytes > max_chunk) {
+      snprintf(why, sizeof(why), "chunk_bytes=%u exceeds the granted %llu",
+               (unsigned)r.chunk_bytes, (unsigned long long)max_chunk);
+      goto reply_refused;
+   }
+   /* No overflow: chunk_offset was just proved equal to an offset this side
+    * accumulated (<= 64 MiB) and chunk_bytes is <= 15 MiB. */
+   const uint64_t chunk_end = r.chunk_offset + (uint64_t)r.chunk_bytes;
+   if (chunk_end > r.total_bytes) {
+      snprintf(why, sizeof(why), "chunk overruns the snapshot");
+      goto reply_refused;
+   }
    if ((r.flags & ~HELIOS_HVR1_FLAG_MASK) != 0 ||
        (r.flags & HELIOS_HVR1_FLAG_MASK) == 0 ||
        (r.flags & HELIOS_HVR1_FLAG_MASK) == HELIOS_HVR1_FLAG_MASK) {
@@ -277,10 +378,20 @@ helios_transact(struct helios_translation_session *s, const void *payload,
                (unsigned)r.flags);
       goto reply_refused;
    }
-   if ((uint64_t)r.chunk_bytes > max_chunk ||
-       (uint64_t)r.chunk_bytes > r.total_bytes) {
-      snprintf(why, sizeof(why), "chunk_bytes=%u exceeds capacity or total",
-               (unsigned)r.chunk_bytes);
+   if (r.flags & HELIOS_HVR1_FLAG_MORE) {
+      if (r.chunk_bytes == 0) {
+         snprintf(why, sizeof(why), "MORE with an empty chunk makes no progress");
+         goto reply_refused;
+      }
+      if (chunk_end >= r.total_bytes) {
+         snprintf(why, sizeof(why), "MORE at or past the snapshot end");
+         goto reply_refused;
+      }
+   } else if (chunk_end != r.total_bytes) {
+      snprintf(why, sizeof(why),
+               "FINAL %llu bytes short of total_bytes -- a prefix is never a "
+               "complete result",
+               (unsigned long long)(r.total_bytes - chunk_end));
       goto reply_refused;
    }
 
@@ -288,6 +399,8 @@ helios_transact(struct helios_translation_session *s, const void *payload,
       memcpy(reply, slot + HELIOS_HVR1_HEADER_SIZE, r.chunk_bytes);
    if (reply_bytes)
       *reply_bytes = r.chunk_bytes;
+   if (total_bytes)
+      *total_bytes = r.total_bytes;
    if (reply_status)
       *reply_status = r.status;
    if (snapshot_generation)
@@ -308,13 +421,18 @@ VkResult
 helios_session_control(struct helios_translation_session *s, const void *payload,
                        uint64_t payload_bytes, void *reply,
                        uint64_t reply_capacity, uint64_t *reply_bytes,
-                       int32_t *reply_status, uint64_t *snapshot_generation,
-                       bool *more)
+                       uint64_t *total_bytes, int32_t *reply_status,
+                       uint64_t *snapshot_generation, bool *more)
 {
    if (!s || !payload)
       return VK_ERROR_INITIALIZATION_FAILED;
-   return helios_transact(s, payload, payload_bytes, reply, reply_capacity,
-                          reply_bytes, reply_status, snapshot_generation, more,
+   /* A first chunk knows neither the snapshot nor its size, but it does know its
+    * offset: the head of a result starts at zero, and a header that says
+    * otherwise is not this result's head. */
+   const struct helios_reply_expect expect = { .chunk_offset = 0 };
+   return helios_transact(s, payload, payload_bytes, &expect, reply,
+                          reply_capacity, reply_bytes, total_bytes, reply_status,
+                          snapshot_generation, more,
                           HELIOS_SESSION_REFUSE_CONTROL_RENDER,
                           HELIOS_SESSION_REFUSE_CONTROL_WAIT,
                           HELIOS_SESSION_REFUSE_CONTROL_REPLY);
@@ -323,16 +441,20 @@ helios_session_control(struct helios_translation_session *s, const void *payload
 VkResult
 helios_session_control_continue(struct helios_translation_session *s,
                                 uint64_t snapshot_generation,
-                                uint64_t expected_offset, void *reply,
+                                uint64_t expected_offset,
+                                uint64_t expected_total_bytes, void *reply,
                                 uint64_t reply_capacity, uint64_t *reply_bytes,
                                 int32_t *reply_status, bool *more)
 {
-   if (!s || !snapshot_generation)
+   if (!s || !snapshot_generation || expected_offset >= expected_total_bytes)
       return VK_ERROR_INITIALIZATION_FAILED;
 
    const uint64_t max_chunk =
       reply_capacity > HELIOS_HVR1_MAX_CHUNK_BYTES ? HELIOS_HVR1_MAX_CHUNK_BYTES
                                                    : reply_capacity;
+   if (max_chunk == 0)
+      return VK_ERROR_INITIALIZATION_FAILED; /* Hvr1ContinuationReject::MaxChunkBytesZero */
+
    HeliosVenusReplyContinuationV1 cont;
    memset(&cont, 0, sizeof(cont));
    cont.package_generation = HELIOS_PACKAGE_GENERATION;
@@ -341,9 +463,18 @@ helios_session_control_continue(struct helios_translation_session *s,
    cont.expected_offset = expected_offset;
    cont.max_chunk_bytes = (uint32_t)max_chunk;
 
-   uint64_t got_snapshot = 0;
-   return helios_transact(s, &cont, sizeof(cont), reply, reply_capacity,
-                          reply_bytes, reply_status, &got_snapshot, more,
+   /* ⛔ The whole point of a continuation: the reply must be the exact next
+    * bytes OF THE SAME snapshot. Slot generation and batch token only prove the
+    * reply belongs to this Render. */
+   const struct helios_reply_expect expect = {
+      .have_snapshot = true,
+      .snapshot_generation = snapshot_generation,
+      .have_total = true,
+      .total_bytes = expected_total_bytes,
+      .chunk_offset = expected_offset,
+   };
+   return helios_transact(s, &cont, sizeof(cont), &expect, reply, reply_capacity,
+                          reply_bytes, NULL, reply_status, NULL, more,
                           HELIOS_SESSION_REFUSE_CONTROL_RENDER,
                           HELIOS_SESSION_REFUSE_CONTROL_WAIT,
                           HELIOS_SESSION_REFUSE_CONTROL_REPLY);
@@ -428,6 +559,7 @@ helios_translation_session_create(LUID adapter_luid,
    if (!s)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    InitializeCriticalSection(&s->lock);
+   InitializeConditionVariable(&s->slot_free);
    s->next_slot_generation = 1;
 
    NTSTATUS st;
@@ -578,9 +710,10 @@ helios_translation_session_create(LUID adapter_luid,
    uint64_t reply_bytes = 0;
    int32_t reply_status = 0;
    bool more = false;
+   const struct helios_reply_expect init_expect = { .chunk_offset = 0 };
    VkResult r = helios_transact(
-      s, &init, sizeof(init), &reply, sizeof(reply), &reply_bytes, &reply_status,
-      NULL, &more, HELIOS_SESSION_REFUSE_INIT_RENDER,
+      s, &init, sizeof(init), &init_expect, &reply, sizeof(reply), &reply_bytes,
+      NULL, &reply_status, NULL, &more, HELIOS_SESSION_REFUSE_INIT_RENDER,
       HELIOS_SESSION_REFUSE_INIT_WAIT, HELIOS_SESSION_REFUSE_INIT_REPLY);
    if (r != VK_SUCCESS)
       goto fail;
