@@ -1131,8 +1131,25 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
    }
 
    /* --- exact external-semaphore query: D3D12_FENCE_BIT IMPORTABLE --- */
+   /*
+    * The query must describe the semaphore this layer will actually create.
+    * §10.3:1170-1178 creates Ready[i]/Release[i] with
+    * VkSemaphoreTypeCreateInfo{TIMELINE, initialValue=0} and then imports
+    * D3D12_FENCE_BIT into them, so the capability question is about a TIMELINE
+    * semaphore. Omitting this chain asks about a BINARY one — a semaphore this
+    * layer never creates — and a driver is entitled to answer differently:
+    * measured on the Helios ICD 2026-08-10, D3D12_FENCE_BIT is importable for
+    * timeline semaphores and absent for binary ones, so the unchained query
+    * refused a device that satisfies the contract.
+    */
+   VkSemaphoreTypeCreateInfo sem_type_info = {};
+   sem_type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+   sem_type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+   sem_type_info.initialValue = 0;
+
    VkPhysicalDeviceExternalSemaphoreInfo sem_info = {};
    sem_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO;
+   sem_info.pNext = &sem_type_info;
    sem_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
    VkExternalSemaphoreProperties sem_props = {};
    sem_props.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
@@ -2050,41 +2067,73 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
          *pDevice, HELIOS_SET_PRESENTABLE_IMAGE_NAME);
 
    if (wsi) {
+      /*
+       * The application's own apiVersion, checked before the proc table,
+       * because it is the usual reason the table has holes and the two are
+       * easy to confuse. The layer's WSI path needs core 1.3 entry points
+       * (vkQueueSubmit2, vkCmdPipelineBarrier2); the loader returns NULL from
+       * vkGetDeviceProcAddr for core functions above VkApplicationInfo::
+       * apiVersion, so a 1.1 application produces a NULL vkQueueSubmit2 on a
+       * 1.4 device. Reporting that as "missing device proc" blames the driver
+       * for the application's declaration.
+       *
+       * This is what create_device_refused_api_below_13 was named for. It had
+       * never been incremented, because the check did not exist —
+       * physdev_refused_api_below_13 covers the DEVICE's version, which is a
+       * different question with a different answer.
+       */
+      if (VK_API_VERSION_MAJOR(inst->app_api_version) < 1 ||
+          (VK_API_VERSION_MAJOR(inst->app_api_version) == 1 &&
+           VK_API_VERSION_MINOR(inst->app_api_version) < 3)) {
+         PFN_vkDestroyDevice destroy = dev->disp.DestroyDevice;
+         delete dev;
+         if (destroy)
+            destroy(*pDevice, pAllocator);
+         *pDevice = VK_NULL_HANDLE;
+         return helios_refuse(HELIOS_CNT_create_device_refused_api_below_13,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "application requested an apiVersion below 1.3");
+      }
+
       /* Every function the WSI path uses must exist before any NT object is
        * created (§10.7:2281-2282). */
-      const void *required[] = {
-         (const void *)dev->disp.QueueSubmit2,
-         (const void *)dev->disp.CreateImage,
-         (const void *)dev->disp.DestroyImage,
-         (const void *)dev->disp.BindImageMemory2,
-         (const void *)dev->disp.GetImageMemoryRequirements2,
-         (const void *)dev->disp.AllocateMemory,
-         (const void *)dev->disp.FreeMemory,
-         (const void *)dev->disp.GetMemoryWin32HandlePropertiesKHR,
-         (const void *)dev->disp.CreateSemaphore,
-         (const void *)dev->disp.DestroySemaphore,
-         (const void *)dev->disp.ImportSemaphoreWin32HandleKHR,
-         (const void *)dev->disp.CreateCommandPool,
-         (const void *)dev->disp.DestroyCommandPool,
-         (const void *)dev->disp.ResetCommandPool,
-         (const void *)dev->disp.AllocateCommandBuffers,
-         (const void *)dev->disp.BeginCommandBuffer,
-         (const void *)dev->disp.EndCommandBuffer,
-         (const void *)dev->disp.CmdPipelineBarrier2,
-         (const void *)dev->disp.CreateFence,
-         (const void *)dev->disp.DestroyFence,
-         (const void *)dev->disp.WaitForFences,
-         (const void *)dev->disp.ResetFences,
+      /* Paired with their names: a bare pointer array reports only THAT
+       * something is missing, and the reader then has to guess which of the
+       * twenty it was. Naming it is the difference between a refusal that
+       * ends the investigation and one that starts it. */
+      const struct { const void *fn; const char *name; } required[] = {
+         { (const void *)dev->disp.QueueSubmit2, "vkQueueSubmit2" },
+         { (const void *)dev->disp.CreateImage, "vkCreateImage" },
+         { (const void *)dev->disp.DestroyImage, "vkDestroyImage" },
+         { (const void *)dev->disp.BindImageMemory2, "vkBindImageMemory2" },
+         { (const void *)dev->disp.GetImageMemoryRequirements2, "vkGetImageMemoryRequirements2" },
+         { (const void *)dev->disp.AllocateMemory, "vkAllocateMemory" },
+         { (const void *)dev->disp.FreeMemory, "vkFreeMemory" },
+         { (const void *)dev->disp.GetMemoryWin32HandlePropertiesKHR, "vkGetMemoryWin32HandlePropertiesKHR" },
+         { (const void *)dev->disp.CreateSemaphore, "vkCreateSemaphore" },
+         { (const void *)dev->disp.DestroySemaphore, "vkDestroySemaphore" },
+         { (const void *)dev->disp.ImportSemaphoreWin32HandleKHR, "vkImportSemaphoreWin32HandleKHR" },
+         { (const void *)dev->disp.CreateCommandPool, "vkCreateCommandPool" },
+         { (const void *)dev->disp.DestroyCommandPool, "vkDestroyCommandPool" },
+         { (const void *)dev->disp.ResetCommandPool, "vkResetCommandPool" },
+         { (const void *)dev->disp.AllocateCommandBuffers, "vkAllocateCommandBuffers" },
+         { (const void *)dev->disp.BeginCommandBuffer, "vkBeginCommandBuffer" },
+         { (const void *)dev->disp.EndCommandBuffer, "vkEndCommandBuffer" },
+         { (const void *)dev->disp.CmdPipelineBarrier2, "vkCmdPipelineBarrier2" },
+         { (const void *)dev->disp.CreateFence, "vkCreateFence" },
+         { (const void *)dev->disp.DestroyFence, "vkDestroyFence" },
+         { (const void *)dev->disp.WaitForFences, "vkWaitForFences" },
+         { (const void *)dev->disp.ResetFences, "vkResetFences" },
       };
-      for (const void *p : required) {
-         if (p == nullptr) {
+      for (const auto &r : required) {
+         if (r.fn == nullptr) {
             PFN_vkDestroyDevice destroy = dev->disp.DestroyDevice;
             delete dev;
             if (destroy)
                destroy(*pDevice, pAllocator);
             *pDevice = VK_NULL_HANDLE;
             return helios_refuse(HELIOS_CNT_create_device_refused_missing_device_proc,
-                                 VK_ERROR_INITIALIZATION_FAILED, nullptr);
+                                 VK_ERROR_INITIALIZATION_FAILED, r.name);
          }
       }
 
