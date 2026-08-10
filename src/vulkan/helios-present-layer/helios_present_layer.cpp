@@ -949,22 +949,16 @@ helios_lower_has_device_extension(HeliosInstance *inst, VkPhysicalDevice phys,
  * Failure of ANY row makes the surface report no support; nothing is
  * approximated and no fallback path exists.
  */
-static const HeliosPhysDevInfo &
-helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
+static void
+helios_admit_compute(HeliosInstance *inst, VkPhysicalDevice phys,
+                     HeliosPhysDevInfo &info)
 {
-   std::unique_lock<std::mutex> g(inst->lock);
-   HeliosPhysDevInfo &info = inst->phys[phys];
-   if (info.computed)
-      return info;
-   info.computed = true;
-   info.admitted = false;
-   g.unlock();
 
    /* --- Vulkan 1.3 --- */
    VkPhysicalDeviceProperties props = {};
    if (!inst->disp.GetPhysicalDeviceProperties) {
       info.reject_reason = "no vkGetPhysicalDeviceProperties";
-      return info;
+      return;
    }
    inst->disp.GetPhysicalDeviceProperties(phys, &props);
    info.api_version = props.apiVersion;
@@ -974,7 +968,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "lower device is not Vulkan 1.3";
       helios_refuse(HELIOS_CNT_physdev_refused_api_below_13, VK_ERROR_INITIALIZATION_FAILED,
                     info.reject_reason);
-      return info;
+      return;
    }
 
    /* --- LUID / UUIDs --- */
@@ -985,14 +979,14 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
    props2.pNext = &id;
    if (!inst->disp.GetPhysicalDeviceProperties2) {
       info.reject_reason = "no vkGetPhysicalDeviceProperties2";
-      return info;
+      return;
    }
    inst->disp.GetPhysicalDeviceProperties2(phys, &props2);
    if (!id.deviceLUIDValid) {
       info.reject_reason = "lower device reports no LUID";
       helios_refuse(HELIOS_CNT_physdev_refused_no_luid, VK_ERROR_INITIALIZATION_FAILED,
                     info.reject_reason);
-      return info;
+      return;
    }
    memcpy(&info.luid, id.deviceLUID, sizeof(info.luid));
    memcpy(info.device_uuid, id.deviceUUID, VK_UUID_SIZE);
@@ -1004,7 +998,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "no DXGI adapter with that LUID";
       helios_refuse(HELIOS_CNT_physdev_refused_no_dxgi_adapter,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    adapter->Release();
 
@@ -1027,7 +1021,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "no canonical unprotected graphics family";
       helios_refuse(HELIOS_CNT_physdev_refused_no_canonical_family,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    info.canonical_family = canonical;
    info.canonical_queue_count = qprops[canonical].queueCount;
@@ -1035,7 +1029,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "canonical family reports q < 2";
       helios_refuse(HELIOS_CNT_physdev_refused_queue_capacity,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
 
    /* --- the lower Win32 external extensions must exist (§10.7:2276-2277) --- */
@@ -1046,7 +1040,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "lower ICD lacks the Win32 external extensions";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
 
    /* --- exact external-image query: IMPORTABLE and DEDICATED_ONLY for the
@@ -1088,7 +1082,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
                            "(layer dispatch defect, not an ICD capability)";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    VkResult fmt_query =
       inst->disp.GetPhysicalDeviceImageFormatProperties2(phys, &fmt_info, &fmt_props);
@@ -1111,7 +1105,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       }
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    const VkExternalMemoryFeatureFlags mem_features =
       ext_props.externalMemoryProperties.externalMemoryFeatures;
@@ -1119,7 +1113,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "D3D12_RESOURCE_BIT not IMPORTABLE";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    if (!(mem_features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT)) {
       /* §10.3:1150-1151 requires the query to report mandatory DEDICATED_ONLY
@@ -1127,7 +1121,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "D3D12_RESOURCE_BIT not DEDICATED_ONLY";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_dedicated,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
 
    /* --- exact external-semaphore query: D3D12_FENCE_BIT IMPORTABLE --- */
@@ -1157,7 +1151,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "no vkGetPhysicalDeviceExternalSemaphoreProperties";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
    inst->disp.GetPhysicalDeviceExternalSemaphoreProperties(phys, &sem_info,
                                                            &sem_props);
@@ -1166,7 +1160,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
       info.reject_reason = "D3D12_FENCE_BIT not IMPORTABLE";
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-      return info;
+      return;
    }
 
    /* --- singleton device group (C45, §10.7:2320-2322) --- */
@@ -1193,7 +1187,7 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
                info.reject_reason = "physical device is not a one-member group";
                helios_refuse(HELIOS_CNT_physdev_refused_not_singleton_group,
                              VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
-               return info;
+               return;
             }
          }
       }
@@ -1203,7 +1197,36 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
    info.reject_reason = "admitted";
    helios_log("[helios-wsi] physical device %p admitted: canonical family %u, q=%u",
               (void *)phys, info.canonical_family, info.canonical_queue_count);
-   return info;
+   return;
+}
+
+/* Compute into a local and publish under the lock. §13.3 forbids holding
+ * inst->lock across the DXGI / lower-ICD calls above, but publishing `computed`
+ * BEFORE the record is filled handed a racing caller `admitted=false,
+ * reason="not evaluated"` on an admissible adapter — and raced the writes. The
+ * computation is pure, so a duplicate on first use is cheaper than a wrong
+ * answer; first writer wins. */
+static const HeliosPhysDevInfo &
+helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
+{
+   {
+      std::lock_guard<std::mutex> g(inst->lock);
+      const HeliosPhysDevInfo &cached = inst->phys[phys];
+      if (cached.computed)
+         return cached;
+   }
+
+   HeliosPhysDevInfo local;
+   local.admitted = false;
+   local.reject_reason = "not evaluated";
+   helios_admit_compute(inst, phys, local);
+   local.computed = true;
+
+   std::lock_guard<std::mutex> g(inst->lock);
+   HeliosPhysDevInfo &slot = inst->phys[phys];
+   if (!slot.computed)
+      slot = local;
+   return slot;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -3014,6 +3037,12 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
 
       {
          std::lock_guard<std::mutex> g(sc->lock);
+         /* state_event is manual-reset and the present tail Sets it every frame,
+          * so without this it latches and the wait below spins. Reset under
+          * sc->lock before re-reading state: every Set is made under this same
+          * lock, so no wake-up can be lost. */
+         if (sc->state_event)
+            ResetEvent(sc->state_event);
          VkResult st = helios_swapchain_status(sc);
          if (st != VK_SUCCESS) {
             helios_count(st == VK_ERROR_DEVICE_LOST ? HELIOS_CNT_acquire_refused_lost
@@ -3259,6 +3288,24 @@ struct HeliosPresentItem {
    uint64_t epoch;
 };
 
+/* A present-side D3D/DXGI failure happens AFTER ownership has transferred and the
+ * slot is PRESENT_QUEUED, but before the queue has signalled Release[i]=epoch —
+ * and nothing else can ever advance that fence. Without this, the slot is
+ * unreachable by helios_refresh_slots and helios_wait_release blocks forever, so
+ * vkDestroySwapchainKHR hangs. Force the fence from the CPU, restore the state
+ * the drain understands, and announce the loss. */
+static void
+helios_present_fail_slot(HeliosSwapchain *sc, HeliosSlot &slot, uint64_t epoch)
+{
+   if (slot.release && slot.release->GetCompletedValue() < epoch)
+      slot.release->Signal(epoch);
+   std::lock_guard<std::mutex> g(sc->lock);
+   slot.state = HELIOS_SLOT_RELEASE_QUEUED;
+   sc->lost = true;
+   if (sc->state_event)
+      SetEvent(sc->state_event);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL
 helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
@@ -3454,6 +3501,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
+         helios_present_fail_slot(sc, slot, epoch);
          continue;
       }
       ID3D12Resource *back = sc->backbuffers[j];
@@ -3485,6 +3533,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
+         helios_present_fail_slot(sc, slot, epoch);
          continue;
       }
 
@@ -3494,6 +3543,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
+         helios_present_fail_slot(sc, slot, epoch);
          continue;
       }
 
@@ -3545,11 +3595,18 @@ helios_wait_release(HeliosSlot &slot)
 {
    if (!slot.release || slot.epoch == 0)
       return true;
-   if (slot.release->GetCompletedValue() >= slot.epoch)
-      return true;
-   if (FAILED(slot.release->SetEventOnCompletion(slot.epoch, slot.release_event)))
-      return false;
-   return WaitForSingleObject(slot.release_event, INFINITE) == WAIT_OBJECT_0;
+   /* Loop on the fence value, not the event: release_event is auto-reset with two
+    * consumers, so acquire can leave a registration armed that later latches with
+    * no waiter, and a single Wait would report "released" while the GPU is still
+    * reading — with teardown as the caller. */
+   for (;;) {
+      if (slot.release->GetCompletedValue() >= slot.epoch)
+         return true;
+      if (FAILED(slot.release->SetEventOnCompletion(slot.epoch, slot.release_event)))
+         return false;
+      if (WaitForSingleObject(slot.release_event, INFINITE) != WAIT_OBJECT_0)
+         return false;
+   }
 }
 
 /*
