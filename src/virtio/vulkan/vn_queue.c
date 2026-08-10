@@ -3145,10 +3145,38 @@ vn_semaphore_init_payloads(struct vn_device *dev,
 
 #if DETECT_OS_WINDOWS
    /* D3D12_FENCE_BIT joins the two opaque types: all three are backed by the
-    * same shareable WDDM monitored fence. vkd3d creates every shared
-    * ID3D12Fence with D3D12_FENCE_BIT and refuses if it is not exportable
-    * (libs/vkd3d/command.c:636), so without it here ID3D12Fence::
-    * CreateSharedHandle cannot work at all — independently of the WSI layer. */
+    * same shareable WDDM monitored fence.
+    *
+    * ⚠ THREE CONDITIONS, NOT ONE. `d3d12_shared_fence_create` is the only caller
+    * that passes `shared = true` to vkd3d's `vkd3d_create_timeline_semaphore`,
+    * and that arm queries vkGetPhysicalDeviceExternalSemaphoreProperties for
+    * handleType = D3D12_FENCE_BIT with a TIMELINE VkSemaphoreTypeCreateInfo in
+    * pNext, then returns E_NOTIMPL ("D3D12-Fence shared timeline semaphores not
+    * supported by host") unless ALL THREE hold:
+    *   1. externalSemaphoreFeatures & EXPORTABLE_BIT
+    *   2. externalSemaphoreFeatures & IMPORTABLE_BIT
+    *   3. exportFromImportedHandleTypes & D3D12_FENCE_BIT
+    * (`vkd3d-proton-helios/libs/vkd3d/command.c`, in
+    * `vkd3d_create_timeline_semaphore` — cite the symbol, the line has moved.)
+    *
+    * This ICD satisfies all three, but only because of what it reports, not by
+    * accident: `vn_GetPhysicalDeviceExternalSemaphoreProperties`
+    * (vn_physical_device.c) selects the TIMELINE handle set for a TIMELINE
+    * query, and when the asked-for handleType is in that set it answers with
+    * compatibleHandleTypes = exportFromImportedHandleTypes = the whole set and
+    * features = EXPORTABLE | IMPORTABLE. The set itself is built by
+    * `vn_physical_device_init_external_semaphore_handles`, which puts
+    * D3D12_FENCE_BIT in the TIMELINE set on Windows (timeline only — a D3D12
+    * fence is a monotonic 64-bit value). Drop it there and condition 3 fails, so
+    * ID3D12Fence::CreateSharedHandle cannot work at all — independently of the
+    * WSI layer.
+    *
+    * ⚠ OPAQUE_WIN32_KMT_BIT is tested here but is deliberately NEVER advertised
+    * by `vn_physical_device_init_external_semaphore_handles` (dxgkrnl refuses a
+    * monitored fence with Shared=1 and no NtSecuritySharing). It stays in this
+    * predicate as a fail-safe superset: a caller that asks for it anyway still
+    * gets a SHAREABLE sync rather than a device-only one it would then fail to
+    * export. Do not read its presence here as an advertisement. */
    if (sem->external_handle_types &
        (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
