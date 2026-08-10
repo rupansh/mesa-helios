@@ -556,12 +556,26 @@ vn_device_memory_import_win32(
    const VkImportMemoryWin32HandleInfoKHR *import_info)
 {
    uint32_t resource_id = 0;
+   uint64_t payload_size = 0;
+   uint32_t payload_type = UINT32_MAX;
    struct vn_renderer_helios_external_memory *external = NULL;
    VkResult result = vn_renderer_helios_external_memory_open(
       dev->renderer, import_info, alloc_info->allocationSize,
-      alloc_info->memoryTypeIndex, &resource_id, &external);
+      alloc_info->memoryTypeIndex, &resource_id, &payload_size, &payload_type,
+      &external);
    if (result != VK_SUCCESS)
       return result;
+
+   /* D3D12_RESOURCE_BIT ignores the caller's allocationSize; the size comes
+    * from Windows. The host, which allocates against this info, must still be
+    * told a truthful size, so substitute the one the payload reported. */
+   VkMemoryAllocateInfo sized_info = *alloc_info;
+   if (import_info->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT &&
+       payload_size) {
+      sized_info.allocationSize = payload_size;
+      alloc_info = &sized_info;
+   }
 
    struct vn_device_memory_alloc_info local_info;
    const VkMemoryAllocateInfo *renderer_alloc_info =
@@ -849,14 +863,42 @@ vn_GetMemoryWin32HandlePropertiesKHR(
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
-   (void)handleType;
-   (void)handle;
    pMemoryWin32HandleProperties->memoryTypeBits = 0;
 
-   /* Vulkan forbids this query for opaque Win32 handle types.  No D3D11,
-    * D3D12, or host-allocation handle type is advertised yet, so there is no
-    * non-opaque payload this entrypoint can truthfully describe. */
-   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   /* Vulkan forbids this query for opaque Win32 handle types. D3D12_RESOURCE
+    * is the one non-opaque type this ICD advertises, and §10.3 has the layer
+    * call this before importing, so it must be answered truthfully rather than
+    * guessed: the payload's WDDM allocation records the memory type its venus
+    * resource was created with, and that single type is the only one the
+    * import can bind to.
+    *
+    * Discovering it means opening the payload, which is why this releases it
+    * again immediately — the caller's real import opens its own. */
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   const VkImportMemoryWin32HandleInfoKHR probe_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+      .handleType = handleType,
+      .handle = handle,
+   };
+   uint32_t resource_id = 0;
+   uint64_t payload_size = 0;
+   uint32_t payload_type = UINT32_MAX;
+   struct vn_renderer_helios_external_memory *external = NULL;
+   VkResult result = vn_renderer_helios_external_memory_open(
+      dev->renderer, &probe_info, 0, UINT32_MAX, &resource_id, &payload_size,
+      &payload_type, &external);
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   vn_renderer_helios_external_memory_destroy(dev->renderer, external);
+
+   if (payload_type >= dev->physical_device->memory_properties.memoryTypeCount)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   pMemoryWin32HandleProperties->memoryTypeBits = 1u << payload_type;
+   return VK_SUCCESS;
 }
 #endif
 

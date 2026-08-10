@@ -181,8 +181,14 @@ vn_renderer_handle_type_for_guest(
    const VkExternalMemoryHandleTypeFlags guest_handle_types)
 {
 #if DETECT_OS_WINDOWS
-   if (guest_handle_types ==
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
+   /* Both native Win32 payload types resolve to the same renderer handle: they
+    * differ only in how the GUEST names the object (a payload this ICD
+    * exported vs a helios_umd12 committed resource), and the same WDDM
+    * allocation carries the same venus resource either way. */
+   if ((guest_handle_types ==
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+        guest_handle_types ==
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT) &&
        physical_dev->external_memory.win32_renderer_handle_type) {
       return physical_dev->external_memory.win32_renderer_handle_type;
    }

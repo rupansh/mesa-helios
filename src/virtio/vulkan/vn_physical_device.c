@@ -1136,6 +1136,16 @@ vn_physical_device_init_external_memory(
 #if DETECT_OS_WINDOWS
       physical_dev->external_memory.supported_handle_types |=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      /* D3D12_RESOURCE_BIT: IMPORT ONLY. VK_LAYER_HELIOS_present creates each
+       * swapchain image as a shareable committed D3D12 texture and imports it
+       * here (docs/HELIOS_PRESENT_SYNC_RETIREMENT.md §10.3). The carrier is the
+       * same D3DKMTQueryResourceInfoFromNtHandle/OpenResourceFromNtHandle open
+       * the OPAQUE_WIN32 path already uses, because helios_umd12 makes every
+       * committed resource venus-exportable. Vulkan cannot EXPORT a D3D12
+       * resource — nothing here creates one — so the export half stays absent
+       * and vn_sanitize_image_format_properties clears EXPORTABLE for it. */
+      physical_dev->external_memory.supported_handle_types |=
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
 #endif
 #endif
    }
@@ -2810,10 +2820,15 @@ vn_sanitize_image_format_properties(
 {
    const VkExternalMemoryHandleTypeFlags supported_handle_types =
       physical_dev->external_memory.supported_handle_types;
-   const bool native_win32 =
+   const bool d3d12_resource =
       external_info &&
       external_info->handleType ==
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+   const bool native_win32 =
+      external_info &&
+      (external_info->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       d3d12_resource);
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
       vn_renderer_handle_type_for_guest(
          physical_dev, external_info ? external_info->handleType : 0);
@@ -2836,7 +2851,24 @@ vn_sanitize_image_format_properties(
             ~VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT;
       }
 
-      if (native_win32) {
+      if (d3d12_resource) {
+         /* Import only, and always dedicated: the payload is one committed
+          * D3D12 resource, so its VkDeviceMemory can back nothing else.
+          * §10.3:1150-1151 requires this query to report IMPORTABLE and
+          * mandatory DEDICATED_ONLY before the layer will import, and both are
+          * true of the carrier rather than merely asserted here — the open
+          * takes the whole WDDM allocation.
+          *
+          * A D3D12 resource is in its own compatibility class: it may not be
+          * imported as OPAQUE_WIN32, so it is compatible only with itself, and
+          * nothing can be exported from it. */
+         mem_props->externalMemoryFeatures =
+            VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT |
+            VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT;
+         mem_props->compatibleHandleTypes =
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+         mem_props->exportFromImportedHandleTypes = 0;
+      } else if (native_win32) {
          mem_props->compatibleHandleTypes =
             mem_props->externalMemoryFeatures
                ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
@@ -3026,10 +3058,15 @@ vn_GetPhysicalDeviceImageFormatProperties2(
 
    /* Check if image format props is in the cache. */
    uint8_t key[BLAKE3_KEY_LEN] = { 0 };
+   /* Both native Win32 types are excluded from the cache: the sanitizer
+    * rewrites the reported properties per handle type, and the cache key does
+    * not carry the handle type. */
    const bool native_win32 =
       external_info &&
-      external_info->handleType ==
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      (external_info->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       external_info->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT);
    const bool cacheable =
       !native_win32 &&
       vn_image_get_image_format_key(
@@ -3108,7 +3145,14 @@ vn_GetPhysicalDeviceExternalBufferProperties(
 
    VkExternalMemoryProperties *props =
       &pExternalBufferProperties->externalMemoryProperties;
-   if (!(pExternalBufferInfo->handleType & supported_handle_types)) {
+   /* D3D12_RESOURCE_BIT is advertised for IMAGES only. The present layer's
+    * payload is a committed D3D12 texture; nothing on this stack shares a
+    * D3D12 buffer into Vulkan, and the import carrier has never been exercised
+    * for one. Reporting no features is how this query says "not supported" —
+    * the alternative is advertising an import that would fail at use. */
+   if (!(pExternalBufferInfo->handleType & supported_handle_types) ||
+       pExternalBufferInfo->handleType ==
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT) {
       props->compatibleHandleTypes = pExternalBufferInfo->handleType;
       props->exportFromImportedHandleTypes = 0;
       props->externalMemoryFeatures = 0;

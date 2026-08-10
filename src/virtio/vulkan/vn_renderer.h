@@ -355,8 +355,15 @@ vn_renderer_helios_external_memory_open(
    struct vn_renderer *renderer,
    const VkImportMemoryWin32HandleInfoKHR *import_info,
    uint64_t allocation_size,
+   /* UINT32_MAX = report the payload's memory type instead of checking it.
+    * Only vkGetMemoryWin32HandlePropertiesKHR may pass it. */
    uint32_t memory_type_index,
    uint32_t *out_resource_id,
+   /* The size the payload actually has. For D3D12_RESOURCE_BIT the caller's
+    * allocationSize is ignored per spec and may be 0, in which case this is
+    * the only place the real size appears. */
+   uint64_t *out_allocation_size,
+   uint32_t *out_memory_type_index,
    struct vn_renderer_helios_external_memory **out_external);
 
 VkResult

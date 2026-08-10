@@ -3699,17 +3699,46 @@ vn_renderer_helios_external_memory_open(
    uint64_t allocation_size,
    uint32_t memory_type_index,
    uint32_t *out_resource_id,
+   uint64_t *out_allocation_size,
+   uint32_t *out_memory_type_index,
    struct vn_renderer_helios_external_memory **out_external)
 {
    struct helios *helios = (struct helios *)renderer;
    *out_resource_id = 0;
+   *out_allocation_size = 0;
+   *out_memory_type_index = UINT32_MAX;
    *out_external = NULL;
 
+   /*
+    * Two guest handle types reach the same carrier, because on this stack they
+    * name the same object. OPAQUE_WIN32 is a payload this ICD exported.
+    * D3D12_RESOURCE is a committed resource created by helios_umd12, and the
+    * fused heap+resource DDI arm sets VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT on
+    * *every* committed create (umd12/src/forward12/resource12.rs) precisely so
+    * the memory is allocator-dedicated and venus-exportable — so its WDDM
+    * allocation carries the same helios_wddm_open_identity, naming the same
+    * venus resource. The host never learns which D3D API named it.
+    *
+    * They are NOT interchangeable to the caller: Vulkan keeps them in separate
+    * compatibility classes, and vn_sanitize_image_format_properties reports
+    * each as compatible only with itself.
+    */
+   const bool d3d12_resource =
+      import_info &&
+      import_info->handleType ==
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
    if (!helios->device || !import_info ||
-       import_info->handleType !=
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+       (import_info->handleType !=
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
+        !d3d12_resource) ||
        (!import_info->handle && !import_info->name))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   /* VkMemoryAllocateInfo::allocationSize is ignored for D3D12_RESOURCE_BIT —
+    * the implementation takes the size from Windows (§10.3, and the Vulkan
+    * spec's import rules). The identity is that size here, so a caller-supplied
+    * 0 means "whatever the allocation says" rather than a mismatch. */
+   const bool size_from_identity = d3d12_resource && allocation_size == 0;
 
    HANDLE nt_handle = import_info->handle;
    bool close_nt_handle = false;
@@ -3813,13 +3842,19 @@ vn_renderer_helios_external_memory_open(
       memcpy(&identity, allocation_info.pPrivateDriverData, sizeof(identity));
    }
 
+   const uint64_t effective_size =
+      size_from_identity ? identity.venus_alloc_size : allocation_size;
    const bool identity_valid =
       identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
       identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
       identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
-      identity.resource_id != 0 && identity.blob_size >= allocation_size &&
-      identity.venus_alloc_size == allocation_size &&
-      identity.memory_type_index == memory_type_index;
+      identity.resource_id != 0 && identity.blob_size >= effective_size &&
+      identity.venus_alloc_size == effective_size &&
+      /* UINT32_MAX = "report it, do not check it". Only
+       * vkGetMemoryWin32HandlePropertiesKHR passes this: it is the call whose
+       * whole job is to discover the memory type, so it cannot supply one. */
+      (memory_type_index == UINT32_MAX ||
+       identity.memory_type_index == memory_type_index);
 
    struct vn_renderer_helios_external_memory *external = NULL;
    if (st == 0 && open.hResource && allocation_info.hAllocation &&
@@ -3849,7 +3884,7 @@ vn_renderer_helios_external_memory_open(
                   (unsigned)allocation_info.hAllocation, identity.magic,
                   identity.version, identity.resource_id,
                   (unsigned long long)identity.venus_alloc_size,
-                  (unsigned long long)allocation_size,
+                  (unsigned long long)effective_size,
                   identity.memory_type_index, memory_type_index);
       return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
                                       : VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -3860,6 +3895,8 @@ vn_renderer_helios_external_memory_open(
                (unsigned)external->allocation,
                (unsigned long long)allocation_size, memory_type_index);
    *out_resource_id = identity.resource_id;
+   *out_allocation_size = effective_size;
+   *out_memory_type_index = identity.memory_type_index;
    *out_external = external;
    return VK_SUCCESS;
 }
