@@ -102,7 +102,12 @@ VkResult helios_session_control_continue(struct helios_translation_session *s,
                                          uint64_t *reply_bytes,
                                          int32_t *reply_status, bool *more);
 
-/* Refusal census, printed beside the A3 gaps. */
+/* Refusal census, printed beside the A3 gaps.
+ *
+ * ⚠ CONTEXT_MINIMA and FENCE moved to A2 with the context itself and are no
+ * longer incremented here; the equivalents are
+ * HELIOS_NATIVE_REFUSE_CONTEXT_MINIMA / _FENCE. They stay so a stored counter
+ * name keeps meaning what it meant. */
 enum helios_session_refusal_site {
    HELIOS_SESSION_REFUSE_ADAPTER,
    HELIOS_SESSION_REFUSE_DEVICE,

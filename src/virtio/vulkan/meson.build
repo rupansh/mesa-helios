@@ -132,6 +132,11 @@ if with_platform_windows
   # role-1 reply pool, finite INIT, C51 reply). Its own TU because A2 and A3
   # both build on it and it is single-owner per the lane brief.
   libvn_files += files('vn_helios_translation_session.c')
+  # A2: the native KMT lane (HVC1 contexts, the HNR2 encoder/fragmenter, the
+  # Render call shape, the per-context monitored fence). Its encoder half is
+  # platform-independent on purpose -- tools/hnr2_encode_probe.c compiles and
+  # RUNS it on Linux against protocol/'s own validator.
+  libvn_files += files('vn_helios_native_kmt.c')
   vn_deps += cc.find_library('setupapi')
   vn_deps += cc.find_library('gdi32')
   # mingw-w64 ships no D3DKMT headers; use the real WDK ones (d3dkmthk.h +

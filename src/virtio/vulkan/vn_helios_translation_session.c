@@ -12,7 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "vn_helios_hwa2.h" /* vn_renderer_helios_diag_log */
+#include "vn_helios_hwa2.h"       /* vn_renderer_helios_diag_log */
+#include "vn_helios_native_kmt.h" /* A2: the HVC1 context and HNR2 encoder */
 
 /* Teardown ignores every status by design -- there is nothing left to do about
  * a failed destroy, and the handles are dropped either way. `(void)` does not
@@ -22,47 +23,6 @@
       NTSTATUS ignored_ = (call);                                              \
       (void)ignored_;                                                          \
    } while (0)
-
-/* ── CRC-64/ECMA-182 ────────────────────────────────────────────────────────
- *
- * ⛔ HAND-MIRRORED from protocol/src/wddm.rs::crc64_ecma_update. Nothing links
- * the two, so helios_crc64_self_test() checks the published check value at
- * session create and refuses rather than shipping a silent transcription slip.
- */
-static uint64_t helios_crc64_table[256];
-static bool helios_crc64_ready;
-
-static void
-helios_crc64_init(void)
-{
-   if (helios_crc64_ready)
-      return;
-   for (unsigned n = 0; n < 256; n++) {
-      uint64_t c = (uint64_t)n << 56;
-      for (unsigned bit = 0; bit < 8; bit++)
-         c = (c & 0x8000000000000000ull) ? ((c << 1) ^ HELIOS_CRC64_ECMA182_POLY)
-                                         : (c << 1);
-      helios_crc64_table[n] = c;
-   }
-   helios_crc64_ready = true;
-}
-
-static uint64_t
-helios_crc64(const void *bytes, size_t len)
-{
-   const uint8_t *p = (const uint8_t *)bytes;
-   uint64_t crc = HELIOS_CRC64_ECMA182_INIT;
-   helios_crc64_init();
-   for (size_t i = 0; i < len; i++)
-      crc = helios_crc64_table[(uint8_t)((crc >> 56) ^ p[i])] ^ (crc << 8);
-   return crc ^ HELIOS_CRC64_ECMA182_XOROUT;
-}
-
-static bool
-helios_crc64_self_test(void)
-{
-   return helios_crc64("123456789", 9) == HELIOS_CRC64_ECMA182_CHECK;
-}
 
 /* ── refusal census ─────────────────────────────────────────────────────────*/
 
@@ -140,31 +100,19 @@ struct helios_reply_slot {
 struct helios_translation_session {
    D3DKMT_HANDLE adapter;
    D3DKMT_HANDLE device;
-   D3DKMT_HANDLE context;
 
-   /* Buffers dxgkrnl hands back from CreateContext/Render. Re-adopted after
-    * EVERY Render, per §10.7 ("adopts the returned next command/allocation
-    * buffers and their actual sizes before recording again"). */
-   void *command_buffer;
-   uint32_t command_buffer_bytes;
-   D3DDDI_ALLOCATIONLIST *allocation_list;
-   uint32_t allocation_list_entries;
-   D3DDDI_PATCHLOCATIONLIST *patch_list;
-   uint32_t patch_list_entries;
+   /* The one HVC1 control context: A2 owns its Render/fence/buffer state. */
+   struct helios_native_context *control;
 
    /* Role-1 reply pool: one allocation, resident, Lock2-mapped for life. */
    D3DKMT_HANDLE pool;
    void *pool_cpu;
+   uint64_t pool_generation; /* HVM1 object_generation the KMD returned */
    D3DKMT_HANDLE paging_queue;
    D3DKMT_HANDLE paging_fence;
 
-   /* C51 completion for the control context. */
-   D3DKMT_HANDLE fence;
-   uint64_t fence_value;
-
    struct helios_reply_slot slots[HELIOS_HVM1_REPLY_SLOT_COUNT];
    uint64_t next_slot_generation;
-   uint64_t next_batch_token;
 
    CRITICAL_SECTION lock;
 
@@ -231,12 +179,10 @@ helios_transact(struct helios_translation_session *s, const void *payload,
                                                    : reply_capacity;
    const uint64_t reply_capacity_bytes = HELIOS_HVR1_HEADER_SIZE + max_chunk;
 
-   /* Reserve COMMIT metadata BEFORE choosing the payload length (§10.7). */
-   const uint64_t metadata = HELIOS_HNR2_HEADER_SIZE + HELIOS_HNR2_USE_RECORD_SIZE;
-   if (payload_bytes == 0 || payload_bytes > HELIOS_HNR2_MAX_PAYLOAD_BYTES ||
-       metadata + payload_bytes > (uint64_t)s->command_buffer_bytes) {
+   if (payload_bytes == 0 || payload_bytes > HELIOS_HNR2_MAX_PAYLOAD_BYTES) {
       helios_session_refuse(HELIOS_SESSION_REFUSE_PAYLOAD_TOO_LARGE,
-                            "control payload does not fit one fragment", 0);
+                            "control payload is empty or above the batch bound",
+                            0);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    if (reply_capacity_bytes > HELIOS_HVM1_REPLY_SLOT_BYTES) {
@@ -255,120 +201,47 @@ helios_transact(struct helios_translation_session *s, const void *payload,
    }
 
    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
-   uint8_t *cmd = (uint8_t *)s->command_buffer;
-   const uint32_t use_offset = (uint32_t)(HELIOS_HNR2_HEADER_SIZE + payload_bytes);
-   const uint32_t use_offset_aligned = (use_offset + 7u) & ~7u;
-   const uint32_t total = use_offset_aligned + HELIOS_HNR2_USE_RECORD_SIZE;
 
-   memset(cmd, 0, total);
-   memcpy(cmd + HELIOS_HNR2_HEADER_SIZE, payload, (size_t)payload_bytes);
+   /* The only allocation this carrier ever lists: its own checked-out slot,
+    * writable, because §10.4 makes the reply target the sole legal write of the
+    * pure-control class. */
+   const struct helios_hnr2_allocation slot_use = {
+      .handle = s->pool,
+      .access = HELIOS_HNR2_ACCESS_WRITE,
+      .expected_generation = s->pool_generation,
+   };
+   struct helios_hnr2_batch batch;
+   memset(&batch, 0, sizeof(batch));
+   batch.payload = payload;
+   batch.payload_bytes = payload_bytes;
+   batch.allocations = &slot_use;
+   batch.allocation_count = 1;
+   batch.has_reply = true;
+   batch.reply_allocation_index = 0;
+   batch.reply_offset = s->slots[slot_index].offset;
+   batch.reply_capacity_bytes = reply_capacity_bytes;
+   batch.reply_slot_generation = slot_generation;
 
-   /* The one COMMIT use record: allocation-list index 0, WRITE. */
-   {
-      uint8_t *u = cmd + use_offset_aligned;
-      const uint32_t index = 0, access = HELIOS_HNR2_ACCESS_WRITE;
-      const uint64_t expected_generation = 0; /* the KMD's own pool allocation */
-      const uint32_t first_patch = 0, patch_count = 0;
-      memcpy(u + 0, &index, 4);
-      memcpy(u + 4, &access, 4);
-      memcpy(u + 8, &expected_generation, 8);
-      memcpy(u + 16, &first_patch, 4);
-      memcpy(u + 20, &patch_count, 4);
-   }
-
-   HeliosNativeRenderV2 h;
-   memset(&h, 0, sizeof(h));
-   h.magic = HELIOS_HNR2_MAGIC;
-   h.abi_version = HELIOS_HNR2_ABI_VERSION;
-   h.header_size = HELIOS_HNR2_HEADER_SIZE;
-   h.package_generation = HELIOS_PACKAGE_GENERATION;
-   h.batch_token = ++s->next_batch_token;
-   h.total_payload_bytes = payload_bytes;
-   h.fragment_payload_offset = 0;
-   h.fragment_payload_bytes = (uint32_t)payload_bytes;
-   h.fragment_index = 0;
-   h.fragment_count = 1;
-   h.use_record_offset = use_offset_aligned;
-   h.use_record_count = 1;
-   h.patch_record_offset = 0;
-   h.patch_record_count = 0;
-   h.reply_allocation_list_index = 0;
-   h.flags = HELIOS_HNR2_FLAG_BEGIN | HELIOS_HNR2_FLAG_COMMIT |
-             HELIOS_HNR2_FLAG_HAS_REPLY;
-   h.reply_offset = s->slots[slot_index].offset;
-   h.reply_capacity_bytes = reply_capacity_bytes;
-   h.reply_slot_generation = slot_generation;
-   h.full_payload_crc64 = helios_crc64(payload, (size_t)payload_bytes);
-   memcpy(cmd, &h, sizeof(h));
-   /* Fragment CRC covers the emitted fragment with this field zero. */
-   {
-      const uint64_t zero = 0;
-      memcpy(cmd + 88, &zero, 8);
-      const uint64_t frag = helios_crc64(cmd, total);
-      memcpy(cmd + 88, &frag, 8);
-   }
-
-   s->allocation_list[0].hAllocation = s->pool;
-   s->allocation_list[0].Value = 0;
-   s->allocation_list[0].WriteOperation = 1;
-
-   D3DKMT_RENDER render;
-   memset(&render, 0, sizeof(render));
-   render.hContext = s->context;
-   render.CommandOffset = 0;
-   render.CommandLength = total;
-   render.AllocationCount = 1;
-   render.PatchLocationCount = 0;
-   render.NewCommandBufferSize = HELIOS_HVC1_DMA_BUFFER_BYTES;
-   render.NewAllocationListSize = HELIOS_HVC1_ALLOCATION_LIST_ENTRIES;
-   render.NewPatchLocationListSize = HELIOS_HVC1_PATCH_LOCATION_ENTRIES;
-
-   NTSTATUS st = D3DKMTRender(&render);
-   if (st != 0) {
-      /* §10.7: a failed Render discards the assembler, loses the context, and
-       * ignores the returned buffers rather than retrying on another transport. */
-      helios_session_refuse(render_site, "D3DKMTRender", (unsigned)st);
+   uint64_t batch_token = 0;
+   uint64_t progress = 0;
+   VkResult vr = helios_native_context_submit(s->control, &batch, true,
+                                              &batch_token, &progress);
+   if (vr != VK_SUCCESS) {
+      /* §10.7: a failed Render discards the assembler and loses the context;
+       * A2 has already marked it so, and there is no other transport. */
+      helios_session_refuse(render_site, "native submit", (unsigned)vr);
       helios_slot_release(s, slot_index);
-      return VK_ERROR_DEVICE_LOST;
+      return vr;
    }
 
-   s->command_buffer = render.pNewCommandBuffer;
-   s->command_buffer_bytes = render.NewCommandBufferSize;
-   s->allocation_list = render.pNewAllocationList;
-   s->allocation_list_entries = render.NewAllocationListSize;
-   s->patch_list = render.pNewPatchLocationList;
-   s->patch_list_entries = render.NewPatchLocationListSize;
-
-   /* C51: enqueue the GPU-side signal behind the Render we just queued, then
-    * one event-backed CPU wait. Never a shared-memory sample. */
-   const uint64_t target = ++s->fence_value;
-   D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU sig;
-   memset(&sig, 0, sizeof(sig));
-   sig.hContext = s->context;
-   sig.ObjectCount = 1;
-   sig.ObjectHandleArray = &s->fence;
-   sig.MonitoredFenceValueArray = &target;
-   st = D3DKMTSignalSynchronizationObjectFromGpu(&sig);
-   if (st != 0) {
-      helios_session_refuse(wait_site, "SignalSynchronizationObjectFromGpu",
-                            (unsigned)st);
+   /* C51: one CPU wait on the GPU-side signal A2 enqueued behind the Render.
+    * Never a shared-memory sample. */
+   vr = helios_native_context_wait(s->control, progress,
+                                   HELIOS_NATIVE_WAIT_INFINITE);
+   if (vr != VK_SUCCESS) {
+      helios_session_refuse(wait_site, "C51 wait", (unsigned)vr);
       helios_slot_release(s, slot_index);
-      return VK_ERROR_DEVICE_LOST;
-   }
-
-   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
-   memset(&wait, 0, sizeof(wait));
-   wait.hDevice = s->device;
-   wait.ObjectCount = 1;
-   wait.ObjectHandleArray = &s->fence;
-   wait.FenceValueArray = &target;
-   wait.hAsyncEvent = NULL; /* synchronous: the call itself blocks */
-   st = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
-   if (st != 0) {
-      helios_session_refuse(wait_site, "WaitForSynchronizationObjectFromCpu",
-                            (unsigned)st);
-      helios_slot_release(s, slot_index);
-      return VK_ERROR_DEVICE_LOST;
+      return vr;
    }
 
    /* ── read the HVR1 the KMD published into our slot ───────────────────── */
@@ -387,7 +260,7 @@ helios_transact(struct helios_translation_session *s, const void *payload,
       snprintf(why, sizeof(why), "package generation mismatch");
       goto reply_refused;
    }
-   if (r.slot_generation != slot_generation || r.batch_token != h.batch_token) {
+   if (r.slot_generation != slot_generation || r.batch_token != batch_token) {
       /* A stale slot answer is the one thing this generation pair exists to
        * catch; never accept it as this transaction's result. */
       snprintf(why, sizeof(why), "stale reply: slot gen/batch token mismatch");
@@ -481,6 +354,13 @@ helios_session_control_continue(struct helios_translation_session *s,
 static void
 helios_session_teardown(struct helios_translation_session *s)
 {
+   /* First, because destroying the context JOINS its outstanding C51 milestone
+    * (§10.7 "drains/cancels every HNR2 use" before the allocation goes): the
+    * only writer of the reply pool is a Render on this context. */
+   if (s->control) {
+      helios_native_context_destroy(s->control);
+      s->control = NULL;
+   }
    if (s->pool_cpu) {
       D3DKMT_UNLOCK2 u = { .hDevice = s->device, .hAllocation = s->pool };
       HELIOS_IGNORE_STATUS(D3DKMTUnlock2(&u));
@@ -500,16 +380,6 @@ helios_session_teardown(struct helios_translation_session *s)
       D3DDDI_DESTROYPAGINGQUEUE dq = { .hPagingQueue = s->paging_queue };
       HELIOS_IGNORE_STATUS(D3DKMTDestroyPagingQueue(&dq));
       s->paging_queue = 0;
-   }
-   if (s->fence) {
-      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT ds = { .hSyncObject = s->fence };
-      HELIOS_IGNORE_STATUS(D3DKMTDestroySynchronizationObject(&ds));
-      s->fence = 0;
-   }
-   if (s->context) {
-      D3DKMT_DESTROYCONTEXT dc = { .hContext = s->context };
-      HELIOS_IGNORE_STATUS(D3DKMTDestroyContext(&dc));
-      s->context = 0;
    }
    if (s->device) {
       D3DKMT_DESTROYDEVICE dd;
@@ -582,56 +452,16 @@ helios_translation_session_create(LUID adapter_luid,
    }
    s->device = cd.hDevice;
 
-   /* The one HVC1 control context: both ordinals UINT32_MAX mean control. */
-   HeliosVulkanContextV1 hvc1;
-   memset(&hvc1, 0, sizeof(hvc1));
-   hvc1.magic = HELIOS_HVC1_MAGIC;
-   hvc1.abi_version = HELIOS_HVC1_ABI_VERSION;
-   hvc1.struct_size = HELIOS_HVC1_SIZE;
-   hvc1.package_generation = HELIOS_PACKAGE_GENERATION;
-   hvc1.capset = HELIOS_NATIVE_RENDER_CAPSET;
-   hvc1.mode = HELIOS_HVC1_MODE_FINITE_HNR2_RENDER;
-   hvc1.queue_family = HELIOS_HVC1_CONTROL_ORDINAL;
-   hvc1.queue_index = HELIOS_HVC1_CONTROL_ORDINAL;
-
-   D3DKMT_CREATECONTEXT cc;
-   memset(&cc, 0, sizeof(cc));
-   cc.hDevice = s->device;
-   cc.NodeOrdinal = HELIOS_HVC1_NODE_ORDINAL;
-   cc.EngineAffinity = HELIOS_HVC1_ENGINE_AFFINITY;
-   cc.ClientHint = D3DKMT_CLIENTHINT_VULKAN;
-   cc.pPrivateDriverData = &hvc1;
-   cc.PrivateDriverDataSize = sizeof(hvc1);
-   st = D3DKMTCreateContext(&cc);
-   if (st != 0) {
-      helios_session_refuse(HELIOS_SESSION_REFUSE_CONTEXT, "CreateContext",
-                            (unsigned)st);
-      goto fail;
-   }
-   s->context = cc.hContext;
-   s->command_buffer = cc.pCommandBuffer;
-   s->command_buffer_bytes = cc.CommandBufferSize;
-   s->allocation_list = cc.pAllocationList;
-   s->allocation_list_entries = cc.AllocationListSize;
-   s->patch_list = cc.pPatchLocationList;
-   s->patch_list_entries = cc.PatchLocationListSize;
-
-   /* §10.7: creation fails if dxgkrnl does not return non-null buffers of at
-    * least the advertised minima. Loud, because a short list silently truncates
-    * a manifest later. */
-   if (!s->command_buffer || s->command_buffer_bytes < HELIOS_HVC1_DMA_BUFFER_BYTES ||
-       !s->allocation_list ||
-       s->allocation_list_entries < HELIOS_HVC1_ALLOCATION_LIST_ENTRIES ||
-       !s->patch_list ||
-       s->patch_list_entries < HELIOS_HVC1_PATCH_LOCATION_ENTRIES) {
-      char why[192];
-      snprintf(why, sizeof(why),
-               "cmd=%p/%u alloc=%p/%u patch=%p/%u below the advertised minima",
-               s->command_buffer, s->command_buffer_bytes, (void *)s->allocation_list,
-               s->allocation_list_entries, (void *)s->patch_list,
-               s->patch_list_entries);
-      helios_session_refuse(HELIOS_SESSION_REFUSE_CONTEXT_MINIMA, why, 0);
-      goto fail;
+   /* The one HVC1 control context: A2 builds it, validates the DXGK_CONTEXTINFO
+    * minima, and owns its monitored progress fence. */
+   {
+      const VkResult ctx = helios_native_context_create(
+         s->device, HELIOS_NATIVE_CONTEXT_CONTROL, 0, 0, &s->control);
+      if (ctx != VK_SUCCESS) {
+         helios_session_refuse(HELIOS_SESSION_REFUSE_CONTEXT,
+                               "native control context", (unsigned)ctx);
+         goto fail;
+      }
    }
 
    /* The role-1 reply pool. pSystemMem=NULL: the KMD owns the backing. */
@@ -665,6 +495,17 @@ helios_translation_session_create(LUID adapter_luid,
       goto fail;
    }
    s->pool = info.hAllocation;
+
+   /* CreateAllocation copies the per-allocation private data back, and the
+    * generation it returns is what every use record naming this pool must
+    * carry: a zero one is `Hnr2TableReject::AllocationGenerationZero` and would
+    * be refused on the wire, so refuse here where the reason is visible. */
+   s->pool_generation = hvm1.object_generation;
+   if (!s->pool_generation) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_POOL_CREATE,
+                            "reply pool came back with object_generation=0", 0);
+      goto fail;
+   }
 
    D3DKMT_CREATEPAGINGQUEUE pq;
    memset(&pq, 0, sizeof(pq));
@@ -722,21 +563,6 @@ helios_translation_session_create(LUID adapter_luid,
    s->pool_cpu = lock.pData;
    for (unsigned i = 0; i < HELIOS_HVM1_REPLY_SLOT_COUNT; i++)
       s->slots[i].offset = (uint64_t)i * HELIOS_HVM1_REPLY_SLOT_BYTES;
-
-   /* The control context's own unshared monitored fence (C51). */
-   D3DKMT_CREATESYNCHRONIZATIONOBJECT2 cs;
-   memset(&cs, 0, sizeof(cs));
-   cs.hDevice = s->device;
-   cs.Info.Type = D3DDDI_MONITORED_FENCE;
-   cs.Info.MonitoredFence.InitialFenceValue = 0;
-   st = D3DKMTCreateSynchronizationObject2(&cs);
-   if (st != 0) {
-      helios_session_refuse(HELIOS_SESSION_REFUSE_FENCE,
-                            "CreateSynchronizationObject2(monitored)",
-                            (unsigned)st);
-      goto fail;
-   }
-   s->fence = cs.hSyncObject;
 
    /* ── the finite INIT ─────────────────────────────────────────────────── */
    HeliosTranslationSessionInitV1 init;
