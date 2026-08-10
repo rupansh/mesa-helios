@@ -3419,17 +3419,39 @@ vn_renderer_helios_external_memory_create(
     * the ICD stops naming host resources at all.
     */
    helios_a3_gap_refuse(HELIOS_A3_GAP_EXPORT_ADOPTION);
-   vn_renderer_helios_diag_log(
-      "external memory export REFUSED (A3 gap): built a valid HWA2 create input"
-      " kind=%u flags=0x%x bind=0x%x misc=0x%x swizzle=%u memory_class=%u"
-      " byte_size=%llu pkg_gen=0x%llx alloc_gen=0 -- but the venus resource"
-      " res_id=%u (memory_id=%llu, vk memory type %u) cannot be named to the KMD"
-      " through it, and no field may be added to carry it.",
-      desc.allocation_kind, desc.flags, desc.bind_flags, desc.misc_flags,
-      desc.swizzle_class, desc.memory_class,
-      (unsigned long long)desc.byte_size,
-      (unsigned long long)desc.package_generation, bo->base.res_id,
-      (unsigned long long)memory_id, memory_type_index);
+
+   /* ⚠ Gate this detail line on the SAME 1-then-every-256 decision
+    * `helios_a3_gap_refuse` makes internally, by re-reading the counter it just
+    * bumped. An unthrottled line here would defeat that throttle completely: the
+    * two lines are emitted back to back, `vn_renderer_helios_diag_log` does a
+    * fopen/vfprintf/fclose per call, and an exporter that retries per frame would
+    * make the diag log itself the failure — exactly what the throttle beside it
+    * exists to prevent.
+    *
+    * Two honest caveats. (1) `helios_a3_gap_refusals()` is read after the
+    * increment rather than returned by it, because `helios_a3_gap_refuse` does
+    * not return the count and its declaration is not this file's to change; with
+    * concurrent exporters the two throttles can disagree by a line, so a rare A3
+    * line may appear without its detail or vice versa. Both are counted exactly
+    * either way. (2) Nothing is softened: the export still returns
+    * VK_ERROR_INVALID_EXTERNAL_HANDLE on every call, `helios_a3_gap_refusals`
+    * still counts every one, and `helios_perf_write` still prints the totals. */
+   const long export_refusals =
+      helios_a3_gap_refusals(HELIOS_A3_GAP_EXPORT_ADOPTION);
+   if (export_refusals == 1 || (export_refusals % 256) == 0) {
+      vn_renderer_helios_diag_log(
+         "external memory export REFUSED (A3 gap) count=%ld: built a valid HWA2"
+         " create input kind=%u flags=0x%x bind=0x%x misc=0x%x swizzle=%u"
+         " memory_class=%u byte_size=%llu pkg_gen=0x%llx alloc_gen=0 -- but the"
+         " venus resource res_id=%u (memory_id=%llu, vk memory type %u) cannot be"
+         " named to the KMD through it, and no field may be added to carry it."
+         " (logged on the 1st and every 256th; the count is exact)",
+         export_refusals, desc.allocation_kind, desc.flags, desc.bind_flags,
+         desc.misc_flags, desc.swizzle_class, desc.memory_class,
+         (unsigned long long)desc.byte_size,
+         (unsigned long long)desc.package_generation, bo->base.res_id,
+         (unsigned long long)memory_id, memory_type_index);
+   }
 
    /* STUB: the D3DKMTCreateAllocation2 that consumed this descriptor is not
     * written, because the record it would send cannot express the venus binding
@@ -3729,15 +3751,28 @@ vn_renderer_helios_external_memory_open(
       } else if (!desc_valid) {
          helios_hwa2_note_reject("c57_open", &reject);
       } else if (!admissible) {
-         InterlockedIncrement(&helios_c57_admission_refusals);
-         vn_renderer_helios_diag_log(
-            "C57 open REFUSED: valid HWA2 but not admissible --"
-            " kind=%u(ok=%d) flags=0x%x(shared=%d) byte_size=%llu"
-            " requested=%llu(ok=%d) alloc_gen=0x%llx",
-            desc.allocation_kind, kind_admissible ? 1 : 0, desc.flags,
-            shared_admissible ? 1 : 0, (unsigned long long)desc.byte_size,
-            (unsigned long long)effective_size, size_admissible ? 1 : 0,
-            (unsigned long long)desc.allocation_generation);
+         /* Same 1-then-every-256 throttle as helios_hwa2_note_reject and
+          * helios_a3_gap_refuse, for the same reason and with the same
+          * guarantee. This arm is per-IMPORT — DWM and DXVK reach it once per
+          * shared-surface open through vkGetMemoryWin32HandlePropertiesKHR — and
+          * vn_renderer_helios_diag_log fopen/vfprintf/fcloses per call, so an
+          * importer looping on a refused surface would turn the log into the
+          * failure. The refusal itself is untouched: the return below is
+          * unchanged, the counter is exact, and helios_perf_write prints it. */
+         const long refusals =
+            InterlockedIncrement(&helios_c57_admission_refusals);
+         if (refusals == 1 || (refusals % 256) == 0) {
+            vn_renderer_helios_diag_log(
+               "C57 open REFUSED count=%ld: valid HWA2 but not admissible --"
+               " kind=%u(ok=%d) flags=0x%x(shared=%d) byte_size=%llu"
+               " requested=%llu(ok=%d) alloc_gen=0x%llx"
+               " (logged on the 1st and every 256th; the count is exact)",
+               refusals, desc.allocation_kind, kind_admissible ? 1 : 0,
+               desc.flags, shared_admissible ? 1 : 0,
+               (unsigned long long)desc.byte_size,
+               (unsigned long long)effective_size, size_admissible ? 1 : 0,
+               (unsigned long long)desc.allocation_generation);
+         }
       }
       /* Admissible with no `external` means only the calloc failed: that is an
        * out-of-host-memory, not a bad handle. */

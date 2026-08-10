@@ -577,14 +577,35 @@ helios_hwa2_note_reject(const char *site,
        (unsigned)reject->code >= HELIOS_HWA2_REJECT_COUNT)
       return;
 
-   InterlockedIncrement(&helios_hwa2_reject_counters[reject->code]);
+   const long count = InterlockedIncrement(&helios_hwa2_reject_counters[reject->code]);
+
+   /* Same 1-then-every-256 throttle, and for the same reason, as
+    * `helios_a3_gap_refuse` below: `vn_renderer_helios_diag_log` does a
+    * fopen/vfprintf/fclose per call, and the reachable call sites are per-import
+    * — `vn_renderer_helios.c`'s `c57_open` arm runs under
+    * `vkGetMemoryWin32HandlePropertiesKHR`, which DWM and DXVK hit once per
+    * shared-surface import. On the split deploy this refusal's own message names
+    * — the case where EVERY import refuses — an unthrottled line would make the
+    * diag log itself the failure and would bury the throttled A3 lines it sits
+    * beside.
+    *
+    * ⚠ NOTHING IS SOFTENED. The refusal is unchanged, `helios_hwa2_reject_count`
+    * still counts every occurrence, `helios_hwa2_reject_summary` still prints
+    * every arm, and the suppressed count is on the line, so a reader can never
+    * mistake one printed line for one refusal. Suppressing the LOG of a refusal
+    * is not suppressing the refusal. */
+   if (count != 1 && (count % 256) != 0)
+      return;
+
    vn_renderer_helios_diag_log(
-      "HWA2 REFUSED site=%s reason=%s found=0x%llx(%llu) expected=0x%llx(%llu) field=%s"
+      "HWA2 REFUSED site=%s reason=%s count=%ld found=0x%llx(%llu)"
+      " expected=0x%llx(%llu) field=%s"
       " -- this ICD reads the 168-byte 10.3 HWA2 descriptor; a legacy 48-byte"
       " HeliosWddmOpenIdentity or 96-byte AdoptedAllocPrivate producer is a SPLIT"
       " DEPLOY (KMD/UMD and ICD from different packages), not a corrupt payload."
-      " There is no fallback parser by design.",
-      site ? site : "?", helios_hwa2_reject_name(reject->code),
+      " There is no fallback parser by design."
+      " (logged on the 1st and every 256th; the count is exact)",
+      site ? site : "?", helios_hwa2_reject_name(reject->code), count,
       (unsigned long long)reject->found, (unsigned long long)reject->found,
       (unsigned long long)reject->expected, (unsigned long long)reject->expected,
       reject->field ? reject->field : "-");
