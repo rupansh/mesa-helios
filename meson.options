@@ -313,7 +313,7 @@ option(
   value : [],
   choices : [
     'device-select', 'intel-nullhw', 'overlay', 'screenshot', 'anti-lag',
-    'vram-report-limit',
+    'vram-report-limit', 'helios-present',
   ],
   description : 'List of vulkan layers to build'
 )

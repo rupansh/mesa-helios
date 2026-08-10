@@ -101,3 +101,11 @@ endif
 if with_vulkan_anti_lag_layer
   subdir('anti-lag-layer')
 endif
+# Windows-only: the layer's sources include <windows.h> and <directx/d3d12.h>,
+# so the platform check is a build requirement and not a preference.
+if with_vulkan_helios_present_layer
+  if not with_platform_windows
+    error('vulkan-layers=helios-present requires platforms=windows')
+  endif
+  subdir('helios-present-layer')
+endif

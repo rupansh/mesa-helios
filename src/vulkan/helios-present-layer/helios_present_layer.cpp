@@ -653,16 +653,14 @@ static const VkExtensionProperties kDeviceExtensions[] = {
  * enumeration result: the lower Helios ICD deliberately exposes no WSI on
  * Windows (§10.7:2209-2210, §10.7:2246-2248), so a stale lower name would let
  * an application reach a swapchain the layer does not own.
+ *
+ * (There was a `helios_is_layer_owned_instance_extension` here, testing the
+ * three names in kInstanceExtensions. It was dead — those three are a strict
+ * SUBSET of the kStale list below, which is what actually does the stripping,
+ * and the CreateInstance loop cannot use it anyway because it has to know
+ * WHICH of the three matched in order to set the right want_* flag. Found by
+ * the first real build, -Wunused-function.)
  */
-static bool
-helios_is_layer_owned_instance_extension(const char *name)
-{
-   for (const VkExtensionProperties &e : kInstanceExtensions)
-      if (streq(name, e.extensionName))
-         return true;
-   return false;
-}
-
 static bool
 helios_is_stale_lower_wsi_name(const char *name)
 {
