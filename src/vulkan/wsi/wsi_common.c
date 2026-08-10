@@ -2877,6 +2877,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       image->acquired = false;
       image->present_serial = ++swapchain->present_serial;
 
+      if (swapchain->pre_present) {
+         results[i] = swapchain->pre_present(swapchain, image_index);
+         if (results[i] != VK_SUCCESS)
+            continue;
+      }
+
       /* If we updated the signal_dma_buf semaphore, extract its syncobj and
        * attach it to the dma-buf before we present so that the present
        * implicitly syncs on it.

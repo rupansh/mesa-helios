@@ -382,6 +382,11 @@ struct wsi_swapchain {
    VkResult (*acquire_next_image)(struct wsi_swapchain *swap_chain,
                                   const VkAcquireNextImageInfoKHR *info,
                                   uint32_t *image_index);
+   /* Optional validation after the common pre-present queue submission and
+    * before backend presentation (including asynchronous enqueue).
+    */
+   VkResult (*pre_present)(struct wsi_swapchain *swap_chain,
+                           uint32_t image_index);
    VkResult (*queue_present)(struct wsi_swapchain *swap_chain,
                              uint32_t image_index,
                              uint64_t present_id,
