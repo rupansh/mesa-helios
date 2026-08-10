@@ -58,19 +58,18 @@ struct vn_device_memory {
     * fd/dma-buf type used to create the Venus blob. */
    VkExternalMemoryHandleTypeFlags renderer_export_handle_types;
 
-   /* Native OPAQUE_WIN32 payload.  It owns/retains the Venus resource after
-    * the BO has transferred that lifetime to WDDM. */
+   /* Native OPAQUE_WIN32 payload: the opened/created WDDM allocation carrying
+    * the immutable §10.3 HWA2 descriptor. ⛔ It no longer "owns/retains the
+    * Venus resource" — UMD-backing adoption is deleted, and no ICD-side record
+    * may name a host resource (§10.3). */
    struct vn_renderer_helios_external_memory *helios_external_memory;
 
-   /* VidMm mirror for an ordinary, non-imported Venus allocation.  The real
-    * bytes stay renderer-owned; these handles exist only for Windows budget
-    * and Task Manager accounting. */
-   uint32_t helios_vidmm_resource;
-   uint32_t helios_vidmm_allocation;
-   /* System-wide KMT share for the same tracker. Creator allocations publish
-    * it; imported allocations retain it by opening the shared resource. */
-   uint32_t helios_vidmm_global_share;
-   uint32_t helios_vidmm_cookie;
+   /* ⛔ `helios_vidmm_{resource,allocation,global_share,cookie}` are DELETED
+    * with the VidMm global-share tracker. The mechanism has no successor
+    * (K4-CONTRACT §6): nothing was folded into HWA2, and the packed
+    * `(cookie << 32) | global_share` attestation was exactly the
+    * "independently usable identity" §10.3 forbids. Do not re-add a field
+    * here to hold one. */
 #endif
 
    /* only valid when wsi platform is used */

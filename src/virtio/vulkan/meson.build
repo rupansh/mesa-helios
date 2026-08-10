@@ -124,6 +124,10 @@ if with_platform_windows
   # for the legacy device-interface helpers still referenced by the fail-clean
   # IOCTL stub until those verbs move onto D3DKMT (Stage 2/3).
   libvn_files += files('vn_renderer_helios.c')
+  # HWA2 parse/validate. Separate TU because it is a transcription of
+  # protocol/src/wddm.rs's validator and must be reviewable against it without
+  # 5000 lines of transport in the way.
+  libvn_files += files('vn_helios_hwa2.c')
   vn_deps += cc.find_library('setupapi')
   vn_deps += cc.find_library('gdi32')
   # mingw-w64 ships no D3DKMT headers; use the real WDK ones (d3dkmthk.h +
@@ -132,6 +136,40 @@ if with_platform_windows
   # Real headers = authoritative ABI (they self-default DXGKDDI_INTERFACE_VERSION
   # to WDDM3_2, matching the OS), so no hand-shimmed D3DKMT structs to keep in sync.
   vn_c_args += '-I' + get_option('helios-wdk-include')
+
+  # protocol/include/helios_wddm.h — the ONE C declaration of the Helios D3D-side
+  # wire records (HWA2/HOB1/HOS1/HOC1), mirroring protocol/src/wddm.rs. The
+  # standing directive is that shared private data has one declaration, in
+  # protocol/, and before this edge existed the ICD hand-copied four of those
+  # records into vn_renderer_helios.c with nothing but `sizeof` asserts — so a
+  # field reorder inside the right number of bytes passed every check on this
+  # side. Including the real header brings its per-field `offsetof` assertions
+  # with it, which is the compile-time cross-check K4-CONTRACT §7 requires of
+  # this cross-repo pair.
+  #
+  # The path crosses the submodule boundary: helios_wddm.h lives in the PARENT
+  # repository and icd/mesa is a submodule of it. This is the same shape as
+  # helios-wdk-include above (default 'Z:/icd/win-build/wdk-include'), which is
+  # also outside this subproject, so the mechanism is not new — but it is derived
+  # rather than optioned, because adding a meson option means editing
+  # icd/mesa/meson.options, which this lane does not own. The derivation is
+  # `<mesa source root>/../../protocol/include`, and mesa is always checked out at
+  # <helios>/icd/mesa; win_meson builds it straight from the Z:\ share, where the
+  # parent tree is present, so the relative walk resolves on both platforms.
+  #
+  # ⚠ It is checked, not assumed: a wrong path would otherwise surface as a
+  # confusing "helios_wddm.h: No such file" from a source file, or worse, as a
+  # stale copy found elsewhere on the include path.
+  helios_protocol_include = meson.project_source_root() / '..' / '..' / 'protocol' / 'include'
+  helios_fs = import('fs')
+  if not helios_fs.exists(helios_protocol_include / 'helios_wddm.h')
+    error('Helios: protocol/include/helios_wddm.h not found at "' +
+          helios_protocol_include + '". icd/mesa must be built from inside the ' +
+          'helios-vgpu tree (it is a submodule at <helios>/icd/mesa); the HWA2 ' +
+          'allocation descriptor has exactly one declaration and this ICD may ' +
+          'not carry a local copy of it.')
+  endif
+  vn_c_args += '-I' + helios_protocol_include
 endif
 
 if with_platform_wayland or with_platform_x11 or \

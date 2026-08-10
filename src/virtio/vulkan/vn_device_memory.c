@@ -555,45 +555,52 @@ vn_device_memory_import_win32(
    const VkMemoryAllocateInfo *alloc_info,
    const VkImportMemoryWin32HandleInfoKHR *import_info)
 {
-   uint32_t resource_id = 0;
+   uint64_t payload_generation = 0;
    uint64_t payload_size = 0;
-   uint32_t payload_type = UINT32_MAX;
+   HeliosWddmAllocationDescV2 payload_desc;
    struct vn_renderer_helios_external_memory *external = NULL;
    VkResult result = vn_renderer_helios_external_memory_open(
       dev->renderer, import_info, alloc_info->allocationSize,
-      alloc_info->memoryTypeIndex, &resource_id, &payload_size, &payload_type,
-      &external);
+      &payload_generation, &payload_size, &payload_desc, &external);
    if (result != VK_SUCCESS)
       return result;
 
-   /* D3D12_RESOURCE_BIT ignores the caller's allocationSize; the size comes
-    * from Windows. The host, which allocates against this info, must still be
-    * told a truthful size, so substitute the one the payload reported. */
-   VkMemoryAllocateInfo sized_info = *alloc_info;
-   if (import_info->handleType ==
-          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT &&
-       payload_size) {
-      sized_info.allocationSize = payload_size;
-      alloc_info = &sized_info;
-   }
-
-   struct vn_device_memory_alloc_info local_info;
-   const VkMemoryAllocateInfo *renderer_alloc_info =
-      vn_device_memory_fix_alloc_info(
-         alloc_info,
-         vn_renderer_handle_type_for_guest(
-            dev->physical_device,
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT),
-         false, &local_info);
-   result = vn_device_memory_import_resource_id(
-      dev, mem, renderer_alloc_info, resource_id);
-   if (result != VK_SUCCESS) {
-      vn_renderer_helios_external_memory_destroy(dev->renderer, external);
-      return result;
-   }
-
-   mem->helios_external_memory = external;
-   return VK_SUCCESS;
+   /* ⛔ THE IMPORT CANNOT COMPLETE, AND THAT IS THE INTENDED STATE.
+    *
+    * Everything above succeeded: the NT handle opened, the private data parsed
+    * as a §10.3 HWA2 descriptor, and the descriptor validated as a create
+    * OUTPUT with a nonzero KMD-assigned generation. What is missing is the one
+    * thing HWA2 deliberately does not carry — a host resource id. The import
+    * needs to tell the host renderer WHICH host object this VkDeviceMemory is,
+    * which is what `VkImportMemoryResourceInfoMESA::resourceId` and
+    * `vn_renderer_bo_create_from_resource_id` exist to say, and §10.3 forbids
+    * this ICD naming a host resource at all.
+    *
+    * There is no legal substitute in scope here, and inventing one is
+    * explicitly out of bounds: not `payload_generation` (an anti-stale token,
+    * "never an identity lookup key"), not the WDDM allocation handle, not a
+    * hash of either. SUPPLIED BY: mesa unit A3, which stops the ICD naming
+    * host resources at all and has the KMD patch the resid in from
+    * HeliosNativeRenderPatch.
+    *
+    * The refusal happens here rather than deeper so that the payload IS opened
+    * and validated first: a split deploy or a malformed descriptor is then
+    * still diagnosed by its own name in the log, instead of being masked by a
+    * blanket "import unsupported". */
+   (void)payload_generation;
+   (void)payload_size;
+   (void)payload_desc;
+   /* `mem` is untouched: nothing is half-installed on it, so the caller's
+    * vk_device_memory_destroy on the failure path has nothing of ours to
+    * unwind. */
+   (void)mem;
+   helios_a3_gap_refuse(HELIOS_A3_GAP_IMPORT_WIN32);
+   vn_renderer_helios_external_memory_destroy(dev->renderer, external);
+   /* STUB: `vn_device_memory_import_resource_id` is not called and
+    * `mem->helios_external_memory` is not installed, because binding a
+    * VkDeviceMemory to an unnamed host object would be fake success — the
+    * caller would get VK_SUCCESS and then read someone else's memory. */
+   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
 static void
@@ -758,27 +765,15 @@ vn_AllocateMemory(VkDevice device,
       return vn_error(dev->instance, result);
    }
 
-#ifdef _WIN32
-   /* Imported allocations already have an owner and must not be charged as a
-    * second physical allocation.  Ordinary and exportable allocations are
-    * owned by this VkDeviceMemory and receive one matching VidMm lifetime. */
-   if (!mem->base.vk.import_handle_type && !import_resource_info &&
-       !import_fd_info && !mem->base.vk.ahardware_buffer &&
-       !mem->helios_external_memory) {
-      const VkMemoryType *memory_type =
-         &dev->physical_device->memory_properties
-             .memoryTypes[mem->base.vk.memory_type_index];
-      const VkMemoryHeap *memory_heap =
-         &dev->physical_device->memory_properties
-             .memoryHeaps[memory_type->heapIndex];
-      const bool device_local =
-         memory_heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
-      (void)vn_renderer_helios_vidmm_alloc(
-         dev->renderer, mem->base.vk.size, device_local,
-         &mem->helios_vidmm_resource, &mem->helios_vidmm_allocation,
-         &mem->helios_vidmm_global_share, &mem->helios_vidmm_cookie);
-   }
-#endif
+   /* ⛔ The VidMm accounting mirror that stood here is DELETED. Every ordinary,
+    * non-imported vkAllocateMemory used to create a second, content-free WDDM
+    * "tracking" allocation purely so Windows budget and Task Manager would show
+    * a charge for renderer-owned venus memory. That mechanism has no successor
+    * (K4-CONTRACT §6) and re-adding it is forbidden by §10.3. The named
+    * consequence: venus device memory is invisible to the Windows video-memory
+    * budget until the KMD owns the allocation itself (HVM1, mesa unit A3 plus
+    * the KMD lane). The bytes were always renderer-owned; only the mirror is
+    * gone. */
 
    *pMemory = vn_device_memory_to_handle(mem);
 
@@ -819,10 +814,7 @@ vn_FreeMemory(VkDevice device,
          dev->renderer, mem->helios_external_memory);
       mem->helios_external_memory = NULL;
    }
-   if (mem->helios_vidmm_allocation)
-      vn_renderer_helios_vidmm_free(dev->renderer,
-                                    mem->helios_vidmm_resource,
-                                    mem->helios_vidmm_allocation);
+   /* No VidMm tracker to free — see the deletion note in vn_AllocateMemory. */
 #endif
    vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
 }
@@ -867,13 +859,26 @@ vn_GetMemoryWin32HandlePropertiesKHR(
 
    /* Vulkan forbids this query for opaque Win32 handle types. D3D12_RESOURCE
     * is the one non-opaque type this ICD advertises, and §10.3 has the layer
-    * call this before importing, so it must be answered truthfully rather than
-    * guessed: the payload's WDDM allocation records the memory type its venus
-    * resource was created with, and that single type is the only one the
-    * import can bind to.
+    * call this before importing.
     *
-    * Discovering it means opening the payload, which is why this releases it
-    * again immediately — the caller's real import opens its own. */
+    * ⛔ IT CAN NO LONGER BE ANSWERED. The old answer read the payload's Vulkan
+    * `memory_type_index` out of the WDDM allocation's private data. HWA2 does
+    * not carry one: its `memory_class` is a three-value protocol enum
+    * (device-local / shared / CPU-visible) whose own documentation says "no
+    * Vulkan memory-type index", and §10.7 states that a C57 D3D12_RESOURCE
+    * import "is a separate allocation class ... never exposed through an
+    * ordinary memory type".
+    *
+    * The payload is still opened and validated, deliberately: that is what
+    * makes a split deploy or a malformed descriptor diagnosable by name here
+    * rather than at the import. Only the ANSWER is refused.
+    *
+    * ⚠ Why not report the ICD's own device-local memory type instead? Because
+    * the subsequent vkAllocateMemory import refuses on the A3 gap regardless,
+    * so a reported bit would promise a binding this ICD cannot perform. That is
+    * fake success one call earlier, and a caller debugging it would be looking
+    * at the wrong function. SUPPLIED BY: mesa units A6 (the two-type table) and
+    * A8, after A3. */
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
@@ -882,23 +887,23 @@ vn_GetMemoryWin32HandlePropertiesKHR(
       .handleType = handleType,
       .handle = handle,
    };
-   uint32_t resource_id = 0;
+   uint64_t payload_generation = 0;
    uint64_t payload_size = 0;
-   uint32_t payload_type = UINT32_MAX;
+   HeliosWddmAllocationDescV2 payload_desc;
    struct vn_renderer_helios_external_memory *external = NULL;
    VkResult result = vn_renderer_helios_external_memory_open(
-      dev->renderer, &probe_info, 0, UINT32_MAX, &resource_id, &payload_size,
-      &payload_type, &external);
+      dev->renderer, &probe_info, 0, &payload_generation, &payload_size,
+      &payload_desc, &external);
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    vn_renderer_helios_external_memory_destroy(dev->renderer, external);
 
-   if (payload_type >= dev->physical_device->memory_properties.memoryTypeCount)
-      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-
-   pMemoryWin32HandleProperties->memoryTypeBits = 1u << payload_type;
-   return VK_SUCCESS;
+   /* STUB: memoryTypeBits stays 0 and the call fails, rather than reporting a
+    * memory type derived from `payload_desc.memory_class`. See above — the
+    * class is not a memory-type index and this ICD may not invent one. */
+   helios_a3_gap_refuse(HELIOS_A3_GAP_HANDLE_PROPERTIES);
+   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 }
 #endif
 

@@ -329,6 +329,11 @@ vn_renderer_create_vtest(struct vn_instance *instance,
                          struct vn_renderer **renderer);
 
 #if defined(_WIN32)
+/* HeliosWddmAllocationDescV2 — the §10.3 allocation descriptor the C57 open
+ * returns. Declared once, in protocol/, and reached through this ICD's HWA2
+ * parse/validate layer. */
+#include "vn_helios_hwa2.h"
+
 /* Helios IOCTL backend (vn_renderer_helios.c) — the only backend on Windows. */
 VkResult
 vn_renderer_create_helios(struct vn_instance *instance,
@@ -337,10 +342,13 @@ vn_renderer_create_helios(struct vn_instance *instance,
 
 struct vn_renderer_helios_external_memory;
 
-/* Native VK_KHR_external_memory_win32 payloads.  A payload is a WDDM
- * allocation which owns (export) or retains (import) the matching Venus
- * resource id.  The Linux renderer still sees its normal fd/dma-buf wire
- * handle; no Win32 handle crosses the Venus protocol. */
+/* Native VK_KHR_external_memory_win32 payloads. A payload is a WDDM allocation
+ * carrying the immutable §10.3 HWA2 descriptor. ⛔ It no longer "owns or
+ * retains the matching Venus resource id" — that was UMD-backing adoption, and
+ * §10.3 forbids any UMD/ICD/descriptor naming a host resource at all. Until
+ * mesa unit A3 lands the replacement mechanism (KMD-owned venus memory plus
+ * KMD-side resid patching), the export path refuses and the import path can
+ * validate a payload but cannot bind it. */
 VkResult
 vn_renderer_helios_external_memory_create(
    struct vn_renderer *renderer,
@@ -355,15 +363,27 @@ vn_renderer_helios_external_memory_open(
    struct vn_renderer *renderer,
    const VkImportMemoryWin32HandleInfoKHR *import_info,
    uint64_t allocation_size,
-   /* UINT32_MAX = report the payload's memory type instead of checking it.
-    * Only vkGetMemoryWin32HandlePropertiesKHR may pass it. */
-   uint32_t memory_type_index,
-   uint32_t *out_resource_id,
+   /* ⛔ THE OUTPUT CONTRACT CHANGED WITH THE §10.3 RETIREMENT.
+    *
+    * Gone: `out_resource_id` and `out_memory_type_index`. HWA2 carries neither
+    * a host resource token nor a Vulkan memory-type index, by design and not by
+    * omission, and no field may be added to carry them. Every former consumer
+    * refuses through `helios_a3_gap_refuse` (vn_helios_hwa2.h) until mesa unit
+    * A3 replaces the mechanism.
+    *
+    * `out_allocation_generation` is NOT their replacement. It is HWA2's nonzero
+    * KMD-assigned anti-stale token, "never an identity lookup key"; the identity
+    * is the opened WDDM allocation inside `out_external`. Pair them, never
+    * substitute one for the retired resid. */
+   uint64_t *out_allocation_generation,
    /* The size the payload actually has. For D3D12_RESOURCE_BIT the caller's
     * allocationSize is ignored per spec and may be 0, in which case this is
     * the only place the real size appears. */
    uint64_t *out_allocation_size,
-   uint32_t *out_memory_type_index,
+   /* Optional: the whole validated descriptor, so a caller can apply the §10.3
+    * C37/C43 format/extent agreement checks this function cannot (it does not
+    * know what the caller intends to bind). May be NULL. */
+   HeliosWddmAllocationDescV2 *out_desc,
    struct vn_renderer_helios_external_memory **out_external);
 
 VkResult
@@ -383,30 +403,14 @@ vn_renderer_helios_external_memory_destroy(
    struct vn_renderer *renderer,
    struct vn_renderer_helios_external_memory *external);
 
-/* Mirror a Venus VkDeviceMemory lifetime into Windows VidMm accounting.  The
- * returned handles are opaque D3DKMT identities owned by the renderer. */
-bool
-vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
-                               uint64_t size,
-                               bool device_local,
-                               uint32_t *resource_handle,
-                               uint32_t *allocation_handle,
-                               uint32_t *global_share,
-                               uint32_t *tracker_cookie);
-
-bool
-vn_renderer_helios_vidmm_open_shared(struct vn_renderer *renderer,
-                                     uint32_t global_share,
-                                     uint32_t expected_cookie,
-                                     uint64_t expected_size,
-                                     bool expected_device_local,
-                                     uint32_t *resource_handle,
-                                     uint32_t *allocation_handle);
-
-void
-vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
-                              uint32_t resource_handle,
-                              uint32_t allocation_handle);
+/* ⛔ `vn_renderer_helios_vidmm_alloc` / `_open_shared` / `_free` are DELETED.
+ * They created and shared a content-free "tracking" WDDM allocation whose only
+ * product was a Windows budget/Task Manager charge mirroring renderer-owned
+ * venus memory, through the legacy KMT global-share namespace §10.3 forbids.
+ * The mechanism has NO SUCCESSOR (K4-CONTRACT §6) — nothing was folded into
+ * HWA2, and re-adding it under another name is forbidden by §10.3's "no ...
+ * independently usable identity". See the deletion note in vn_renderer_helios.c
+ * for the accounting consequence, which is named rather than hidden. */
 #endif
 
 static inline VkResult

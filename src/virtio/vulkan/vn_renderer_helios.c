@@ -47,6 +47,11 @@
 #include "vn_renderer_internal.h"
 #include "vn_device.h"
 #include "vn_device_memory.h"
+/* HWA2: the §10.3 allocation descriptor this backend both builds (create input)
+ * and reads (C57 open). It pulls protocol/include/helios_wddm.h, which is the
+ * ONE declaration of the record — see vn_helios_hwa2.h for why the four
+ * hand-copied 48/96-byte mirrors that used to live in this file are gone. */
+#include "vn_helios_hwa2.h"
 #include "vn_instance.h" /* helios_venus_instance_ctx_id (instance-scoped export) */
 #include "vn_physical_device.h"
 /* helios_venus_queue_gpu_fence: decodes a VkQueue to its venus per-queue
@@ -138,13 +143,22 @@ struct helios_unicode_string {
 #define HELIOS_MAP_CACHE_UNCACHED  0x00000002u
 #define HELIOS_MAP_CACHE_WC        0x00000003u
 
-#define HELIOS_WDDM_MAGIC               0x4857444Du /* 'HWDM' */
-#define HELIOS_WDDM_VERSION             1u
-#define HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY 1u
-#define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
-#define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
-#define HELIOS_WDDM_IDENTITY_MAGIC      0x4849444Eu /* 'HIDN' */
-#define HELIOS_WDDM_IDENTITY_VERSION    1u
+/* ⛔ The 'HWDM'/'HIDN' allocation-private vocabulary is RETIRED and must not be
+ * reintroduced. It carried, in one 48-byte record, a host virtio resource id
+ * (`adopt_resource_id` on create, `resource_id` on open) and a Vulkan
+ * `memory_type_index`; §10.3 forbids both — "no host resource token, resid,
+ * PID, process handle, synchronization object, mutable value, or independently
+ * usable identity ... a host resid may live SOLELY inside the KMD allocation
+ * object". Its successor for everything HWA2 *does* carry is
+ * `HeliosWddmAllocationDescV2` (protocol/include/helios_wddm.h); for the two
+ * fields it does not, there is no successor field, only mesa unit A3's
+ * mechanism change, and every former consumer refuses through
+ * `helios_a3_gap_refuse` instead (vn_helios_hwa2.h).
+ *
+ * The HELIOS_WDDM_ALLOC_KIND_TRACKING VidMm mirror is deleted outright and has
+ * NO successor at all — K4-CONTRACT §6. Nothing was "folded into HWA2": grep it
+ * yourself, `protocol/src/wddm.rs` has no tracking kind, cookie, global-share
+ * field or tracker flag bit. */
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
 
 #ifndef OBJ_INHERIT
@@ -226,48 +240,16 @@ struct helios_escape_attach_resource {
    uint32_t resource_id;
 };
 
-struct helios_wddm_alloc_private {
-   uint64_t blob_id;
-   uint64_t size;
-   uint32_t magic;
-   uint32_t version;
-   uint32_t blob_mem;
-   uint32_t blob_flags;
-   uint32_t ctx_id;
-   uint32_t map_cache;
-   uint32_t kind;
-   uint32_t adopt_resource_id;
-};
-
-struct helios_wddm_alloc_meta {
-   uint32_t width;
-   uint32_t height;
-   uint32_t format;
-   uint32_t pitch;
-   uint32_t bind_flags;
-   uint32_t misc_flags;
-   uint64_t venus_alloc_size;
-   uint32_t memory_type_index;
-   uint32_t dxgi_format;
-   uint64_t plane_offset;
-};
-
-struct helios_wddm_open_identity {
-   uint64_t venus_alloc_size;
-   uint64_t blob_size;
-   uint32_t magic;
-   uint32_t version;
-   uint32_t resource_id;
-   uint32_t memory_type_index;
-   uint32_t ctx_id;
-   uint32_t kind;
-   uint32_t reserved[2];
-};
-
-struct helios_wddm_external_private {
-   struct helios_wddm_alloc_private alloc;
-   struct helios_wddm_alloc_meta meta;
-};
+/* ⛔ `helios_wddm_alloc_private` (48 B), `helios_wddm_alloc_meta` (48 B),
+ * `helios_wddm_open_identity` (48 B) and `helios_wddm_external_private` (96 B)
+ * used to be declared here, as hand-written C copies of records whose source of
+ * truth is `protocol/`. They are deleted, and re-adding a local copy of a wire
+ * record is forbidden by standing directive: shared private data has ONE
+ * declaration, in `protocol/`. The replacement is
+ * `HeliosWddmAllocationDescV2` from `protocol/include/helios_wddm.h`, whose own
+ * `offsetof` assertions make a layout drift a compile error on this side —
+ * which the four size-only `_Static_assert`s below never did in either
+ * direction (K4-CONTRACT §7 calls this the third cross-repo atomic pair). */
 
 /* C3/M3.4 async transport: WAIT_FENCE v2 (40 bytes). `fence_id` is the WIRE
  * fence id the KMD wrote back into the SUBMIT_VENUS escape buffer. The caller
@@ -342,14 +324,11 @@ _Static_assert(sizeof(struct helios_escape_wait_fence) == 40, "wait_fence size")
 _Static_assert(sizeof(struct helios_escape_fence_event) == 40, "fence_event size");
 _Static_assert(sizeof(struct helios_escape_query_scanout) == 64, "query_scanout size");
 _Static_assert(sizeof(struct helios_venus_scanout_info) == 40, "scanout_info size");
-_Static_assert(sizeof(struct helios_wddm_alloc_private) == 48,
-               "wddm alloc private size");
-_Static_assert(sizeof(struct helios_wddm_alloc_meta) == 48,
-               "wddm alloc meta size");
-_Static_assert(sizeof(struct helios_wddm_open_identity) == 48,
-               "wddm open identity size");
-_Static_assert(sizeof(struct helios_wddm_external_private) == 96,
-               "wddm external private size");
+/* The four `wddm *` size guards that stood here are gone with the records they
+ * guarded. HWA2's layout is now pinned by protocol/include/helios_wddm.h's own
+ * per-field `offsetof` assertions, which fire in THIS translation unit because
+ * this file includes it — strictly stronger than the `sizeof == 48` they
+ * replace, which a field reorder passed silently. */
 
 /* ── Backend private structs (vtest pattern: base is the first member) ──────── */
 
@@ -614,6 +593,14 @@ static volatile LONG helios_fence_event_lost;      /* NOT_FOUND + unsignaled
  * non-zero means the per-device handle leak below is still live. */
 static volatile LONG helios_module_pin_failures;
 
+/* C57 admission refusals: the payload was a structurally valid HWA2 but is not
+ * an allocation the import path may adopt (wrong kind, not shared, or a size
+ * that does not bound what the caller asked to bind). Distinct from an HWA2
+ * parse/validate refusal — those mean the bytes are not a descriptor at all and
+ * are counted per-arm inside vn_helios_hwa2.c. Declared here with the other
+ * process-wide counters because helios_perf_write prints it. */
+static volatile LONG helios_c57_admission_refusals;
+
 /* Process-global state, audited 2026-07-06 (23rd session) for the two-live-
  * VkInstance shape the dcomp present vehicle introduces (a Vulkan app's own
  * instance + the vehicle's DXVK->ICD stack in the SAME process):
@@ -785,113 +772,53 @@ helios_venus_memory_alloc_info(VkDeviceMemory memory,
    return true;
 }
 
-/* Kept for old bridge DLLs, but deliberately never attest the legacy
- * process-local lifetime. They then retain the adopted allocation's full
- * conservative charge instead of recreating creator-exit under-reporting. */
+/* ── the retired VidMm global-share tracker ─────────────────────────────────
+ *
+ * ⛔ DELETED MECHANISM, NO SUCCESSOR (K4-CONTRACT §6). The tracker was a second
+ * WDDM allocation (`HELIOS_WDDM_ALLOC_KIND_TRACKING`, created through the
+ * LEGACY GLOBAL SHARE namespace with `D3DKMTCreateAllocation2{CreateShared=1}`
+ * + `D3DKMTOpenResource`) whose only product was a Task Manager / budget charge
+ * mirroring a renderer-owned venus allocation, plus a cross-process attestation
+ * built out of `(cookie << 32) | hGlobalShare`. §10.3 forbids all three parts:
+ * the legacy global-share namespace, the "independently usable identity" the
+ * packed u64 is, and UMD-backing adoption, which is what the mirror attests to.
+ * `protocol/src/wddm_legacy.rs:30` used to claim it was "folded into HWA2's own
+ * tracking-kind fields"; K4-CONTRACT §6 corrects that — `grep -in track
+ * protocol/src/wddm.rs` returns nothing. Do not go looking for a replacement
+ * and do not translate this into something else.
+ *
+ * The three exports survive as SYMBOLS ONLY, so that an older
+ * `helios_umd.dll` bridge that resolves them by name (umd/bridge/
+ * bridge_icd_exports.cpp) gets a counted refusal rather than a stale
+ * attestation or a missing-export crash. Deleting the symbols is the D3D11-UMD
+ * lane's half of OWNERSHIP.md §2's second atomic pair, not this file's. */
 __declspec(dllexport) bool
 helios_venus_memory_vidmm_tracked(VkDeviceMemory memory)
 {
    (void)memory;
+   helios_a3_gap_refuse(HELIOS_A3_GAP_VIDMM_TRACKER);
    return false;
 }
 
-/* System-wide share of the exact tracker described above. A nonzero result is
- * stronger than the legacy boolean attestation: another process can open the
- * same WDDM allocation and keep its one VidMm charge alive after this process
- * releases the creator-side VkDeviceMemory. */
 __declspec(dllexport) uint64_t
 helios_venus_memory_vidmm_global_identity(VkDeviceMemory memory)
 {
-   if (memory == VK_NULL_HANDLE)
-      return 0;
-
-   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
-   return mem->helios_vidmm_resource && mem->helios_vidmm_allocation &&
-          mem->helios_vidmm_global_share && mem->helios_vidmm_cookie
-             ? ((uint64_t)mem->helios_vidmm_cookie << 32) |
-                  mem->helios_vidmm_global_share
-             : 0;
+   (void)memory;
+   helios_a3_gap_refuse(HELIOS_A3_GAP_VIDMM_TRACKER);
+   /* Zero is the caller's documented "no identity" answer, and it is now the
+    * only answer: a nonzero value here would be exactly the independently
+    * usable identity §10.3 forbids the ICD from minting. */
+   return 0;
 }
 
-/* Retain a creator's shared VidMm tracker on an imported VkDeviceMemory. */
 __declspec(dllexport) bool
 helios_venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
                                        uint64_t global_identity)
 {
-   const uint32_t global_share = (uint32_t)global_identity;
-   const uint32_t expected_cookie = (uint32_t)(global_identity >> 32);
-   if (memory == VK_NULL_HANDLE || !global_share || !expected_cookie)
-      return false;
-
-   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
-   struct vk_device *vk_dev = mem->base.vk.base.device;
-   if (!vk_dev)
-      return false;
-   struct vn_device *dev = vn_device_from_vk(vk_dev);
-   struct helios *helios = (struct helios *)dev->renderer;
-   mtx_lock(&helios->dev_mutex);
-   const bool already_complete =
-      mem->helios_vidmm_resource && mem->helios_vidmm_allocation &&
-      mem->helios_vidmm_global_share && mem->helios_vidmm_cookie;
-   const bool already_partial =
-      mem->helios_vidmm_resource || mem->helios_vidmm_allocation ||
-      mem->helios_vidmm_global_share || mem->helios_vidmm_cookie;
-   mtx_unlock(&helios->dev_mutex);
-   if (already_complete || already_partial)
-      return already_complete;
-
-   const VkMemoryType *memory_type =
-      &dev->physical_device->memory_properties
-          .memoryTypes[mem->base.vk.memory_type_index];
-   const VkMemoryHeap *memory_heap =
-      &dev->physical_device->memory_properties
-          .memoryHeaps[memory_type->heapIndex];
-   const bool device_local =
-      memory_heap->flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
-   uint32_t resource = 0;
-   uint32_t allocation = 0;
-   uint32_t retained_share = global_share;
-   uint32_t retained_cookie = expected_cookie;
-   bool retained = vn_renderer_helios_vidmm_open_shared(
-      dev->renderer, global_share, expected_cookie, mem->base.vk.size,
-      device_local, &resource, &allocation);
-
-   /* The creator can release its last tracker reference while this process is
-    * opening the payload. Preserve accounting in that race by creating a new
-    * full-size tracker in the imported memory's actual heap. Concurrent or
-    * repeated fallback owners can conservatively over-report. */
-   if (!retained) {
-      retained = vn_renderer_helios_vidmm_alloc(
-         dev->renderer, mem->base.vk.size, device_local, &resource,
-         &allocation, &retained_share, &retained_cookie);
-      if (!retained)
-         return false;
-      helios_diag("VidMm global tracker 0x%x unavailable; created fallback 0x%x",
-                  global_share, retained_share);
-   }
-
-   /* The bridge normally calls once per freshly imported memory. Keep the
-    * install serialized anyway: a duplicate concurrent call frees its local
-    * reference instead of overwriting and leaking the winner's handles. */
-   mtx_lock(&helios->dev_mutex);
-   const bool empty = !mem->helios_vidmm_resource &&
-                      !mem->helios_vidmm_allocation &&
-                      !mem->helios_vidmm_global_share &&
-                      !mem->helios_vidmm_cookie;
-   if (empty) {
-      mem->helios_vidmm_resource = resource;
-      mem->helios_vidmm_allocation = allocation;
-      mem->helios_vidmm_global_share = retained_share;
-      mem->helios_vidmm_cookie = retained_cookie;
-   }
-   const bool complete = mem->helios_vidmm_resource &&
-                         mem->helios_vidmm_allocation &&
-                         mem->helios_vidmm_global_share &&
-                         mem->helios_vidmm_cookie;
-   mtx_unlock(&helios->dev_mutex);
-   if (!empty)
-      vn_renderer_helios_vidmm_free(dev->renderer, resource, allocation);
-   return complete;
+   (void)memory;
+   (void)global_identity;
+   helios_a3_gap_refuse(HELIOS_A3_GAP_VIDMM_TRACKER);
+   return false;
 }
 
 __declspec(dllexport) uint32_t
@@ -3029,6 +2956,20 @@ helios_perf_write(struct helios *helios, bool final)
            helios_fence_event_immediate, helios_fence_event_raced,
            helios_fence_event_timeouts, helios_fence_event_fallbacks,
            helios_fence_event_lost);
+   /* §10.3 seam counters. `hwa2_rejects` names which validation arm refused a
+    * private-data buffer (`private_data_size` first of all means a split
+    * deploy); `a3_gaps` counts the paths that HWA2 deliberately cannot serve
+    * until mesa unit A3 lands; `c57_admission` counts payloads that WERE valid
+    * HWA2 but are not allocations the import path may adopt. Nonzero a3_gaps is
+    * EXPECTED in this intermediate state and is not by itself a defect. */
+   {
+      char hwa2_summary[512];
+      char a3_summary[256];
+      helios_hwa2_reject_summary(hwa2_summary, sizeof(hwa2_summary));
+      helios_a3_gap_summary(a3_summary, sizeof(a3_summary));
+      fprintf(f, "hwa2_rejects=[%s] a3_gaps=[%s] c57_admission=%ld\n",
+              hwa2_summary, a3_summary, helios_c57_admission_refusals);
+   }
    fprintf(f, "shmem_creates=%llu shmem_cache_hits=%llu bo_creates=%llu bo_maps=%llu\n",
            (unsigned long long)helios->perf.shmem_creates,
            (unsigned long long)helios->perf.shmem_cache_hits,
@@ -3227,6 +3168,13 @@ helios_open_d3dkmt(struct helios *helios)
       }
    }
 
+   /* ⚠ The paging queue currently has NO consumer: its only callers were
+    * `helios_vidmm_make_resident_locked` and the VidMm tracker, both deleted
+    * with UMD-backing adoption (K4-CONTRACT §6). It is kept created because
+    * MakeResident comes back the moment the KMD owns the venus allocation
+    * (HVM1 / mesa unit A3) and because tearing down and re-adding the queue is
+    * a change to renderer setup with no benefit in between. Do not read its
+    * presence as evidence that anything is made resident today. */
    D3DKMT_CREATEPAGINGQUEUE create_queue;
    memset(&create_queue, 0, sizeof(create_queue));
    create_queue.hDevice = helios->device;
@@ -3252,21 +3200,11 @@ helios_open_d3dkmt(struct helios *helios)
    return true;
 }
 
-static void
-helios_vidmm_evict_locked(struct helios *helios,
-                          D3DKMT_HANDLE allocation_handle)
-{
-   if (allocation_handle && helios->device) {
-      D3DKMT_EVICT evict;
-      memset(&evict, 0, sizeof(evict));
-      evict.hDevice = helios->device;
-      evict.NumAllocations = 1;
-      evict.AllocationList = &allocation_handle;
-      const NTSTATUS status = D3DKMTEvict(&evict);
-      if (status != 0)
-         helios_diag("VidMm Evict failed status=0x%08x", (unsigned)status);
-   }
-}
+/* ⛔ `helios_vidmm_evict_locked` and `helios_vidmm_make_resident_locked` were
+ * deleted with the VidMm tracker below: MakeResident/Evict were only ever
+ * applied to the tracking allocation, never to a C57-opened payload, so the
+ * two helpers lost their only callers. `helios_vidmm_destroy_locked` stays —
+ * the external-memory create/open paths still destroy what they opened. */
 
 static void
 helios_vidmm_destroy_locked(struct helios *helios,
@@ -3290,285 +3228,41 @@ helios_vidmm_destroy_locked(struct helios *helios,
    }
 }
 
-enum helios_vidmm_residency {
-   HELIOS_VIDMM_NOT_ACQUIRED,
-   HELIOS_VIDMM_RESIDENT,
-   HELIOS_VIDMM_RESIDENT_WAIT_FAILED,
-};
 
-static enum helios_vidmm_residency
-helios_vidmm_make_resident_locked(struct helios *helios,
-                                  D3DKMT_HANDLE allocation,
-                                  uint64_t size)
-{
-   UINT priority = D3DDDI_ALLOCATIONPRIORITY_MAXIMUM;
-   D3DDDI_MAKERESIDENT resident;
-   memset(&resident, 0, sizeof(resident));
-   resident.hPagingQueue = helios->paging_queue;
-   resident.NumAllocations = 1;
-   resident.AllocationList = &allocation;
-   resident.PriorityList = &priority;
-   NTSTATUS st = D3DKMTMakeResident(&resident);
-   if (st != 0 && st != HELIOS_STATUS_PENDING) {
-      helios_diag("VidMm MakeResident size=%llu failed status=0x%08x",
-                  (unsigned long long)size, (unsigned)st);
-      return HELIOS_VIDMM_NOT_ACQUIRED;
-   }
+/* ⛔ THE VIDMM GLOBAL-SHARE TRACKER IS DELETED, WITH NO SUCCESSOR.
+ *
+ * What stood here: `helios_vidmm_new_cookie`, `vn_renderer_helios_vidmm_alloc`,
+ * `vn_renderer_helios_vidmm_open_shared` and `vn_renderer_helios_vidmm_free` —
+ * a second, content-free WDDM allocation of kind
+ * `HELIOS_WDDM_ALLOC_KIND_TRACKING` created for EVERY ordinary
+ * `vkAllocateMemory` purely so Windows budget/Task Manager would see a charge
+ * for renderer-owned venus memory, published through the legacy KMT global
+ * share so another process could open the same charge, and attested with a
+ * `(cookie << 32) | hGlobalShare` u64.
+ *
+ * Why it is gone, and why nothing replaces it (K4-CONTRACT §6):
+ *   - §10.3 forbids the legacy global-share namespace as a sharing mechanism;
+ *   - the packed u64 is precisely the "independently usable identity" §10.3
+ *     says no UMD, ICD, batch or private descriptor may name or supply;
+ *   - HWA2 has no tracking kind, no cookie, no global-share field and no
+ *     tracker flag bit. `protocol/src/wddm_legacy.rs:30` claimed the mechanism
+ *     was "folded into HWA2's own tracking-kind fields"; that line is false and
+ *     K4-CONTRACT §6 corrects it.
+ *
+ * ⚠ CONSEQUENCE, NAMED SO NOBODY REDISCOVERS IT AS A BUG: an ordinary venus
+ * VkDeviceMemory no longer appears in the Windows video-memory budget or in
+ * Task Manager's GPU memory column. The bytes were always renderer-owned; only
+ * the mirror is gone. The accounting successor is the KMD owning the venus
+ * allocation itself (HVM1), which is mesa unit A3 plus the KMD lane, not a
+ * field this ICD can set.
+ *
+ * The three dllexports that fed the DXVK bridge from here are retained as
+ * counted refusals — see helios_venus_memory_vidmm_* above. */
 
-   if (resident.PagingFenceValue) {
-      UINT64 value = resident.PagingFenceValue;
-      D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait;
-      memset(&wait, 0, sizeof(wait));
-      wait.hDevice = helios->device;
-      wait.ObjectCount = 1;
-      wait.ObjectHandleArray = &helios->paging_sync;
-      wait.FenceValueArray = &value;
-      st = D3DKMTWaitForSynchronizationObjectFromCpu(&wait);
-      if (st != 0) {
-         helios_diag("VidMm paging wait size=%llu failed status=0x%08x",
-                     (unsigned long long)size, (unsigned)st);
-         return HELIOS_VIDMM_RESIDENT_WAIT_FAILED;
-      }
-   }
-   return HELIOS_VIDMM_RESIDENT;
-}
-
-static uint32_t
-helios_vidmm_new_cookie(struct helios *helios)
-{
-   static volatile LONG serial;
-   LARGE_INTEGER counter;
-   QueryPerformanceCounter(&counter);
-   uint64_t mixed = (uint64_t)counter.QuadPart ^
-                    ((uint64_t)GetCurrentProcessId() << 32) ^
-                    (uintptr_t)helios ^ (uint32_t)InterlockedIncrement(&serial);
-   mixed ^= mixed >> 33;
-   mixed *= UINT64_C(0xff51afd7ed558ccd);
-   mixed ^= mixed >> 33;
-   uint32_t cookie = (uint32_t)mixed;
-   return cookie ? cookie : 1;
-}
-
-bool
-vn_renderer_helios_vidmm_alloc(struct vn_renderer *renderer,
-                               uint64_t size,
-                               bool device_local,
-                               uint32_t *resource_handle,
-                               uint32_t *allocation_handle,
-                               uint32_t *global_share,
-                               uint32_t *tracker_cookie)
-{
-   struct helios *helios = (struct helios *)renderer;
-   if (!resource_handle || !allocation_handle || !global_share ||
-       !tracker_cookie)
-      return false;
-   *resource_handle = 0;
-   *allocation_handle = 0;
-   *global_share = 0;
-   *tracker_cookie = 0;
-
-   if (!size || !helios->device || !helios->ctx_id ||
-       !helios->paging_queue || !helios->paging_sync)
-      return false;
-
-   struct helios_wddm_alloc_private private_data;
-   memset(&private_data, 0, sizeof(private_data));
-   private_data.size = size;
-   private_data.magic = HELIOS_WDDM_MAGIC;
-   private_data.version = HELIOS_WDDM_VERSION;
-   private_data.ctx_id = helios->ctx_id;
-   private_data.kind = HELIOS_WDDM_ALLOC_KIND_TRACKING;
-   private_data.map_cache = helios_vidmm_new_cookie(helios);
-   if (!device_local)
-      private_data.blob_flags = HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING;
-
-   D3DDDI_ALLOCATIONINFO2 allocation_info;
-   memset(&allocation_info, 0, sizeof(allocation_info));
-   allocation_info.pPrivateDriverData = &private_data;
-   allocation_info.PrivateDriverDataSize = sizeof(private_data);
-
-   D3DKMT_CREATEALLOCATION create;
-   memset(&create, 0, sizeof(create));
-   create.hDevice = helios->device;
-   create.Flags.CreateResource = 1;
-   /* A legacy KMT global share names one WDDM resource system-wide. Importers
-    * open this same tracker rather than creating another full-size charge. */
-   create.Flags.CreateShared = 1;
-   create.Flags.AllowNotZeroed = 1;
-   create.NumAllocations = 1;
-   create.pAllocationInfo2 = &allocation_info;
-
-   mtx_lock(&helios->dev_mutex);
-   NTSTATUS st = D3DKMTCreateAllocation2(&create);
-   if (st != 0) {
-      mtx_unlock(&helios->dev_mutex);
-      helios_diag("VidMm CreateAllocation2 size=%llu failed status=0x%08x",
-                  (unsigned long long)size, (unsigned)st);
-      return false;
-   }
-
-   D3DKMT_HANDLE allocation = allocation_info.hAllocation;
-   enum helios_vidmm_residency residency = HELIOS_VIDMM_NOT_ACQUIRED;
-   if (create.hResource && allocation && create.hGlobalShare)
-      residency = helios_vidmm_make_resident_locked(helios, allocation, size);
-   if (!create.hResource || !allocation || !create.hGlobalShare ||
-       residency != HELIOS_VIDMM_RESIDENT) {
-      if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
-         helios_vidmm_evict_locked(helios, allocation);
-      helios_vidmm_destroy_locked(helios, create.hResource, allocation);
-      mtx_unlock(&helios->dev_mutex);
-      helios_diag("VidMm shared tracker invalid resource=0x%x allocation=0x%x global=0x%x",
-                  (unsigned)create.hResource, (unsigned)allocation,
-                  (unsigned)create.hGlobalShare);
-      return false;
-   }
-
-   *resource_handle = create.hResource;
-   *allocation_handle = allocation;
-   *global_share = create.hGlobalShare;
-   *tracker_cookie = private_data.map_cache;
-   mtx_unlock(&helios->dev_mutex);
-   return true;
-}
-
+/* Retained: the 1 MiB sanity cap on every private-data size dxgkrnl reports,
+ * used by the C57 open path. It bounds a `calloc` sized from a number the
+ * kernel supplies, so it stays even though its other caller is gone. */
 #define HELIOS_VIDMM_PRIVATE_DATA_LIMIT (1024u * 1024u)
-
-bool
-vn_renderer_helios_vidmm_open_shared(struct vn_renderer *renderer,
-                                     uint32_t global_share,
-                                     uint32_t expected_cookie,
-                                     uint64_t expected_size,
-                                     bool expected_device_local,
-                                     uint32_t *resource_handle,
-                                     uint32_t *allocation_handle)
-{
-   struct helios *helios = (struct helios *)renderer;
-   if (!global_share || !expected_cookie || !expected_size ||
-       !resource_handle || !allocation_handle)
-      return false;
-   *resource_handle = 0;
-   *allocation_handle = 0;
-   if (!helios->device || !helios->paging_queue || !helios->paging_sync)
-      return false;
-
-   D3DKMT_QUERYRESOURCEINFO query;
-   memset(&query, 0, sizeof(query));
-   query.hDevice = helios->device;
-   query.hGlobalShare = global_share;
-
-   mtx_lock(&helios->dev_mutex);
-   NTSTATUS st = D3DKMTQueryResourceInfo(&query);
-   if (st != 0 || query.NumAllocations != 1 ||
-       query.PrivateRuntimeDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
-       query.ResourcePrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT ||
-       query.TotalPrivateDriverDataSize > HELIOS_VIDMM_PRIVATE_DATA_LIMIT) {
-      mtx_unlock(&helios->dev_mutex);
-      helios_diag("VidMm QueryResourceInfo global=0x%x failed status=0x%08x allocs=%u private=%u/%u/%u",
-                  global_share, (unsigned)st, query.NumAllocations,
-                  query.PrivateRuntimeDataSize,
-                  query.ResourcePrivateDriverDataSize,
-                  query.TotalPrivateDriverDataSize);
-      return false;
-   }
-
-   void *runtime_data = query.PrivateRuntimeDataSize
-                           ? calloc(1, query.PrivateRuntimeDataSize) : NULL;
-   void *resource_private = query.ResourcePrivateDriverDataSize
-                              ? calloc(1, query.ResourcePrivateDriverDataSize) : NULL;
-   void *total_private = query.TotalPrivateDriverDataSize
-                           ? calloc(1, query.TotalPrivateDriverDataSize) : NULL;
-   if ((query.PrivateRuntimeDataSize && !runtime_data) ||
-       (query.ResourcePrivateDriverDataSize && !resource_private) ||
-       (query.TotalPrivateDriverDataSize && !total_private)) {
-      free(runtime_data);
-      free(resource_private);
-      free(total_private);
-      mtx_unlock(&helios->dev_mutex);
-      return false;
-   }
-
-   if (query.PrivateRuntimeDataSize) {
-      query.pPrivateRuntimeData = runtime_data;
-      st = D3DKMTQueryResourceInfo(&query);
-      if (st != 0) {
-         free(runtime_data);
-         free(resource_private);
-         free(total_private);
-         mtx_unlock(&helios->dev_mutex);
-         helios_diag("VidMm QueryResourceInfo data global=0x%x failed status=0x%08x",
-                     global_share, (unsigned)st);
-         return false;
-      }
-   }
-
-   D3DDDI_OPENALLOCATIONINFO allocation_info;
-   memset(&allocation_info, 0, sizeof(allocation_info));
-   D3DKMT_OPENRESOURCE open;
-   memset(&open, 0, sizeof(open));
-   open.hDevice = helios->device;
-   open.hGlobalShare = global_share;
-   open.NumAllocations = 1;
-   open.pOpenAllocationInfo = &allocation_info;
-   open.pPrivateRuntimeData = runtime_data;
-   open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
-   open.pResourcePrivateDriverData = resource_private;
-   open.ResourcePrivateDriverDataSize = query.ResourcePrivateDriverDataSize;
-   open.pTotalPrivateDriverDataBuffer = total_private;
-   open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
-   st = D3DKMTOpenResource(&open);
-   D3DKMT_HANDLE allocation = allocation_info.hAllocation;
-   struct helios_wddm_alloc_private private_data;
-   memset(&private_data, 0, sizeof(private_data));
-   if (allocation_info.PrivateDriverDataSize >= sizeof(private_data) &&
-       allocation_info.pPrivateDriverData)
-      memcpy(&private_data, allocation_info.pPrivateDriverData,
-             sizeof(private_data));
-   const bool expected_nonlocal = !expected_device_local;
-   const bool tracker_matches =
-      private_data.magic == HELIOS_WDDM_MAGIC &&
-      private_data.version == HELIOS_WDDM_VERSION &&
-      private_data.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING &&
-      private_data.map_cache == expected_cookie &&
-      private_data.size == expected_size &&
-      !!(private_data.blob_flags & HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING) ==
-         expected_nonlocal;
-   enum helios_vidmm_residency residency = HELIOS_VIDMM_NOT_ACQUIRED;
-   if (st == 0 && open.hResource && allocation && tracker_matches)
-      residency = helios_vidmm_make_resident_locked(
-         helios, allocation, expected_size);
-   if (residency == HELIOS_VIDMM_RESIDENT) {
-      *resource_handle = open.hResource;
-      *allocation_handle = allocation;
-   } else {
-      if (residency != HELIOS_VIDMM_NOT_ACQUIRED)
-         helios_vidmm_evict_locked(helios, allocation);
-      if (open.hResource || allocation)
-         helios_vidmm_destroy_locked(helios, open.hResource, allocation);
-      helios_diag("VidMm OpenResource global=0x%x failed/mismatched status=0x%08x resource=0x%x allocation=0x%x",
-                  global_share, (unsigned)st, (unsigned)open.hResource,
-                  (unsigned)allocation);
-   }
-   free(runtime_data);
-   free(resource_private);
-   free(total_private);
-   mtx_unlock(&helios->dev_mutex);
-   return *resource_handle != 0 && *allocation_handle != 0;
-}
-
-void
-vn_renderer_helios_vidmm_free(struct vn_renderer *renderer,
-                              uint32_t resource_handle,
-                              uint32_t allocation_handle)
-{
-   struct helios *helios = (struct helios *)renderer;
-   if (!resource_handle || !allocation_handle)
-      return;
-
-   mtx_lock(&helios->dev_mutex);
-   helios_vidmm_evict_locked(helios, allocation_handle);
-   helios_vidmm_destroy_locked(helios, resource_handle, allocation_handle);
-   mtx_unlock(&helios->dev_mutex);
-}
 
 static void
 helios_external_memory_destroy_locked(
@@ -3588,6 +3282,85 @@ helios_external_memory_destroy_locked(
    }
 }
 
+/*
+ * Build the §10.3 create-INPUT descriptor for one venus-exported VkDeviceMemory.
+ *
+ * ⛔ FIELD PARTITION (K4-CONTRACT §1.1), and the KMD refuses the create rather
+ * than correcting a field, so every value here is load-bearing:
+ *   - the header is ours to write exactly: magic, abi_version, struct_size and
+ *     package_generation. A creator that cannot stamp the package generation has
+ *     no business creating an allocation, and zero is never a wildcard.
+ *   - `allocation_generation` is written ZERO. It is KMD-assigned, exactly like
+ *     HOC1's, and a nonzero value on input is refused by name.
+ *   - the two KMD-owned flag bits (DIRECT_FLIP_COMPATIBLE, D3D12_RUNTIME_PRIMARY)
+ *     are written ZERO. §10.3 sets both in the kernel after cross-validating the
+ *     create record, the runtime PRIMARY flag and the D3DDDI_ID_UNINITIALIZED
+ *     sentinel; an opener never infers either and a creator never asserts either.
+ *   - everything else is written exactly and echoed back verbatim.
+ *
+ * WHY THESE VALUES for a VkDeviceMemory:
+ *   - `allocation_kind` is BUFFER, not IMAGE: a VkDeviceMemory is a linear byte
+ *     range with no DXGI interpretation. ⚠ Note the trap this avoids — the
+ *     retired record's `kind == 1` meant DEVICE_MEMORY, and HWA2's
+ *     `allocation_kind == 1` means BUFFER. Same number, different question. The
+ *     BUFFER arm then REQUIRES every geometry field, dxgi_format, d3d_ddi_format
+ *     and plane_count to be zero, which is why they are left zeroed rather than
+ *     filled in "for completeness"; a nonzero one is a named refusal.
+ *   - `flags` carries SHARED because this allocation exists to be exported, and
+ *     CPU_VISIBLE iff the Vulkan memory type is host-visible. `memory_class` is
+ *     derived from the SAME predicate, because §10.3 cross-checks them: a
+ *     CPU_VISIBLE class without the flag, or a DEVICE_LOCAL class with it, is a
+ *     named refusal.
+ *   - `misc_flags` carries SHARED_NT_HANDLE because the create below sets
+ *     `NtSecuritySharing = 1`. These two must agree or the descriptor describes
+ *     a different object than the one being made.
+ *   - `vidpn_source` is the C44 sentinel: a non-primary must carry exactly that,
+ *     never a concrete source.
+ *   - `swizzle_class` is LINEAR: a buffer has no tiling.
+ *   - `bind_flags` is zero. A VkDeviceMemory has no D3D bind vocabulary, and
+ *     HWA2's bind bits are a shared protocol vocabulary, never a raw D3D11/D3D12
+ *     bit reinterpretation, so guessing one would be worse than none.
+ *
+ * ⛔ WHAT IS NOT HERE AND MAY NOT BE ADDED: the venus/virtio resource id. The
+ * retired 96-byte record put it in `adopt_resource_id` and the KMD "adopted" the
+ * host resource behind it. HWA2 has no such field by design.
+ */
+static void
+helios_hwa2_build_export_create_input(HeliosWddmAllocationDescV2 *desc,
+                                      uint64_t allocation_size,
+                                      VkMemoryPropertyFlags memory_flags)
+{
+   memset(desc, 0, sizeof(*desc));
+   desc->magic = HELIOS_HWA2_MAGIC;
+   desc->abi_version = HELIOS_HWA2_ABI_VERSION;
+   desc->struct_size = HELIOS_HWA2_BYTES;
+   desc->package_generation = HELIOS_PACKAGE_GENERATION;
+   /* KMD-assigned; zero on input is the rule, not an omission. */
+   desc->allocation_generation = 0;
+   desc->byte_size = allocation_size;
+
+   const bool cpu_visible =
+      (memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+   desc->allocation_kind = HELIOS_HWA2_KIND_BUFFER;
+   desc->flags = HELIOS_HWA2_FLAG_SHARED |
+                 (cpu_visible ? HELIOS_HWA2_FLAG_CPU_VISIBLE : 0u);
+   desc->bind_flags = 0;
+   desc->misc_flags = HELIOS_HWA2_MISC_SHARED_NT_HANDLE;
+   desc->vidpn_source = HELIOS_D3DDDI_ID_UNINITIALIZED;
+   desc->standard_allocation_type = 0;
+   desc->swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
+   /* SHARED rather than DEVICE_LOCAL for the non-CPU-visible arm: this
+    * allocation is by construction reachable by another process through its NT
+    * handle, and DEVICE_LOCAL additionally asserts "not CPU mappable", which is
+    * the only thing §10.3 cross-checks it for. Choosing DEVICE_LOCAL here would
+    * also collide with the K2/HLM1 sequencing gap (K4-CONTRACT §4): role-4
+    * device-local placement is admitted and counted, not satisfied, until the
+    * HLM1 segment exists. */
+   desc->memory_class =
+      cpu_visible ? HELIOS_HWA2_MEMORY_CPU_VISIBLE : HELIOS_HWA2_MEMORY_SHARED;
+   desc->plane_count = 0;
+}
+
 VkResult
 vn_renderer_helios_external_memory_create(
    struct vn_renderer *renderer,
@@ -3605,76 +3378,66 @@ vn_renderer_helios_external_memory_create(
        !memory_id || !allocation_size)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
-   struct vn_renderer_helios_external_memory *external =
-      calloc(1, sizeof(*external));
-   if (!external)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   /* Build the descriptor first, and validate it as the KMD will, so the
+    * refusal below carries the exact bytes mesa unit A3 will eventually send
+    * rather than a shrug. A self-refusal here would be a bug in this file, not
+    * in the caller, and is counted separately from the A3 gap. */
+   HeliosWddmAllocationDescV2 desc;
+   helios_hwa2_build_export_create_input(&desc, allocation_size,
+                                         bo->memory_flags);
 
-   struct helios_wddm_external_private private_data;
-   memset(&private_data, 0, sizeof(private_data));
-   private_data.alloc.blob_id = memory_id;
-   private_data.alloc.size = allocation_size;
-   private_data.alloc.magic = HELIOS_WDDM_MAGIC;
-   private_data.alloc.version = HELIOS_WDDM_VERSION;
-   private_data.alloc.blob_mem = VIRTIO_GPU_BLOB_MEM_HOST3D;
-   private_data.alloc.blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
-   private_data.alloc.ctx_id = helios->ctx_id;
-   private_data.alloc.map_cache = HELIOS_MAP_CACHE_CACHED;
-   private_data.alloc.kind = HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY;
-   private_data.alloc.adopt_resource_id = bo->base.res_id;
-   private_data.meta.venus_alloc_size = allocation_size;
-   private_data.meta.memory_type_index = memory_type_index;
-
-   D3DDDI_ALLOCATIONINFO2 allocation_info;
-   memset(&allocation_info, 0, sizeof(allocation_info));
-   allocation_info.pPrivateDriverData = &private_data;
-   allocation_info.PrivateDriverDataSize = sizeof(private_data);
-
-   D3DKMT_CREATEALLOCATION create;
-   memset(&create, 0, sizeof(create));
-   create.hDevice = helios->device;
-   create.Flags.CreateResource = 1;
-   create.Flags.CreateShared = 1;
-   create.Flags.NtSecuritySharing = 1;
-   create.Flags.AllowNotZeroed = 1;
-   create.NumAllocations = 1;
-   create.pAllocationInfo2 = &allocation_info;
-
-   mtx_lock(&helios->dev_mutex);
-   const NTSTATUS st = D3DKMTCreateAllocation2(&create);
-   if (st == 0 && create.hResource && allocation_info.hAllocation) {
-      /* The KMD atomically re-owns this resource id for the allocation.  The
-       * BO must never send RELEASE_BLOB after this point. */
-      bo->resource_released = true;
-      external->resource = create.hResource;
-      external->allocation = allocation_info.hAllocation;
-   } else {
-      if (st == 0) {
-         /* A successful call with incomplete output has still passed through
-          * the KMD adoption path, so treat the BO lifetime as transferred. */
-         bo->resource_released = true;
-         external->resource = create.hResource;
-         external->allocation = allocation_info.hAllocation;
-         helios_external_memory_destroy_locked(helios, external);
-      }
-      helios_diag("external memory CreateAllocation2 failed status=0x%08x resource=0x%x allocation=0x%x res_id=%u",
-                  (unsigned)st, (unsigned)create.hResource,
-                  (unsigned)allocation_info.hAllocation, bo->base.res_id);
-   }
-   mtx_unlock(&helios->dev_mutex);
-
-   if (!external->resource || !external->allocation) {
-      free(external);
-      return st == 0 ? VK_ERROR_INVALID_EXTERNAL_HANDLE
-                     : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   struct helios_hwa2_reject_detail reject;
+   if (!helios_hwa2_validate_create_input(&desc, HELIOS_PACKAGE_GENERATION,
+                                          &reject)) {
+      helios_hwa2_note_reject("export_create_input", &reject);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
-   helios_diag("external memory adopted res=%u resource=0x%x allocation=0x%x size=%llu type=%u",
-               bo->base.res_id, (unsigned)external->resource,
-               (unsigned)external->allocation,
-               (unsigned long long)allocation_size, memory_type_index);
-   *out_external = external;
-   return VK_SUCCESS;
+   /* ⛔ THE EXPORT CANNOT COMPLETE, AND THIS IS THE INTENDED STATE.
+    *
+    * The only thing this call ever did was hand the KMD `adopt_resource_id =
+    * bo->base.res_id` so the kernel would re-own THIS BO's venus resource behind
+    * the new WDDM allocation — UMD-backing adoption. HWA2 carries no host
+    * resource token by design, and §10.3 is not silent-by-omission about it:
+    * "no host resource token, resid, PID, process handle, synchronization
+    * object, mutable value, or independently usable identity ... a host resid
+    * may live SOLELY inside the KMD allocation object; no UMD, ICD, batch, or
+    * private descriptor can name or supply one."
+    *
+    * So the create is refused BEFORE D3DKMTCreateAllocation2 rather than after.
+    * Issuing it would succeed and produce a WDDM allocation with segment
+    * backing that is NOT this BO's venus memory; exporting that NT handle would
+    * hand an importer an object whose descriptor is perfectly valid and whose
+    * contents are unrelated. That is the exact shape of fake success this
+    * project forbids, and it would be discovered as corrupted pixels three
+    * layers away.
+    *
+    * Refusing before the create also keeps `bo->resource_released` FALSE, so the
+    * BO's own RELEASE_BLOB lifetime is untouched: nothing is half-transferred.
+    *
+    * SUPPLIED BY: mesa unit A3 — the KMD owns the venus allocation (HVM1) and
+    * the ICD stops naming host resources at all.
+    */
+   helios_a3_gap_refuse(HELIOS_A3_GAP_EXPORT_ADOPTION);
+   vn_renderer_helios_diag_log(
+      "external memory export REFUSED (A3 gap): built a valid HWA2 create input"
+      " kind=%u flags=0x%x bind=0x%x misc=0x%x swizzle=%u memory_class=%u"
+      " byte_size=%llu pkg_gen=0x%llx alloc_gen=0 -- but the venus resource"
+      " res_id=%u (memory_id=%llu, vk memory type %u) cannot be named to the KMD"
+      " through it, and no field may be added to carry it.",
+      desc.allocation_kind, desc.flags, desc.bind_flags, desc.misc_flags,
+      desc.swizzle_class, desc.memory_class,
+      (unsigned long long)desc.byte_size,
+      (unsigned long long)desc.package_generation, bo->base.res_id,
+      (unsigned long long)memory_id, memory_type_index);
+
+   /* STUB: the D3DKMTCreateAllocation2 that consumed this descriptor is not
+    * written, because the record it would send cannot express the venus binding
+    * the export needs (see above). `desc` is complete and validated and is the
+    * input A3 will send unchanged; nothing here is a placeholder value.
+    * VK_ERROR_INVALID_EXTERNAL_HANDLE is the documented result for a handle
+    * type this implementation cannot produce a payload for. */
+   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
 
 static void
@@ -3707,16 +3470,16 @@ vn_renderer_helios_external_memory_open(
    struct vn_renderer *renderer,
    const VkImportMemoryWin32HandleInfoKHR *import_info,
    uint64_t allocation_size,
-   uint32_t memory_type_index,
-   uint32_t *out_resource_id,
+   uint64_t *out_allocation_generation,
    uint64_t *out_allocation_size,
-   uint32_t *out_memory_type_index,
+   HeliosWddmAllocationDescV2 *out_desc,
    struct vn_renderer_helios_external_memory **out_external)
 {
    struct helios *helios = (struct helios *)renderer;
-   *out_resource_id = 0;
+   *out_allocation_generation = 0;
    *out_allocation_size = 0;
-   *out_memory_type_index = UINT32_MAX;
+   if (out_desc)
+      memset(out_desc, 0, sizeof(*out_desc));
    *out_external = NULL;
 
    /*
@@ -3726,8 +3489,8 @@ vn_renderer_helios_external_memory_open(
     * fused heap+resource DDI arm sets VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT on
     * *every* committed create (umd12/src/forward12/resource12.rs) precisely so
     * the memory is allocator-dedicated and venus-exportable — so its WDDM
-    * allocation carries the same helios_wddm_open_identity, naming the same
-    * venus resource. The host never learns which D3D API named it.
+    * allocation carries the same HWA2 descriptor. The host never learns which
+    * D3D API named it.
     *
     * They are NOT interchangeable to the caller: Vulkan keeps them in separate
     * compatibility classes, and vn_sanitize_image_format_properties reports
@@ -3845,30 +3608,95 @@ vn_renderer_helios_external_memory_open(
    if (st == 0)
       st = D3DKMTOpenResourceFromNtHandle(&open);
 
-   struct helios_wddm_open_identity identity;
-   memset(&identity, 0, sizeof(identity));
-   if (st == 0 && allocation_info.pPrivateDriverData &&
-       allocation_info.PrivateDriverDataSize >= sizeof(identity)) {
-      memcpy(&identity, allocation_info.pPrivateDriverData, sizeof(identity));
+   /* ── read the descriptor ────────────────────────────────────────────────
+    *
+    * The per-allocation private data is the §10.3 HWA2 record, written by the
+    * KMD at CREATE and const from then on. ⚠ `DxgkDdiOpenAllocation` writes no
+    * byte of it: the retired HeliosWddmOpenIdentity restamped the first 48
+    * bytes at open time, which meant two openers of one allocation could
+    * disagree about what they had. If this reader ever needs the KMD to have
+    * written something at open, the design has regressed.
+    *
+    * The length and containment checks live in helios_hwa2_from_private_data,
+    * this ICD's transcription of `HeliosWddmAllocationDescV2::from_private_data`
+    * — including the exact `== 168` length test (never `>=`, which the old
+    * reader used and which would have accepted a buffer `protocol/` itself
+    * refuses) and the arena containment §10.9 requires. `total_private` is the
+    * queried pTotalPrivateDriverDataBuffer that dxgkrnl addresses this pointer
+    * inside; it is passed so containment is checked rather than assumed. */
+   HeliosWddmAllocationDescV2 desc;
+   struct helios_hwa2_reject_detail reject;
+   memset(&desc, 0, sizeof(desc));
+   memset(&reject, 0, sizeof(reject));
+   bool desc_valid = false;
+   if (st == 0) {
+      desc_valid = helios_hwa2_from_private_data(
+                      allocation_info.pPrivateDriverData,
+                      allocation_info.PrivateDriverDataSize, total_private,
+                      query.TotalPrivateDriverDataSize, &desc, &reject) &&
+                   /* Create-OUTPUT stage: this descriptor was written by the
+                    * KMD, so `allocation_generation` must be NONZERO. A zero one
+                    * means we are looking at an unfinished create record rather
+                    * than at an allocation. */
+                   helios_hwa2_validate_create_output(
+                      &desc, HELIOS_PACKAGE_GENERATION, &reject);
    }
 
+   /* ── admission: is this an allocation THIS path may import? ──────────────
+    *
+    * Structural validity is not admission. Two further gates, each with an
+    * argument rather than a habit:
+    *
+    *  - kind. BUFFER (a venus VkDeviceMemory export) and IMAGE (a D3D12
+    *    committed texture or a WSI swapchain image) are the two kinds a guest
+    *    can legitimately hand us. The three STANDARD_* kinds are dxgkrnl's own
+    *    primary/shadow/staging surfaces and PAGING_OBJECT is a VidMm object;
+    *    neither is a Vulkan-importable payload, and admitting one would let a
+    *    caller bind device memory over the desktop primary.
+    *    ⚠⚠ THE TRAP THIS REPLACES: the old predicate was `kind == 1`, meaning
+    *    HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY. HWA2's `allocation_kind == 1` is
+    *    KIND_BUFFER. A mechanical struct swap would have kept compiling and
+    *    silently started rejecting every imported image.
+    *  - FLAG_SHARED. The payload arrived through an NT handle, so its creator
+    *    must have declared it shareable. One that did not is being opened
+    *    outside the sharing contract its own descriptor states.
+    *
+    * §10.3's C37/C43 format/extent agreement checks are NOT applied here: this
+    * function does not know what the caller intends to bind, and `out_desc`
+    * exists precisely so the caller can apply them. Named so the omission is
+    * not later read as an oversight. */
+   const bool kind_admissible =
+      desc_valid && (desc.allocation_kind == HELIOS_HWA2_KIND_BUFFER ||
+                     desc.allocation_kind == HELIOS_HWA2_KIND_IMAGE);
+   const bool shared_admissible =
+      desc_valid && (desc.flags & HELIOS_HWA2_FLAG_SHARED) != 0;
+
+   /* ── size ────────────────────────────────────────────────────────────────
+    *
+    * HWA2 has ONE extent. The retired record carried two — a page-rounded
+    * `blob_size` and the creator's exact `venus_alloc_size` — and cross-checked
+    * them against each other; that cross-check can no longer be expressed and
+    * its loss is real, not a simplification.
+    *
+    * ⚠ UNVERIFIED, AND THE OPERATOR DEPENDS ON IT: §10.3 calls `byte_size` the
+    * "exact backing extent ... bounds every plane", which reads as the
+    * page-rounded blob semantics rather than the creator's vkAllocateMemory
+    * size. If that is right, `==` against a Vulkan allocationSize would produce
+    * a false refusal on every rounded allocation, so this is `>=`: the backing
+    * must be at least what the caller wants to bind, and may be more. `>=` is
+    * also the fail-safe direction — it can never admit an over-bind. Re-decide
+    * against the KMD write site when K4 lands it; that write site did not exist
+    * when this was written. */
    const uint64_t effective_size =
-      size_from_identity ? identity.venus_alloc_size : allocation_size;
-   const bool identity_valid =
-      identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
-      identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
-      identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
-      identity.resource_id != 0 && identity.blob_size >= effective_size &&
-      identity.venus_alloc_size == effective_size &&
-      /* UINT32_MAX = "report it, do not check it". Only
-       * vkGetMemoryWin32HandlePropertiesKHR passes this: it is the call whose
-       * whole job is to discover the memory type, so it cannot supply one. */
-      (memory_type_index == UINT32_MAX ||
-       identity.memory_type_index == memory_type_index);
+      size_from_identity ? desc.byte_size : allocation_size;
+   const bool size_admissible =
+      desc_valid && effective_size != 0 && desc.byte_size >= effective_size;
+
+   const bool admissible =
+      desc_valid && kind_admissible && shared_admissible && size_admissible;
 
    struct vn_renderer_helios_external_memory *external = NULL;
-   if (st == 0 && open.hResource && allocation_info.hAllocation &&
-       identity_valid) {
+   if (st == 0 && open.hResource && allocation_info.hAllocation && admissible) {
       external = calloc(1, sizeof(*external));
       if (external) {
          external->resource = open.hResource;
@@ -3889,24 +3717,57 @@ vn_renderer_helios_external_memory_open(
    mtx_unlock(&helios->dev_mutex);
 
    if (!external) {
-      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u size=%llu/%llu type=%u/%u",
-                  (unsigned)st, (unsigned)open.hResource,
-                  (unsigned)allocation_info.hAllocation, identity.magic,
-                  identity.version, identity.resource_id,
-                  (unsigned long long)identity.venus_alloc_size,
-                  (unsigned long long)effective_size,
-                  identity.memory_type_index, memory_type_index);
-      return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
-                                      : VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      /* Three distinguishable failures, and the log must say which: the OS
+       * refused the open; the bytes are not an HWA2 descriptor (the split-deploy
+       * arm, named by helios_hwa2_note_reject); or the descriptor is valid but
+       * describes an allocation this path may not adopt. */
+      if (st != 0) {
+         helios_diag("external memory open failed status=0x%08x resource=0x%x "
+                     "allocation=0x%x",
+                     (unsigned)st, (unsigned)open.hResource,
+                     (unsigned)allocation_info.hAllocation);
+      } else if (!desc_valid) {
+         helios_hwa2_note_reject("c57_open", &reject);
+      } else if (!admissible) {
+         InterlockedIncrement(&helios_c57_admission_refusals);
+         vn_renderer_helios_diag_log(
+            "C57 open REFUSED: valid HWA2 but not admissible --"
+            " kind=%u(ok=%d) flags=0x%x(shared=%d) byte_size=%llu"
+            " requested=%llu(ok=%d) alloc_gen=0x%llx",
+            desc.allocation_kind, kind_admissible ? 1 : 0, desc.flags,
+            shared_admissible ? 1 : 0, (unsigned long long)desc.byte_size,
+            (unsigned long long)effective_size, size_admissible ? 1 : 0,
+            (unsigned long long)desc.allocation_generation);
+      }
+      /* Admissible with no `external` means only the calloc failed: that is an
+       * out-of-host-memory, not a bad handle. */
+      return st == 0 && admissible ? VK_ERROR_OUT_OF_HOST_MEMORY
+                                   : VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
-   helios_diag("external memory opened res=%u resource=0x%x allocation=0x%x size=%llu type=%u",
-               identity.resource_id, (unsigned)external->resource,
-               (unsigned)external->allocation,
-               (unsigned long long)allocation_size, memory_type_index);
-   *out_resource_id = identity.resource_id;
+   helios_diag("external memory opened alloc_gen=0x%llx resource=0x%x "
+               "allocation=0x%x kind=%u flags=0x%x size=%llu",
+               (unsigned long long)desc.allocation_generation,
+               (unsigned)external->resource, (unsigned)external->allocation,
+               desc.allocation_kind, desc.flags,
+               (unsigned long long)effective_size);
+   /* ⛔ The output contract, and what is deliberately absent from it.
+    *
+    * `allocation_generation` is what a caller carries forward where it used to
+    * carry `resource_id` — but it is NOT a substitute for it and must never be
+    * used as one. It is a nonzero KMD-assigned anti-stale token, "never an
+    * identity lookup key" (§10.3); the identity is the local WDDM allocation
+    * object itself, `external->allocation`. Together they are exactly what
+    * §10.3 says an HNR2 use record requires: the local allocation plus the
+    * immutable HWA2 record.
+    *
+    * There is no `out_resource_id` and no `out_memory_type_index`, because there
+    * is nothing legal to put in either — see helios_a3_gap_refuse's site table
+    * in vn_helios_hwa2.c. */
+   *out_allocation_generation = desc.allocation_generation;
    *out_allocation_size = effective_size;
-   *out_memory_type_index = identity.memory_type_index;
+   if (out_desc)
+      *out_desc = desc;
    *out_external = external;
    return VK_SUCCESS;
 }
