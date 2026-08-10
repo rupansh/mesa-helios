@@ -1172,3 +1172,66 @@ vn_GetImageSubresourceLayout2(VkDevice device,
    vn_call_vkGetImageSubresourceLayout2(dev->primary_ring, device, image,
                                         pSubresource, pLayout);
 }
+
+#if DETECT_OS_WINDOWS
+
+/* The private presentable-image tag call. Contract and rationale:
+ * src/vulkan/helios_private_wsi.h. It is deliberately NOT a registry
+ * entrypoint — it never appears in vk.xml, so it cannot travel through the
+ * generated dispatch table and is returned by vn_GetDeviceProcAddr by name.
+ *
+ * This is a gate, not a rubber stamp. CLAUDE.md rule 2 forbids a call that
+ * accepts whatever it is handed and reports success; each refusal below is a
+ * property the reference requires of a presentable image, checked against what
+ * the ICD already knows about the image.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_SetHeliosPresentableImageHELIOS(VkDevice device,
+                                   VkImage image,
+                                   uint64_t swapchainId,
+                                   uint32_t imageIndex)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_image *img = vn_image_from_handle(image);
+
+   if (!img)
+      return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
+
+   /* §10.3: a presentable image is a D3D12 committed resource imported with
+    * D3D12_RESOURCE_BIT. An image created without that external handle type is
+    * not one, whatever the caller believes — this is the check that makes the
+    * tag mean something, and it costs nothing because vk_image already records
+    * the create-time handle types. */
+   if (!(img->base.vk.external_handle_types &
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)) {
+      vn_log(dev->instance,
+             "presentable-image tag refused: image was not created with "
+             "D3D12_RESOURCE_BIT (external_handle_types=0x%x)",
+             img->base.vk.external_handle_types);
+      return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
+   }
+
+   /* One image is one slot. A second tag naming a different slot means the
+    * layer has aliased two slots onto one image, which would make every
+    * later ownership transfer ambiguous and is precisely the confusion this
+    * record exists to prevent. Re-tagging the SAME slot is idempotent, so a
+    * retried swapchain build is not punished. */
+   if (img->helios_presentable.tagged &&
+       (img->helios_presentable.swapchain_id != swapchainId ||
+        img->helios_presentable.image_index != imageIndex)) {
+      vn_log(dev->instance,
+             "presentable-image tag refused: image already tagged as "
+             "swapchain %" PRIu64 " slot %u, re-tag as swapchain %" PRIu64
+             " slot %u",
+             img->helios_presentable.swapchain_id,
+             img->helios_presentable.image_index, swapchainId, imageIndex);
+      return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
+   }
+
+   img->helios_presentable.tagged = true;
+   img->helios_presentable.swapchain_id = swapchainId;
+   img->helios_presentable.image_index = imageIndex;
+   return VK_SUCCESS;
+}
+
+#endif /* DETECT_OS_WINDOWS */

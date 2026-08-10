@@ -745,6 +745,19 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vn_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+
+#if DETECT_OS_WINDOWS
+   /* The private presentable-image tag (src/vulkan/helios_private_wsi.h). It
+    * is not a registry entrypoint, so vk_device_get_proc_addr — which is
+    * generated from vk.xml — cannot know it and would return NULL. This is
+    * also the ONLY way it is published: it is deliberately not a DLL export,
+    * because the layer's contract resolves it exclusively through the
+    * next-layer vkGetDeviceProcAddr, and an export would offer a second route
+    * that bypasses the device it is scoped to. */
+   if (pName && !strcmp(pName, HELIOS_SET_PRESENTABLE_IMAGE_NAME))
+      return (PFN_vkVoidFunction)vn_SetHeliosPresentableImageHELIOS;
+#endif
+
    return vk_device_get_proc_addr(&dev->base.vk, pName);
 }
 

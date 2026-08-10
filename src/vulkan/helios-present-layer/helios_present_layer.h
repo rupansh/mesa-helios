@@ -74,32 +74,13 @@ extern "C" {
 /* The private lower-ICD presentable-image tag call                    */
 /* ------------------------------------------------------------------ */
 /*
- * §10.7:2581-2588 requires "a device/image-scoped private dispatch call" from
- * this layer into the lower Helios ICD that
- *   (a) records that this VkImage is the exact presentable image of a layer
- *       swapchain slot, and
- *   (b) thereby makes VK_IMAGE_LAYOUT_PRESENT_SRC_KHR legal for it and lets
- *       the ICD validate the PRESENT_SRC_KHR -> GENERAL -> QUEUE_FAMILY_EXTERNAL
- *       release and the reciprocal acquire.
- *
- * The reference never names the entry point, so this declaration is the
- * layer-side half of an ABI that must be agreed with the lower-ICD sub-lane
- * (lane-mesa.md ambiguity A4). It is resolved ONLY through the captured
- * next-layer vkGetDeviceProcAddr — never by GetProcAddress, never by a global
- * lookup — and its absence is a hard refusal of vkCreateSwapchainKHR
- * (counter: swapchain_refused_tag_call_absent). It is never approximated.
- *
- * swapchainId is the layer swapchain's process-unique, monotonically
- * increasing generation id; it is NOT a handle value and is never serialized
- * outside this process (§12.3:3305-3307).
+ * ⛔ Declared ONCE, in src/vulkan/helios_private_wsi.h, which the Helios ICD
+ * includes too. This file used to carry its own copy of the name and the
+ * signature — an ABI with two declarations, which is exactly what the standing
+ * directive behind OWNERSHIP.md §4 exists to prevent. The contract, and why
+ * the ICD needs to be told at all, is documented there.
  */
-#define HELIOS_SET_PRESENTABLE_IMAGE_NAME "vkSetHeliosPresentableImageHELIOS"
-
-typedef VkResult(VKAPI_PTR *PFN_vkSetHeliosPresentableImageHELIOS)(
-   VkDevice device,
-   VkImage image,
-   uint64_t swapchainId,
-   uint32_t imageIndex);
+#include "vulkan/helios_private_wsi.h"
 
 /* ------------------------------------------------------------------ */
 /* Named refusal counters                                              */

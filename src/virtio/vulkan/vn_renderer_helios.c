@@ -1023,13 +1023,23 @@ helios_wddm_sync_open_nt(struct vn_renderer *renderer,
       return VK_SUCCESS;
    }
 
+   /* Keep the FIRST status. The Nt2 open is the one that can return a
+    * monitored fence's CPU/GPU VAs, so it is the informative failure; the
+    * legacy open below cannot return them and only ever explains why the
+    * fallback did not rescue it. Reporting the second status alone said
+    * "0xc000000d" for a failure that happened one call earlier for a
+    * different reason. */
+   const NTSTATUS st_nt2 = st;
+
    D3DKMT_OPENSYNCOBJECTFROMNTHANDLE open;
    memset(&open, 0, sizeof(open));
    open.hNtHandle = nt_handle;
    st = D3DKMTOpenSyncObjectFromNtHandle(&open);
    if (st != 0) {
-      helios_diag("sync_open_nt failed status=0x%08x handle=%p dev=0x%x",
-                  (unsigned)st, nt_handle, (unsigned)helios->device);
+      helios_diag("sync_open_nt failed nt2_status=0x%08x legacy_status=0x%08x "
+                  "handle=%p dev=0x%x",
+                  (unsigned)st_nt2, (unsigned)st, nt_handle,
+                  (unsigned)helios->device);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 

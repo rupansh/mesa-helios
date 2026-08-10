@@ -13,6 +13,10 @@
 
 #include "vn_common.h"
 
+#if DETECT_OS_WINDOWS
+#include "vulkan/helios_private_wsi.h"
+#endif
+
 /* changing this to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR disables ownership
  * transfers and can be useful for debugging
  */
@@ -59,11 +63,33 @@ struct vn_image {
       /* memory backing the prime blit dst buffer */
       struct vn_device_memory *blit_mem;
    } wsi;
+
+#if DETECT_OS_WINDOWS
+   /* The presentable-image tag set by VK_LAYER_HELIOS_present through
+    * vkSetHeliosPresentableImageHELIOS (src/vulkan/helios_private_wsi.h).
+    * `tagged` is what makes VK_IMAGE_LAYOUT_PRESENT_SRC_KHR meaningful for an
+    * image that is not a VkSwapchainKHR image, and the id/index are what let a
+    * misuse be reported against a specific slot rather than "some image". */
+   struct {
+      bool tagged;
+      uint64_t swapchain_id;
+      uint32_t image_index;
+   } helios_presentable;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_image,
                                base.vk.base,
                                VkImage,
                                VK_OBJECT_TYPE_IMAGE)
+
+#if DETECT_OS_WINDOWS
+/* Implemented in vn_image.c; published only through vn_GetDeviceProcAddr. */
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_SetHeliosPresentableImageHELIOS(VkDevice device,
+                                   VkImage image,
+                                   uint64_t swapchainId,
+                                   uint32_t imageIndex);
+#endif
 
 struct vn_image_view {
    struct vn_object_base base;
