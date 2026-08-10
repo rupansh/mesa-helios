@@ -189,8 +189,16 @@ stw_st_framebuffer_validate_locked(struct st_context *st,
       (stwfb->pfd_flags & PFD_SWAP_COPY))
       mask |= ST_ATTACHMENT_FRONT_LEFT_MASK;
 
-   /* remove outdated textures */
-   if (stwfb->texture_width != width || stwfb->texture_height != height) {
+   /* Remove outdated textures.  A Zink minimize/restore transition also
+    * changes whether the resources are drawable-backed, even when the
+    * preserved framebuffer dimensions have not changed.
+    */
+   bool recreate =
+      stwfb->texture_width != width || stwfb->texture_height != height;
+#ifdef GALLIUM_ZINK
+   recreate |= stw_dev->zink && stwfb->fb->must_resize;
+#endif
+   if (recreate) {
       for (i = 0; i < ST_ATTACHMENT_COUNT; i++) {
          pipe_resource_reference(&stwfb->msaa_textures[i], NULL);
          pipe_resource_reference(&stwfb->textures[i], NULL);
@@ -226,12 +234,17 @@ stw_st_framebuffer_validate_locked(struct st_context *st,
 
 #ifdef GALLIUM_ZINK
          if (stw_dev->zink) {
-            /* Covers the case where we have already created a drawable that
-             * then got swapped and now we have to make a new back buffer.
-             * For Zink, we just alias the front buffer in that case.
-             */
-            if (i == ST_ATTACHMENT_BACK_LEFT && stwfb->textures[ST_ATTACHMENT_FRONT_LEFT])
+            if (stwfb->fb->minimized) {
                bind &= ~PIPE_BIND_DISPLAY_TARGET;
+            } else {
+               /* Covers the case where we have already created a drawable
+                * that then got swapped and now we have to make a new back
+                * buffer.  For Zink, just alias the front buffer then.
+                */
+               if (i == ST_ATTACHMENT_BACK_LEFT &&
+                   stwfb->textures[ST_ATTACHMENT_FRONT_LEFT])
+                  bind &= ~PIPE_BIND_DISPLAY_TARGET;
+            }
          }
 #endif
 
@@ -241,7 +254,7 @@ stw_st_framebuffer_validate_locked(struct st_context *st,
          bind = PIPE_BIND_DEPTH_STENCIL;
 
 #ifdef GALLIUM_ZINK
-         if (stw_dev->zink)
+         if (stw_dev->zink && !stwfb->fb->minimized)
             bind |= PIPE_BIND_DISPLAY_TARGET;
 #endif
 
@@ -268,6 +281,7 @@ stw_st_framebuffer_validate_locked(struct st_context *st,
 
 #ifdef GALLIUM_ZINK
          if (stw_dev->zink &&
+             !stwfb->fb->minimized &&
              i < ST_ATTACHMENT_DEPTH_STENCIL &&
              stw_dev->screen->resource_create_drawable) {
 

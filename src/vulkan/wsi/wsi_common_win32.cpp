@@ -1170,15 +1170,38 @@ wsi_win32_surface_get_support(VkIcdSurfaceBase *surface,
 }
 
 static VkResult
+wsi_win32_get_client_extent(HWND hwnd, VkExtent2D *extent)
+{
+   RECT rect;
+   if (!GetClientRect(hwnd, &rect))
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   const LONG width = rect.right - rect.left;
+   const LONG height = rect.bottom - rect.top;
+
+   /* The Win32 WSI specification requires both dimensions to be zero when
+    * the window has no drawable area.  GetClientRect can briefly return a
+    * zero for only one dimension while a window is being created or resized.
+    */
+   if (width <= 0 || height <= 0)
+      *extent = { 0u, 0u };
+   else
+      *extent = { (uint32_t)width, (uint32_t)height };
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
                                    struct wsi_device *wsi_device,
                                    VkSurfaceCapabilitiesKHR* caps)
 {
    VkIcdSurfaceWin32 *surface = (VkIcdSurfaceWin32 *)surf;
 
-   RECT win_rect;
-   if (!GetClientRect(surface->hwnd, &win_rect))
-      return VK_ERROR_SURFACE_LOST_KHR;
+   VkExtent2D extent;
+   VkResult result = wsi_win32_get_client_extent(surface->hwnd, &extent);
+   if (result != VK_SUCCESS)
+      return result;
 
    caps->minImageCount = 1;
 
@@ -1194,15 +1217,12 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
       caps->maxImageCount = 0;
    }
 
-   caps->currentExtent = {
-      (uint32_t)win_rect.right - (uint32_t)win_rect.left,
-      (uint32_t)win_rect.bottom - (uint32_t)win_rect.top
-   };
-   caps->minImageExtent = { 1u, 1u };
-   caps->maxImageExtent = {
-      wsi_device->maxImageDimension2D,
-      wsi_device->maxImageDimension2D,
-   };
+   /* Win32 does not support choosing a swapchain extent independently of the
+    * native window size.  This includes the normalized 0x0 minimized state.
+    */
+   caps->currentExtent = extent;
+   caps->minImageExtent = extent;
+   caps->maxImageExtent = extent;
 
    caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
    caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
@@ -2459,6 +2479,22 @@ wsi_win32_surface_create_swapchain(
 
    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
 
+   /* Win32 requires the swapchain extent to match the current client area.
+    * Reject stale and zero-area extents before image setup so invalid
+    * allocations never reach the Vulkan driver.  Applications can query the
+    * new capabilities and retry after the window changes.
+    */
+   VkExtent2D surface_extent;
+   VkResult result =
+      wsi_win32_get_client_extent(surface->base.hwnd, &surface_extent);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (surface_extent.width == 0 || surface_extent.height == 0 ||
+       create_info->imageExtent.width != surface_extent.width ||
+       create_info->imageExtent.height != surface_extent.height)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
    /* Helios async present: with the fence-wait + blit on the worker thread,
     * the swapchain depth is the app's run-ahead budget — at the requested 2-3
     * images the app stalls in acquire before the GPU can pipeline and the
@@ -2519,9 +2555,8 @@ wsi_win32_surface_create_swapchain(
    struct wsi_base_image_params *image_params = supports_dxgi ?
       &dxgi_image_params.base : &cpu_image_params.base;
 
-   VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
-                                        create_info, image_params,
-                                        allocator);
+   result = wsi_swapchain_init(wsi_device, &chain->base, device,
+                               create_info, image_params, allocator);
    if (result != VK_SUCCESS) {
       u_cnd_monotonic_destroy(&chain->acquire_cond);
       mtx_destroy(&chain->acquire_mutex);
