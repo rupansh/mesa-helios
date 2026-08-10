@@ -1072,10 +1072,43 @@ helios_admit(HeliosInstance *inst, VkPhysicalDevice phys)
    fmt_props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
    fmt_props.pNext = &ext_props;
 
-   if (!inst->disp.GetPhysicalDeviceImageFormatProperties2 ||
-       inst->disp.GetPhysicalDeviceImageFormatProperties2(phys, &fmt_info,
-                                                          &fmt_props) != VK_SUCCESS) {
-      info.reject_reason = "external image format query failed";
+   /*
+    * The two ways this query can fail are a LAYER defect and an ICD gap
+    * respectively, and they were originally reported by the same string. A
+    * refusal that cannot tell "could not run the check" from "the check said
+    * no" sends the reader to the wrong repository: measured on 2026-08-10, it
+    * cost a separate probe (tools/vk_external_handle_probe.cpp) to establish
+    * that the entry point was present and the driver had answered
+    * FORMAT_NOT_SUPPORTED. `reject_reason` is cached in inst->phys and must
+    * stay a string literal, so the VkResult is named by a switch rather than
+    * formatted.
+    */
+   if (!inst->disp.GetPhysicalDeviceImageFormatProperties2) {
+      info.reject_reason = "no vkGetPhysicalDeviceImageFormatProperties2 "
+                           "(layer dispatch defect, not an ICD capability)";
+      helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
+                    VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
+      return info;
+   }
+   VkResult fmt_query =
+      inst->disp.GetPhysicalDeviceImageFormatProperties2(phys, &fmt_info, &fmt_props);
+   if (fmt_query != VK_SUCCESS) {
+      switch (fmt_query) {
+      case VK_ERROR_FORMAT_NOT_SUPPORTED:
+         info.reject_reason =
+            "external image query: FORMAT_NOT_SUPPORTED - the lower ICD does not "
+            "support D3D12_RESOURCE_BIT for the C37 tuple";
+         break;
+      case VK_ERROR_OUT_OF_HOST_MEMORY:
+         info.reject_reason = "external image query: OUT_OF_HOST_MEMORY";
+         break;
+      case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+         info.reject_reason = "external image query: OUT_OF_DEVICE_MEMORY";
+         break;
+      default:
+         info.reject_reason = "external image query failed with an unexpected VkResult";
+         break;
+      }
       helios_refuse(HELIOS_CNT_physdev_refused_no_external_image_import,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
       return info;
