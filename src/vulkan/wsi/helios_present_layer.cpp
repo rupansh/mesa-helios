@@ -253,6 +253,11 @@ struct HeliosInstance {
    bool surface_enabled = false;      /* VK_KHR_surface */
    bool win32_surface_enabled = false;/* VK_KHR_win32_surface */
    bool surface_caps2_enabled = false;/* VK_KHR_get_surface_capabilities2 */
+   /* Observed, not consumed: these two are the app's, and they travel down to
+    * the ICD untouched. They exist here only so the KHR aliases of the
+    * core-1.1 entry points can be gated on them. */
+   bool device_group_creation_enabled = false; /* VK_KHR_device_group_creation */
+   bool physdev_props2_enabled = false;        /* VK_KHR_get_physical_device_properties2 */
    IDXGIFactory4 *dxgi_factory = nullptr;
    std::mutex lock;
    std::unordered_map<VkPhysicalDevice, HeliosPhysDevInfo> phys;
@@ -353,6 +358,9 @@ struct HeliosDevice {
    PFN_vkSetDeviceLoaderData set_device_loader_data = nullptr;
 
    bool wsi_enabled = false;
+   /* Observed, not consumed — see HeliosInstance's pair. Gates the KHR alias
+    * of the bind-memory2 entry points, which were promoted to core 1.1. */
+   bool bind_memory2_khr_enabled = false; /* VK_KHR_bind_memory2 */
    uint32_t canonical_family = UINT32_MAX;
    uint32_t private_queue_index = UINT32_MAX;
    VkQueue helper_queue = VK_NULL_HANDLE;
@@ -508,19 +516,36 @@ helios_client_extent(HWND hwnd, VkExtent2D *out)
 struct HeliosEntry {
    const char *name;
    PFN_vkVoidFunction fn;
-   /* gate: 0 always, 1 needs VK_KHR_surface, 2 needs VK_KHR_win32_surface,
-    * 3 needs VK_KHR_get_surface_capabilities2, 4 needs core 1.1,
-    * 5 needs VK_KHR_swapchain enabled on the device */
+   /* See the HELIOS_GATE_* enum below. */
    int gate;
+   /* True when the entry's first parameter is a VkPhysicalDevice.
+    *
+    * §10.7's dispatch closure distinguishes them because the loader resolves
+    * physical-device functions through GetPhysicalDeviceProcAddr as well as
+    * GetInstanceProcAddr, and a layer that answers one and not the other drops
+    * out of the chain for exactly those entry points. */
+   bool phys;
 };
 
 enum {
    HELIOS_GATE_ALWAYS = 0,
-   HELIOS_GATE_SURFACE = 1,
-   HELIOS_GATE_WIN32_SURFACE = 2,
-   HELIOS_GATE_CAPS2 = 3,
-   HELIOS_GATE_CORE_1_1 = 4,
-   HELIOS_GATE_SWAPCHAIN = 5,
+   HELIOS_GATE_SURFACE = 1,          /* VK_KHR_surface */
+   HELIOS_GATE_WIN32_SURFACE = 2,    /* VK_KHR_win32_surface */
+   HELIOS_GATE_CAPS2 = 3,            /* VK_KHR_get_surface_capabilities2 */
+   HELIOS_GATE_CORE_1_1 = 4,         /* app apiVersion >= 1.1 */
+   HELIOS_GATE_SWAPCHAIN = 5,        /* VK_KHR_swapchain, on the device */
+   /* The three below gate KHR ALIASES of entry points that were promoted to
+    * core 1.1. The alias is resolvable only while its extension is enabled —
+    * an app on 1.1 gets the un-suffixed name through HELIOS_GATE_CORE_1_1 and
+    * the suffixed one only if it asked for the extension — so these are
+    * deliberately NOT folded into HELIOS_GATE_CORE_1_1.
+    *
+    * ⚠ Unlike the gates above, these name extensions this layer does not own.
+    * They are OBSERVED during CreateInstance/CreateDevice and passed through to
+    * the lower ICD, never consumed. */
+   HELIOS_GATE_DEVICE_GROUP_CREATION_KHR = 6, /* VK_KHR_device_group_creation */
+   HELIOS_GATE_PHYSDEV_PROPS2_KHR = 7,        /* VK_KHR_get_physical_device_properties2 */
+   HELIOS_GATE_BIND_MEMORY2_KHR = 8,          /* VK_KHR_bind_memory2, on the device */
 };
 
 /* The two lists, transcribed from §10.7:2250-2262. Order is the prose order. */
@@ -717,6 +742,12 @@ helios_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     * copied lower array (§10.7:2246-2248). The copy is ours; the caller's
     * array is never written. */
    bool want_surface = false, want_win32 = false, want_caps2 = false;
+   /* ⚠ OBSERVED, NOT CONSUMED. These two are not this layer's extensions: they
+    * belong to the app and the lower ICD implements them, so they must reach
+    * `lower_exts` unchanged. We record them only to gate the KHR aliases of
+    * the entry points they were promoted from — dropping either from the lower
+    * list would disable a working extension to answer a naming question. */
+   bool want_device_group_creation = false, want_physdev_props2 = false;
    std::vector<const char *> lower_exts;
    lower_exts.reserve(pCreateInfo->enabledExtensionCount);
    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
@@ -733,6 +764,10 @@ helios_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
          want_caps2 = true;
          continue;
       }
+      if (streq(name, VK_KHR_DEVICE_GROUP_CREATION_EXTENSION_NAME))
+         want_device_group_creation = true; /* falls through to lower_exts */
+      else if (streq(name, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
+         want_physdev_props2 = true;        /* falls through to lower_exts */
       if (helios_is_stale_lower_wsi_name(name))
          continue;
       lower_exts.push_back(name);
@@ -762,6 +797,8 @@ helios_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    inst->surface_enabled = want_surface;
    inst->win32_surface_enabled = want_win32;
    inst->surface_caps2_enabled = want_caps2 && want_surface;
+   inst->device_group_creation_enabled = want_device_group_creation;
+   inst->physdev_props2_enabled = want_physdev_props2;
    inst->app_api_version =
       (pCreateInfo->pApplicationInfo && pCreateInfo->pApplicationInfo->apiVersion)
          ? pCreateInfo->pApplicationInfo->apiVersion
@@ -1805,6 +1842,8 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* Does the application want the layer's WSI on this device? */
    bool wsi = false;
+   /* Observed, not consumed — see the instance pair. */
+   bool want_bind_memory2 = false;
    std::vector<const char *> lower_exts;
    lower_exts.reserve(pCreateInfo->enabledExtensionCount + 2);
    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
@@ -1813,6 +1852,8 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
          wsi = true; /* consumed here; the lower ICD exposes no WSI */
          continue;
       }
+      if (streq(name, VK_KHR_BIND_MEMORY_2_EXTENSION_NAME))
+         want_bind_memory2 = true; /* falls through to lower_exts */
       if (helios_is_stale_lower_wsi_name(name))
          continue;
       lower_exts.push_back(name);
@@ -1935,6 +1976,7 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->phys = physicalDevice;
    dev->inst = inst;
    dev->wsi_enabled = wsi;
+   dev->bind_memory2_khr_enabled = want_bind_memory2;
    dev->canonical_family = info.canonical_family;
    dev->private_queue_index = private_index;
    if (cb_info)
@@ -2693,7 +2735,13 @@ helios_CreateSwapchainKHR(VkDevice device,
    }
 
    /* ---- per-slot S[i], H[i], fences, imports, recording objects ----- */
-   sc->slots.resize(sc->image_count);
+   /* ⚠ NOT `slots.resize(n)`. A HeliosSlot owns the `std::mutex` that covers
+    * its recording objects (A13), so it is neither copyable nor movable, and
+    * `resize` requires MoveInsertable. The sized constructor requires only
+    * DefaultInsertable and value-initialises the elements in place, which is
+    * what a fixed-size slot array wants anyway — the count is decided once,
+    * here, and never changes for the life of the swapchain. */
+   sc->slots = std::vector<HeliosSlot>(sc->image_count);
    D3D12_HEAP_PROPERTIES heap = {};
    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
