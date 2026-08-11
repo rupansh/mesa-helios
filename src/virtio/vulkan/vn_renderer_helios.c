@@ -139,7 +139,8 @@ struct helios_unicode_string {
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
 #define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
 #define HELIOS_WDDM_IDENTITY_MAGIC      0x4849444Eu /* 'HIDN' */
-#define HELIOS_WDDM_IDENTITY_VERSION    1u
+#define HELIOS_WDDM_IDENTITY_VERSION_LEGACY 1u
+#define HELIOS_WDDM_IDENTITY_VERSION    2u
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
 
 #ifndef OBJ_INHERIT
@@ -3396,7 +3397,8 @@ vn_renderer_helios_external_memory_open(
 
    const bool identity_valid =
       identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
-      identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
+      (identity.version == HELIOS_WDDM_IDENTITY_VERSION_LEGACY ||
+       identity.version == HELIOS_WDDM_IDENTITY_VERSION) &&
       identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
       identity.resource_id != 0 && identity.blob_size >= allocation_size &&
       identity.venus_alloc_size == allocation_size &&
