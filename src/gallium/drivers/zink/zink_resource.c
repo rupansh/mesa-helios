@@ -1002,6 +1002,10 @@ static inline bool
 get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, struct mem_alloc_info *alloc_info)
 {
    bool needs_export = (templ->bind & (ZINK_BIND_VIDEO | ZINK_BIND_DMABUF)) != 0;
+#ifdef _WIN32
+   /* PIPE_BIND_SHARED means an OPAQUE_WIN32 export on Windows. */
+   needs_export |= (templ->bind & PIPE_BIND_SHARED) != 0;
+#endif
    if (alloc_info->whandle) {
       if (alloc_info->whandle->type == WINSYS_HANDLE_TYPE_FD ||
           alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)
@@ -1521,7 +1525,9 @@ setup_image_pnext(struct zink_screen *screen, const struct pipe_resource *templ,
          s->idfmlci.pDrmFormatModifiers = modifiers;
          ici->pNext = &s->idfmlci;
       } else if (ici->tiling == VK_IMAGE_TILING_OPTIMAL) {
+#ifndef _WIN32
          alloc_info->shared = false;
+#endif
       }
    } else if (alloc_info->user_mem) {
       s->emici.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
@@ -1981,7 +1987,11 @@ resource_create(struct pipe_screen *pscreen,
       if (res->obj->image && res->queue != VK_QUEUE_FAMILY_FOREIGN_EXT && screen->driver_workarounds.general_layout)
          zink_resource_image_hic_transition(screen, res, VK_IMAGE_LAYOUT_GENERAL);
    }
+#ifdef _WIN32
+   if (res->obj->exportable_dmabuf)
+#else
    if (res->obj->exportable)
+#endif
       res->base.b.bind |= ZINK_BIND_DMABUF;
    return &res->base.b;
 
@@ -2246,18 +2256,17 @@ zink_resource_get_handle(struct pipe_screen *pscreen,
       struct zink_resource_object *obj = res->obj;
 
 #if defined(_WIN32)
-      /*
-       * Ordinary GL resources are not born exportable.  Rebind them to a
-       * dedicated OPAQUE_WIN32 allocation before asking Vulkan for a handle,
-       * mirroring the lazy export conversion used by the Unix dma-buf path.
+      /* Ordinary GL resources are not born exportable. Rebind them to a
+       * dedicated, optimally tiled OPAQUE_WIN32 allocation first. Do not use
+       * ZINK_BIND_DMABUF here: that bind is the Unix linear/modifier path and
+       * transfers ownership to VK_QUEUE_FAMILY_FOREIGN_EXT.
        */
       if (!res->obj->exportable) {
          assert(!zink_resource_usage_is_unflushed(res));
-         unsigned bind = ZINK_BIND_DMABUF;
-         if (!(res->base.b.bind & PIPE_BIND_SHARED))
-            bind |= PIPE_BIND_SHARED;
+         if (res->base.b.bind & PIPE_BIND_SHARED)
+            return false;
          zink_screen_lock_context(screen);
-         if (!add_resource_bind(screen->copy_context, res, bind)) {
+         if (!add_resource_bind(screen->copy_context, res, PIPE_BIND_SHARED)) {
             zink_screen_unlock_context(screen);
             return false;
          }

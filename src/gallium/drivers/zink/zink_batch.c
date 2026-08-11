@@ -899,11 +899,17 @@ zink_end_batch(struct zink_context *ctx)
 
    set_foreach(&bs->dmabuf_exports, entry) {
       struct zink_resource *res = (void*)entry->key;
+#ifdef _WIN32
+      const uint32_t external_queue = res->obj->exportable_dmabuf ?
+         VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
+#else
+      const uint32_t external_queue = VK_QUEUE_FAMILY_FOREIGN_EXT;
+#endif
       if (screen->info.have_KHR_synchronization2) {
          VkImageMemoryBarrier2 imb;
          zink_resource_image_barrier2_init(&imb, res, res->layout, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
          imb.srcQueueFamilyIndex = screen->gfx_queue;
-         imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+         imb.dstQueueFamilyIndex = external_queue;
          VkDependencyInfo dep = {
             VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
             NULL,
@@ -920,7 +926,7 @@ zink_end_batch(struct zink_context *ctx)
          VkImageMemoryBarrier imb;
          zink_resource_image_barrier_init(&imb, res, res->layout, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
          imb.srcQueueFamilyIndex = screen->gfx_queue;
-         imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+         imb.dstQueueFamilyIndex = external_queue;
          VKCTX(CmdPipelineBarrier)(
             bs->cmdbuf,
             res->obj->access_stage,
@@ -931,21 +937,26 @@ zink_end_batch(struct zink_context *ctx)
             1, &imb
          );
       }
-      res->queue = VK_QUEUE_FAMILY_FOREIGN_EXT;
+      res->queue = external_queue;
 
-      /* We just transitioned to VK_QUEUE_FAMILY_FOREIGN_EXT.  We'll need a
-       * barrier to transition back to our queue before we can use this
-       * resource again.  Set need_barriers if bound.
+      /* We just released ownership to an external queue family. We'll need a
+       * barrier to acquire it back before using this resource again. Set
+       * need_barriers if it is bound.
        */
       for (unsigned i = 0; i < ARRAY_SIZE(ctx->need_barriers); i++) {
          if (res->bind_count[i])
             _mesa_set_add(ctx->need_barriers[i], res);
       }
 
-      for (; res; res = zink_resource(res->base.b.next)) {
-         VkSemaphore sem = zink_create_exportable_semaphore(screen);
-         if (sem) {
-            util_dynarray_append(&ctx->bs->signal_semaphores, sem);
+#ifdef _WIN32
+      if (res->obj->exportable_dmabuf)
+#endif
+      {
+         for (; res; res = zink_resource(res->base.b.next)) {
+            VkSemaphore sem = zink_create_exportable_semaphore(screen);
+            if (sem) {
+               util_dynarray_append(&ctx->bs->signal_semaphores, sem);
+            }
          }
       }
       bs->has_work = true;
