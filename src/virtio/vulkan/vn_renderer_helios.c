@@ -3427,13 +3427,17 @@ vn_renderer_helios_external_memory_open(
    mtx_unlock(&helios->dev_mutex);
 
    if (!external) {
-      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u size=%llu/%llu type=%u/%u",
+      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u kind=%u/%u blob=%llu/%llu size=%llu/%llu type=%u/%u valid=%u",
                   (unsigned)st, (unsigned)open.hResource,
                   (unsigned)allocation_info.hAllocation, identity.magic,
                   identity.version, identity.resource_id,
+                  identity.kind, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+                  (unsigned long long)identity.blob_size,
+                  (unsigned long long)allocation_size,
                   (unsigned long long)identity.venus_alloc_size,
                   (unsigned long long)allocation_size,
-                  identity.memory_type_index, memory_type_index);
+                  identity.memory_type_index, memory_type_index,
+                  identity_valid);
       return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
                                       : VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
