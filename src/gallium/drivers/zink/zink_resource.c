@@ -1012,6 +1012,21 @@ get_export_flags(struct zink_screen *screen, const struct pipe_resource *templ, 
    if (needs_export) {
       if (alloc_info->whandle && alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE) {
          alloc_info->external = ZINK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_BIT;
+#ifdef _WIN32
+      } else if (screen->info.have_KHR_external_memory_win32) {
+         /*
+          * WINSYS_HANDLE_TYPE_FD is the native Win32 HANDLE type on Windows.
+          * Unlike the dma-buf path below, exporting it uses OPAQUE_WIN32 and
+          * does not require EXT_external_memory_dma_buf.
+          *
+          * Keep external set for export-only allocations too.  Image setup
+          * uses it to attach VkExternalMemoryImageCreateInfo, which must agree
+          * with the VkExportMemoryAllocateInfo used for the backing memory.
+          */
+         alloc_info->external = ZINK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_BIT;
+         alloc_info->export_types |=
+            ZINK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_BIT;
+#endif
       } else if (screen->info.have_EXT_external_memory_dma_buf) {
          alloc_info->external = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
          alloc_info->export_types |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -2230,7 +2245,43 @@ zink_resource_get_handle(struct pipe_screen *pscreen,
       struct zink_screen *screen = zink_screen(pscreen);
       struct zink_resource_object *obj = res->obj;
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+      /*
+       * Ordinary GL resources are not born exportable.  Rebind them to a
+       * dedicated OPAQUE_WIN32 allocation before asking Vulkan for a handle,
+       * mirroring the lazy export conversion used by the Unix dma-buf path.
+       */
+      if (!res->obj->exportable) {
+         assert(!zink_resource_usage_is_unflushed(res));
+         unsigned bind = ZINK_BIND_DMABUF;
+         if (!(res->base.b.bind & PIPE_BIND_SHARED))
+            bind |= PIPE_BIND_SHARED;
+         zink_screen_lock_context(screen);
+         if (!add_resource_bind(screen->copy_context, res, bind)) {
+            zink_screen_unlock_context(screen);
+            return false;
+         }
+         if (res->all_binds)
+            p_atomic_inc(&screen->image_rebind_counter);
+         screen->copy_context->base.flush(&screen->copy_context->base, NULL, 0);
+         zink_screen_unlock_context(screen);
+         obj = res->obj;
+      }
+
+      VkMemoryGetWin32HandleInfoKHR handle_info = {0};
+      HANDLE handle;
+      handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+      handle_info.memory = zink_bo_get_mem(obj->bo);
+      handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+      VkResult result = VKSCR(GetMemoryWin32HandleKHR)(screen->dev, &handle_info,
+                                                       &handle);
+      if (result != VK_SUCCESS) {
+         mesa_loge("ZINK: vkGetMemoryWin32HandleKHR failed (%s)",
+                   vk_Result_to_str(result));
+         return false;
+      }
+      whandle->handle = handle;
+#else
       if (whandle->type == WINSYS_HANDLE_TYPE_KMS && screen->drm_fd == -1) {
          whandle->handle = -1;
       } else {
@@ -2280,17 +2331,6 @@ zink_resource_get_handle(struct pipe_screen *pscreen,
 
          whandle->handle = fd;
       }
-#else
-      VkMemoryGetWin32HandleInfoKHR handle_info = {0};
-      HANDLE handle;
-      handle_info.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
-      //TODO: remove for wsi
-      handle_info.memory = zink_bo_get_mem(obj->bo);
-      handle_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-      VkResult result = VKSCR(GetMemoryWin32HandleKHR)(screen->dev, &handle_info, &handle);
-      if (result != VK_SUCCESS)
-         return false;
-      whandle->handle = handle;
 #endif
       uint64_t value;
       zink_resource_get_param(pscreen, context, tex, 0, 0, 0, PIPE_RESOURCE_PARAM_MODIFIER, 0, &value);
