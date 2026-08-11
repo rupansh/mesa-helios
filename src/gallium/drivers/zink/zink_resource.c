@@ -28,6 +28,7 @@
 #include "zink_context.h"
 #include "zink_fence.h"
 #include "zink_format.h"
+#include "zink_glinterop.h"
 #include "zink_program.h"
 #include "zink_screen.h"
 #include "zink_surface.h"
@@ -2082,6 +2083,95 @@ add_resource_bind(struct zink_context *ctx, struct zink_resource *res, unsigned 
    return true;
 }
 
+#ifdef _WIN32
+static bool
+make_win32_exportable(struct zink_screen *screen, struct pipe_context *pctx,
+                      struct zink_resource *res)
+{
+   unsigned bind = 0;
+   if (!(res->base.b.bind & PIPE_BIND_SHARED))
+      bind |= PIPE_BIND_SHARED;
+   if (!res->obj->is_buffer &&
+       !(res->base.b.bind & PIPE_BIND_SHADER_IMAGE))
+      bind |= PIPE_BIND_SHADER_IMAGE;
+   if (!bind)
+      return res->obj->exportable;
+
+   /* The rebind copies through Zink's private copy context. Submit pending
+    * work from the GL context first so both submissions are ordered on the
+    * Vulkan queue before the old allocation is replaced.
+    */
+   if (pctx && zink_resource_usage_is_unflushed(res))
+      pctx->flush(pctx, NULL, 0);
+   if (zink_resource_usage_is_unflushed(res)) {
+      mesa_loge("ZINK: cannot export a resource with unflushed usage");
+      return false;
+   }
+
+   zink_screen_lock_context(screen);
+   if (!add_resource_bind(screen->copy_context, res, bind)) {
+      zink_screen_unlock_context(screen);
+      return false;
+   }
+   if (res->all_binds)
+      p_atomic_inc(&screen->image_rebind_counter);
+   screen->copy_context->base.flush(&screen->copy_context->base, NULL, 0);
+   zink_screen_unlock_context(screen);
+   return true;
+}
+
+static uint32_t
+zink_interop_export_object(struct pipe_screen *pscreen,
+                           struct pipe_context *pctx,
+                           struct pipe_resource *pres, uint32_t data_size,
+                           void *data, bool *need_export_dmabuf)
+{
+   struct zink_screen *screen = zink_screen(pscreen);
+   struct zink_resource *res = zink_resource(pres);
+
+   *need_export_dmabuf = true;
+   if (!screen->info.have_KHR_external_memory_win32 ||
+       !make_win32_exportable(screen, pctx, res))
+      return 0;
+
+   if (!data || data_size < sizeof(struct zink_glinterop_export_info))
+      return 0;
+
+   struct zink_glinterop_export_info *info = data;
+   memset(info, 0, sizeof(*info));
+   info->magic = ZINK_GLINTEROP_EXPORT_INFO_MAGIC;
+   info->version = ZINK_GLINTEROP_EXPORT_INFO_VERSION;
+   info->struct_size = sizeof(*info);
+   info->object_type = res->obj->is_buffer ? ZINK_GLINTEROP_OBJECT_BUFFER :
+                                             ZINK_GLINTEROP_OBJECT_IMAGE;
+   info->handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+   info->create_flags = res->obj->vkflags;
+   info->usage = res->obj->vkusage;
+   info->sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+   info->released_queue_family = res->queue;
+   info->allocation_size = res->obj->size;
+   info->memory_offset = res->obj->offset;
+
+   if (!res->obj->is_buffer) {
+      VkImageCreateInfo ici;
+      init_ici(screen, &ici, pres, pres->bind, res->modifiers_count);
+      info->image_type = ici.imageType;
+      info->format = res->format;
+      info->width = ici.extent.width;
+      info->height = ici.extent.height;
+      info->depth = ici.extent.depth;
+      info->mip_levels = ici.mipLevels;
+      info->array_layers = ici.arrayLayers;
+      info->samples = ici.samples;
+      info->tiling = res->linear ? VK_IMAGE_TILING_LINEAR :
+                                   VK_IMAGE_TILING_OPTIMAL;
+      info->layout = res->layout;
+   }
+
+   return sizeof(*info);
+}
+#endif
+
 static bool
 zink_resource_is_aux_plane(struct pipe_resource *pres)
 {
@@ -2256,26 +2346,12 @@ zink_resource_get_handle(struct pipe_screen *pscreen,
       struct zink_resource_object *obj = res->obj;
 
 #if defined(_WIN32)
-      /* Ordinary GL resources are not born exportable. Rebind them to a
-       * dedicated, optimally tiled OPAQUE_WIN32 allocation first. Do not use
-       * ZINK_BIND_DMABUF here: that bind is the Unix linear/modifier path and
-       * transfers ownership to VK_QUEUE_FAMILY_FOREIGN_EXT.
+      /* Do not use ZINK_BIND_DMABUF here: that is the Unix
+       * linear/modifier/FOREIGN ownership path.
        */
-      if (!res->obj->exportable) {
-         assert(!zink_resource_usage_is_unflushed(res));
-         if (res->base.b.bind & PIPE_BIND_SHARED)
-            return false;
-         zink_screen_lock_context(screen);
-         if (!add_resource_bind(screen->copy_context, res, PIPE_BIND_SHARED)) {
-            zink_screen_unlock_context(screen);
-            return false;
-         }
-         if (res->all_binds)
-            p_atomic_inc(&screen->image_rebind_counter);
-         screen->copy_context->base.flush(&screen->copy_context->base, NULL, 0);
-         zink_screen_unlock_context(screen);
-         obj = res->obj;
-      }
+      if (!make_win32_exportable(screen, context, res))
+         return false;
+      obj = res->obj;
 
       VkMemoryGetWin32HandleInfoKHR handle_info = {0};
       HANDLE handle;
@@ -3635,6 +3711,10 @@ zink_screen_resource_init(struct pipe_screen *pscreen)
       pscreen->resource_get_handle = zink_resource_get_handle;
       pscreen->resource_from_handle = zink_resource_from_handle;
    }
+#ifdef _WIN32
+   if (screen->info.have_KHR_external_memory_win32)
+      pscreen->interop_export_object = zink_interop_export_object;
+#endif
    if (screen->info.have_EXT_external_memory_host) {
       pscreen->resource_from_user_memory = zink_resource_from_user_memory;
    }

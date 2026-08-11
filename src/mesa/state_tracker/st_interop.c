@@ -310,6 +310,7 @@ st_interop_export_object(struct st_context *st,
    out->out_driver_data_written = 0;
    if (screen->interop_export_object) {
       out->out_driver_data_written = screen->interop_export_object(screen,
+                                                                   st->pipe,
                                                                    res,
                                                                    in->out_driver_data_size,
                                                                    in->out_driver_data,

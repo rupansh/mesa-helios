@@ -1184,9 +1184,14 @@ d3d12_interop_query_device_info(struct pipe_screen *pscreen, uint32_t data_size,
 }
 
 static uint32_t
-d3d12_interop_export_object(struct pipe_screen *pscreen, struct pipe_resource *res,
-                              uint32_t data_size, void *data, bool *need_export_dmabuf)
+d3d12_interop_export_object(struct pipe_screen *pscreen,
+                            struct pipe_context *pctx,
+                            struct pipe_resource *res,
+                            uint32_t data_size,
+                            void *data,
+                            bool *need_export_dmabuf)
 {
+   (void) pctx;
    if (data_size < sizeof(d3d12_interop_resource_info) || !data)
       return 0;
    d3d12_interop_resource_info *info = (d3d12_interop_resource_info *)data;
