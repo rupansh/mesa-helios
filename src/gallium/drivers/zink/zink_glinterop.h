@@ -13,7 +13,7 @@
  * can validate it before interpreting Vulkan values.
  */
 #define ZINK_GLINTEROP_EXPORT_INFO_MAGIC 0x314c475aU /* "ZGL1" */
-#define ZINK_GLINTEROP_EXPORT_INFO_VERSION 1
+#define ZINK_GLINTEROP_EXPORT_INFO_VERSION 2
 
 enum zink_glinterop_object_type {
    ZINK_GLINTEROP_OBJECT_IMAGE = 1,
@@ -41,7 +41,7 @@ struct zink_glinterop_export_info {
    uint32_t sharing_mode;
    uint32_t layout;
    uint32_t released_queue_family;
-   uint32_t reserved;
+   uint32_t memory_type_index;
 
    uint64_t allocation_size;
    uint64_t memory_offset;

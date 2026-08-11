@@ -2149,6 +2149,7 @@ zink_interop_export_object(struct pipe_screen *pscreen,
    info->usage = res->obj->vkusage;
    info->sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
    info->released_queue_family = res->queue;
+   info->memory_type_index = res->obj->bo->base.placement;
    info->allocation_size = res->obj->size;
    info->memory_offset = res->obj->offset;
 
