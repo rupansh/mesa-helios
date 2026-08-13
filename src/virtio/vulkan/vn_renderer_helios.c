@@ -1283,6 +1283,7 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
          ? ep->ExceptionRecord->ExceptionInformation[1]
          : 0;
    CONTEXT *c = ep->ContextRecord;
+#if defined(__x86_64__) || defined(_M_X64)
    fprintf(f,
            "%lld pid=%lu av code=0x%08lx ip=0x%llx fault=0x%llx "
            "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
@@ -1294,6 +1295,25 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
            (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
            (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
            (unsigned long long)c->R8, (unsigned long long)c->R9);
+#elif defined(__i386__) || defined(_M_IX86)
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=0x%08lx fault=0x%llx "
+           "eax=0x%08lx ebx=0x%08lx ecx=0x%08lx edx=0x%08lx "
+           "esi=0x%08lx edi=0x%08lx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           (unsigned long)c->Eip, (unsigned long long)fault,
+           (unsigned long)c->Eax, (unsigned long)c->Ebx,
+           (unsigned long)c->Ecx, (unsigned long)c->Edx,
+           (unsigned long)c->Esi, (unsigned long)c->Edi);
+#else
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=%p fault=0x%llx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress,
+           (unsigned long long)fault);
+#endif
    fclose(f);
    return EXCEPTION_CONTINUE_SEARCH;
 }
