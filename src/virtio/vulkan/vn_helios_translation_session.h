@@ -39,7 +39,7 @@ struct helios_translation_session;
 
 /*
  * Build the session: open the adapter, create the raw KMT device, create the one
- * HVC1 control context, create + make resident + Lock2-map the 64 MiB role-1
+ * HVC1 control context, create + make resident + Lock2-map the 4 MiB role-1
  * reply pool, then run the finite INIT and capture what it returns.
  *
  * `requested_endpoint_capacity` is 1..=HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION; the

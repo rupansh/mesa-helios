@@ -105,6 +105,7 @@ struct helios_translation_session {
    struct helios_native_context *control;
 
    /* Role-1 reply pool: one allocation, resident, Lock2-mapped for life. */
+   D3DKMT_HANDLE pool_resource;
    D3DKMT_HANDLE pool;
    void *pool_cpu;
    uint64_t pool_generation; /* HVM1 object_generation the KMD returned */
@@ -365,7 +366,7 @@ helios_transact(struct helios_translation_session *s, const void *payload,
       goto reply_refused;
    }
    /* No overflow: chunk_offset was just proved equal to an offset this side
-    * accumulated (<= 64 MiB) and chunk_bytes is <= 15 MiB. */
+    * accumulated (<= 64 MiB) and chunk_bytes fits one reply slot. */
    const uint64_t chunk_end = r.chunk_offset + (uint64_t)r.chunk_bytes;
    if (chunk_end > r.total_bytes) {
       snprintf(why, sizeof(why), "chunk overruns the snapshot");
@@ -497,14 +498,13 @@ helios_session_teardown(struct helios_translation_session *s)
       HELIOS_IGNORE_STATUS(D3DKMTUnlock2(&u));
       s->pool_cpu = NULL;
    }
-   if (s->pool) {
+   if (s->pool_resource) {
       D3DKMT_DESTROYALLOCATION2 d;
       memset(&d, 0, sizeof(d));
       d.hDevice = s->device;
-      d.hResource = 0;
-      d.phAllocationList = &s->pool;
-      d.AllocationCount = 1;
+      d.hResource = s->pool_resource;
       HELIOS_IGNORE_STATUS(D3DKMTDestroyAllocation2(&d));
+      s->pool_resource = 0;
       s->pool = 0;
    }
    if (s->paging_queue) {
@@ -596,7 +596,7 @@ helios_translation_session_create(LUID adapter_luid,
       }
    }
 
-   /* The role-1 reply pool. pSystemMem=NULL: the KMD owns the backing. */
+   /* The role-1 reply pool. Dxgkrnl owns the shared backing store. */
    HeliosVenusMemoryAllocationV1 hvm1;
    memset(&hvm1, 0, sizeof(hvm1));
    hvm1.magic = HELIOS_HVM1_MAGIC;
@@ -620,18 +620,25 @@ helios_translation_session_create(LUID adapter_luid,
    ca2.hDevice = s->device;
    ca2.NumAllocations = 1;
    ca2.pAllocationInfo2 = &info;
+   ca2.Flags.CreateResource = 1;
+   ca2.Flags.CreateShared = 1;
+   ca2.Flags.NtSecuritySharing = 1;
    st = D3DKMTCreateAllocation2(&ca2);
    if (st != 0) {
       helios_session_refuse(HELIOS_SESSION_REFUSE_POOL_CREATE,
                             "CreateAllocation2(role-1 reply pool)", (unsigned)st);
       goto fail;
    }
+   s->pool_resource = ca2.hResource;
    s->pool = info.hAllocation;
+   if (!s->pool_resource || !s->pool) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_POOL_CREATE,
+                            "reply pool returned incomplete resource state", 0);
+      goto fail;
+   }
 
-   /* CreateAllocation copies the per-allocation private data back, and the
-    * generation it returns is what every use record naming this pool must
-    * carry: a zero one is `Hnr2TableReject::AllocationGenerationZero` and would
-    * be refused on the wire, so refuse here where the reason is visible. */
+   /* The OpenAllocation leg of CreateAllocation returns the canonical
+    * generation. Every use record naming this pool must carry it. */
    s->pool_generation = hvm1.object_generation;
    if (!s->pool_generation) {
       helios_session_refuse(HELIOS_SESSION_REFUSE_POOL_CREATE,
