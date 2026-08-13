@@ -790,6 +790,7 @@ struct pipe_screen {
     * \return how much data was written
     */
    uint32_t (*interop_export_object)(struct pipe_screen *screen,
+                                     struct pipe_context *context,
                                      struct pipe_resource *res,
                                      uint32_t in_data_size,
                                      void *data,

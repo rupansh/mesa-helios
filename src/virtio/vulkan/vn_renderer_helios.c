@@ -139,7 +139,8 @@ struct helios_unicode_string {
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
 #define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
 #define HELIOS_WDDM_IDENTITY_MAGIC      0x4849444Eu /* 'HIDN' */
-#define HELIOS_WDDM_IDENTITY_VERSION    1u
+#define HELIOS_WDDM_IDENTITY_VERSION_LEGACY 1u
+#define HELIOS_WDDM_IDENTITY_VERSION    2u
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
 
 #ifndef OBJ_INHERIT
@@ -1282,6 +1283,7 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
          ? ep->ExceptionRecord->ExceptionInformation[1]
          : 0;
    CONTEXT *c = ep->ContextRecord;
+#if defined(__x86_64__) || defined(_M_X64)
    fprintf(f,
            "%lld pid=%lu av code=0x%08lx ip=0x%llx fault=0x%llx "
            "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
@@ -1293,6 +1295,25 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
            (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
            (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
            (unsigned long long)c->R8, (unsigned long long)c->R9);
+#elif defined(__i386__) || defined(_M_IX86)
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=0x%08lx fault=0x%llx "
+           "eax=0x%08lx ebx=0x%08lx ecx=0x%08lx edx=0x%08lx "
+           "esi=0x%08lx edi=0x%08lx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           (unsigned long)c->Eip, (unsigned long long)fault,
+           (unsigned long)c->Eax, (unsigned long)c->Ebx,
+           (unsigned long)c->Ecx, (unsigned long)c->Edx,
+           (unsigned long)c->Esi, (unsigned long)c->Edi);
+#else
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=%p fault=0x%llx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress,
+           (unsigned long long)fault);
+#endif
    fclose(f);
    return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -3396,7 +3417,8 @@ vn_renderer_helios_external_memory_open(
 
    const bool identity_valid =
       identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
-      identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
+      (identity.version == HELIOS_WDDM_IDENTITY_VERSION_LEGACY ||
+       identity.version == HELIOS_WDDM_IDENTITY_VERSION) &&
       identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
       identity.resource_id != 0 && identity.blob_size >= allocation_size &&
       identity.venus_alloc_size == allocation_size &&
@@ -3425,13 +3447,17 @@ vn_renderer_helios_external_memory_open(
    mtx_unlock(&helios->dev_mutex);
 
    if (!external) {
-      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u size=%llu/%llu type=%u/%u",
+      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u kind=%u/%u blob=%llu/%llu size=%llu/%llu type=%u/%u valid=%u",
                   (unsigned)st, (unsigned)open.hResource,
                   (unsigned)allocation_info.hAllocation, identity.magic,
                   identity.version, identity.resource_id,
+                  identity.kind, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+                  (unsigned long long)identity.blob_size,
+                  (unsigned long long)allocation_size,
                   (unsigned long long)identity.venus_alloc_size,
                   (unsigned long long)allocation_size,
-                  identity.memory_type_index, memory_type_index);
+                  identity.memory_type_index, memory_type_index,
+                  identity_valid);
       return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
                                       : VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
