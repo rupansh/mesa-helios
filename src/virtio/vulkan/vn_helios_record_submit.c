@@ -19,9 +19,11 @@
 #include "vn_cs.h"
 #include "vn_device.h"
 #include "vn_device_memory.h"
+#include "vn_helios_direct_dispatch.h"
 #include "vn_helios_native_kmt.h"
 #include "vn_image.h"
 #include "vn_instance.h"
+#include "vn_physical_device.h"
 #include "vn_queue.h"
 #include "vn_renderer.h"
 
@@ -337,8 +339,20 @@ vn_helios_submit_queue_init(struct vn_device *dev,
    owner->live_queue_count++;
    mtx_unlock(&owner->lock);
 
-   if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
-      return VK_SUCCESS;
+   if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (queue_family >= dev->physical_device->queue_family_count) {
+         vn_helios_submit_queue_fini(queue);
+         return VK_ERROR_INITIALIZATION_FAILED;
+      }
+      const VkQueueFlags queue_flags =
+         dev->physical_device->queue_family_properties[queue_family]
+            .queueFamilyProperties.queueFlags;
+      VkResult result = vn_helios_direct_register_queue(
+         dev->instance, queue, queue_family, queue_index, queue_flags);
+      if (result != VK_SUCCESS)
+         vn_helios_submit_queue_fini(queue);
+      return result;
+   }
 
    if (shared_queue) {
       if (!shared_queue->helios_native_context) {
@@ -377,6 +391,9 @@ vn_helios_submit_queue_fini(struct vn_queue *queue)
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
    struct vn_helios_submit_instance *owner =
       dev ? helios_submit_owner(dev->instance) : NULL;
+
+   if (dev)
+      vn_helios_direct_unregister_queue(dev->instance, queue);
 
    if (queue->helios_native_context_owner && queue->helios_native_context)
       helios_native_context_destroy(queue->helios_native_context);
@@ -456,15 +473,25 @@ vn_helios_record_context_create(struct vn_instance *instance,
 }
 
 HeliosTranslatorStatusCode
-vn_helios_record_context_destroy(struct vn_helios_record_context *context)
+vn_helios_record_context_can_destroy(
+   struct vn_helios_record_context *context)
 {
    if (!context)
       return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
    mtx_lock(&context->lock);
    const bool live = context->active_scope != NULL;
    mtx_unlock(&context->lock);
-   if (live)
-      return HELIOS_TRANSLATOR_STATUS_SCOPE_STILL_LIVE;
+   return live ? HELIOS_TRANSLATOR_STATUS_SCOPE_STILL_LIVE
+               : HELIOS_TRANSLATOR_STATUS_OK;
+}
+
+HeliosTranslatorStatusCode
+vn_helios_record_context_destroy(struct vn_helios_record_context *context)
+{
+   const HeliosTranslatorStatusCode checked =
+      vn_helios_record_context_can_destroy(context);
+   if (checked != HELIOS_TRANSLATOR_STATUS_OK)
+      return checked;
    if (context->lock_live)
       mtx_destroy(&context->lock);
    free(context);
@@ -716,6 +743,48 @@ vn_helios_record_scope_close(HeliosTranslatorScope opaque,
    free(scope->payload);
    free(scope);
    return HELIOS_TRANSLATOR_STATUS_OK;
+}
+
+bool
+vn_helios_record_scope_identity(HeliosTranslatorScope opaque,
+                                struct vn_instance **out_instance,
+                                uint64_t *out_context_generation)
+{
+   struct HeliosTranslatorScope_T *scope = opaque;
+   if (!scope || !scope->context || !scope->context->owner ||
+       !out_instance || !out_context_generation)
+      return false;
+   *out_instance = scope->context->owner->instance;
+   *out_context_generation = scope->context->context_generation;
+   return *out_instance != NULL && *out_context_generation != 0;
+}
+
+void
+vn_helios_record_note_loader_provenance(struct vn_instance *instance)
+{
+   helios_record_refuse(helios_submit_owner(instance),
+                        HELIOS_RECORD_REFUSE_LOADER_PROVENANCE);
+}
+
+void
+vn_helios_record_note_foreign_handle(struct vn_instance *instance)
+{
+   helios_record_refuse(helios_submit_owner(instance),
+                        HELIOS_RECORD_REFUSE_FOREIGN_HANDLE);
+}
+
+void
+vn_helios_record_note_withheld_proc(struct vn_instance *instance)
+{
+   helios_record_refuse(helios_submit_owner(instance),
+                        HELIOS_RECORD_REFUSE_WITHHELD_PROC);
+}
+
+void
+vn_helios_record_note_reentrant_join(struct vn_instance *instance)
+{
+   helios_record_refuse(helios_submit_owner(instance),
+                        HELIOS_RECORD_REFUSE_REENTRANT_JOIN);
 }
 
 void

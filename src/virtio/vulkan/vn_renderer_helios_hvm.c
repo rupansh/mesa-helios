@@ -203,6 +203,42 @@ helios_find_adapter(struct helios *helios)
    return VK_SUCCESS;
 }
 
+/* A5 direct instances do not discover an adapter.  Open exactly the supplied
+ * LUID once to prove that it is available and to collect diagnostic PCI
+ * address data, then let the HTS1 session open that same LUID for ownership. */
+static VkResult
+helios_select_direct_adapter(struct helios *helios,
+                             uint32_t luid_low,
+                             int32_t luid_high)
+{
+   LUID luid = {
+      .LowPart = luid_low,
+      .HighPart = luid_high,
+   };
+   if (luid.LowPart == 0 && luid.HighPart == 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   D3DKMT_OPENADAPTERFROMLUID open = { .AdapterLuid = luid };
+   if (D3DKMTOpenAdapterFromLuid(&open) != 0 || !open.hAdapter)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   helios->adapter_luid = luid;
+   D3DKMT_ADAPTERADDRESS address;
+   memset(&address, 0, sizeof(address));
+   D3DKMT_QUERYADAPTERINFO query;
+   memset(&query, 0, sizeof(query));
+   query.hAdapter = open.hAdapter;
+   query.Type = KMTQAITYPE_ADAPTERADDRESS_RENDER;
+   query.pPrivateDriverData = &address;
+   query.PrivateDriverDataSize = sizeof(address);
+   if (D3DKMTQueryAdapterInfo(&query) == 0) {
+      helios->adapter_address = address;
+      helios->has_adapter_address = true;
+   }
+   helios_close_enum_adapter(open.hAdapter);
+   return VK_SUCCESS;
+}
+
 static VkResult
 helios_wait_paging(struct helios *helios, uint64_t value)
 {
@@ -1073,6 +1109,46 @@ vn_renderer_helios_device_handle(const struct vn_renderer *renderer)
              : 0;
 }
 
+VkResult
+vn_renderer_helios_build_queue_attach(
+   const struct vn_renderer *renderer,
+   const HeliosTranslationEndpointV1 *endpoint,
+   const HeliosQueueAttachRequestV1 *request,
+   HeliosQueueAttachV1 *out_hqa1)
+{
+   if (!renderer || !endpoint || !request || !out_hqa1)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   const struct helios *helios = helios_from_renderer_const(renderer);
+   if (!helios->session)
+      return VK_ERROR_DEVICE_LOST;
+
+   uint64_t capability_low = 0;
+   uint64_t capability_high = 0;
+   helios_session_capability(helios->session, &capability_low,
+                             &capability_high);
+   const uint64_t session_generation =
+      helios_session_generation(helios->session);
+   if ((!capability_low && !capability_high) || !session_generation)
+      return VK_ERROR_DEVICE_LOST;
+
+   *out_hqa1 = (HeliosQueueAttachV1){
+      .magic = HELIOS_HQA1_MAGIC,
+      .abi_version = HELIOS_HQA1_ABI_VERSION,
+      .struct_size = HELIOS_HQA1_SIZE,
+      .package_generation = HELIOS_PACKAGE_GENERATION,
+      .session_generation = session_generation,
+      .capability_low = capability_low,
+      .capability_high = capability_high,
+      .endpoint_id = endpoint->endpoint_id,
+      .engine_class = endpoint->engine_class,
+      .queue_family = endpoint->queue_family,
+      .queue_index = endpoint->queue_index,
+      .context_generation = request->context_generation,
+      .flags = request->context_flags,
+   };
+   return VK_SUCCESS;
+}
+
 static VkResult
 helios_refuse_generic_submit(struct vn_renderer *renderer,
                              const struct vn_renderer_submit *submit)
@@ -1182,10 +1258,24 @@ vn_renderer_create_helios(struct vn_instance *instance,
    InitializeCriticalSection(&helios->bootstrap_lock);
    helios->bootstrap_lock_live = true;
 
-   VkResult result = helios_find_adapter(helios);
+   const bool direct = instance->helios_direct_requested;
+   const uint32_t endpoint_capacity =
+      direct ? instance->helios_direct_endpoint_capacity
+             : HELIOS_SESSION_ENDPOINTS;
+   if (direct)
+      instance->helios_direct_create_status =
+         HELIOS_TRANSLATOR_STATUS_ADAPTER_UNAVAILABLE;
+   VkResult result =
+      direct ? helios_select_direct_adapter(
+                  helios, instance->helios_direct_adapter_luid_low,
+                  instance->helios_direct_adapter_luid_high)
+             : helios_find_adapter(helios);
+   if (result == VK_SUCCESS && direct)
+      instance->helios_direct_create_status =
+         HELIOS_TRANSLATOR_STATUS_SESSION_INIT;
    if (result == VK_SUCCESS)
       result = helios_translation_session_create(
-         helios->adapter_luid, HELIOS_SESSION_ENDPOINTS, &helios->session);
+         helios->adapter_luid, endpoint_capacity, &helios->session);
    if (result == VK_SUCCESS) {
       helios->device = helios_session_device_handle(helios->session);
       result = helios_native_context_create(helios->device,
@@ -1206,9 +1296,15 @@ vn_renderer_create_helios(struct vn_instance *instance,
       }
    }
    if (result != VK_SUCCESS) {
+      if (direct && result == VK_ERROR_OUT_OF_HOST_MEMORY)
+         instance->helios_direct_create_status =
+            HELIOS_TRANSLATOR_STATUS_SESSION_CAPACITY;
       helios_destroy(&helios->base, alloc);
       return result;
    }
+
+   if (direct)
+      instance->helios_direct_create_status = HELIOS_TRANSLATOR_STATUS_OK;
 
    helios_renderer_info_init(helios);
    helios->base.ops.destroy = helios_destroy;

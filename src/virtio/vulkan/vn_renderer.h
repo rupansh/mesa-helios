@@ -294,6 +294,7 @@ vn_renderer_create_vtest(struct vn_instance *instance,
  * returns. Declared once, in protocol/, and reached through this ICD's HWA2
  * parse/validate layer. */
 #include "vn_helios_hwa2.h"
+#include "helios_translator_dispatch.h"
 
 /* Escape-free per-instance HVM1 backend — the only backend on Windows. */
 VkResult
@@ -346,6 +347,17 @@ uint32_t
 vn_renderer_helios_endpoint_capacity(const struct vn_renderer *renderer);
 uint32_t
 vn_renderer_helios_device_handle(const struct vn_renderer *renderer);
+
+/* A5's sole capability crossing: fill the complete HQA1 packet inside the
+ * renderer that directly owns the HTS1 session.  The capability is never
+ * returned bare and is never retained by the caller outside this sealed
+ * record. */
+VkResult
+vn_renderer_helios_build_queue_attach(
+   const struct vn_renderer *renderer,
+   const HeliosTranslationEndpointV1 *endpoint,
+   const HeliosQueueAttachRequestV1 *request,
+   HeliosQueueAttachV1 *out_hqa1);
 
 /* ⛔ `vn_renderer_helios_vidmm_alloc` / `_open_shared` / `_free` are DELETED.
  * They created and shared a content-free "tracking" WDDM allocation whose only

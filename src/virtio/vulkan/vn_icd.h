@@ -13,6 +13,10 @@
 
 #include "vn_common.h"
 
+#if defined(_WIN32)
+#include "vn_helios_direct_dispatch.h"
+#endif
+
 PUBLIC
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *pSupportedVersion);

@@ -66,6 +66,19 @@ struct vn_instance {
    bool engine_is_zink;
 
 #if defined(_WIN32)
+   /* A5 direct creation passes the adapter and requested HTS1 capacity through
+    * the object being constructed.  These are construction facts, never a
+    * process-global selector or a post-create lookup key. */
+   bool helios_direct_requested;
+   uint32_t helios_direct_adapter_luid_low;
+   int32_t helios_direct_adapter_luid_high;
+   uint32_t helios_direct_endpoint_capacity;
+   int32_t helios_direct_create_status;
+
+   /* Non-forgeable A5 ownership tag.  Only the private direct constructor
+    * installs it, and every down-call cross-checks it against this instance. */
+   struct HeliosTranslatorInstance_T *helios_direct;
+
    /* A4 owns the submission mode and thread-current outer-scope key here.
     * It is a direct child of this instance, never process-global state. */
    struct vn_helios_submit_instance *helios_submit;
@@ -152,5 +165,17 @@ vn_instance_release_ring_idx(struct vn_instance *instance, uint32_t ring_idx)
    mtx_unlock(&instance->ring_idx_mutex);
 #endif
 }
+
+#if defined(_WIN32)
+/* A5's loader-free constructor.  The exact adapter/capacity travel only on
+ * this stack into the instance being allocated; ordinary loader creation
+ * continues through vn_CreateInstance with no hidden selector. */
+VkResult
+vn_helios_create_direct_instance(uint32_t adapter_luid_low,
+                                 int32_t adapter_luid_high,
+                                 uint32_t endpoint_capacity,
+                                 VkInstance *out_instance,
+                                 int32_t *out_status);
+#endif
 
 #endif /* VN_INSTANCE_H */

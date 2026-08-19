@@ -291,10 +291,15 @@ vn_EnumerateInstanceLayerProperties(uint32_t *pPropertyCount,
    return VK_SUCCESS;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
-                  const VkAllocationCallbacks *pAllocator,
-                  VkInstance *pInstance)
+static VkResult
+vn_create_instance_internal(const VkInstanceCreateInfo *pCreateInfo,
+                            const VkAllocationCallbacks *pAllocator,
+                            VkInstance *pInstance,
+                            bool helios_direct,
+                            uint32_t adapter_luid_low,
+                            int32_t adapter_luid_high,
+                            uint32_t endpoint_capacity,
+                            int32_t *out_direct_status)
 {
    const VkAllocationCallbacks *alloc =
       pAllocator ? pAllocator : vk_default_allocator();
@@ -305,8 +310,28 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    instance = vk_zalloc(alloc, sizeof(*instance), VN_DEFAULT_ALIGN,
                         VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
-   if (!instance)
+   if (!instance) {
+#if defined(_WIN32)
+      if (out_direct_status)
+         *out_direct_status = HELIOS_TRANSLATOR_STATUS_SESSION_CAPACITY;
+#else
+      (void)out_direct_status;
+#endif
       return vn_error(NULL, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+#if defined(_WIN32)
+   instance->helios_direct_requested = helios_direct;
+   instance->helios_direct_adapter_luid_low = adapter_luid_low;
+   instance->helios_direct_adapter_luid_high = adapter_luid_high;
+   instance->helios_direct_endpoint_capacity = endpoint_capacity;
+   instance->helios_direct_create_status = HELIOS_TRANSLATOR_STATUS_SESSION_INIT;
+#else
+   (void)helios_direct;
+   (void)adapter_luid_low;
+   (void)adapter_luid_high;
+   (void)endpoint_capacity;
+#endif
 
    struct vk_instance_dispatch_table dispatch_table;
    vk_instance_dispatch_table_from_entrypoints(
@@ -348,7 +373,7 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    }
 
    result = vn_instance_init_renderer(instance);
-   if (result == VK_ERROR_INITIALIZATION_FAILED) {
+   if (result == VK_ERROR_INITIALIZATION_FAILED && !helios_direct) {
       assert(!instance->renderer);
       *pInstance = instance_handle;
       return VK_SUCCESS;
@@ -367,6 +392,16 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (result != VK_SUCCESS) {
       vn_renderer_destroy(instance->renderer, alloc);
       goto out_mtx_destroy;
+   }
+   if (helios_direct) {
+      result = vn_helios_submit_instance_set_record_only(instance);
+      if (result != VK_SUCCESS) {
+         instance->helios_direct_create_status =
+            HELIOS_TRANSLATOR_STATUS_SUBMISSION_MODE;
+         vn_helios_submit_instance_fini(instance);
+         vn_renderer_destroy(instance->renderer, alloc);
+         goto out_mtx_destroy;
+      }
    }
 #endif
 
@@ -449,6 +484,11 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    *pInstance = instance_handle;
 
+#if defined(_WIN32)
+   if (out_direct_status)
+      *out_direct_status = HELIOS_TRANSLATOR_STATUS_OK;
+#endif
+
    return VK_SUCCESS;
 
 out_ring_fini:
@@ -464,6 +504,10 @@ out_shmem_pool_fini:
    vn_renderer_destroy(instance->renderer, alloc);
 
 out_mtx_destroy:
+#if defined(_WIN32)
+   if (out_direct_status)
+      *out_direct_status = instance->helios_direct_create_status;
+#endif
    mtx_destroy(&instance->physical_device.mutex);
    mtx_destroy(&instance->ring_idx_mutex);
 
@@ -472,6 +516,45 @@ out_mtx_destroy:
 
    return vn_error(NULL, result);
 }
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                  const VkAllocationCallbacks *pAllocator,
+                  VkInstance *pInstance)
+{
+   return vn_create_instance_internal(pCreateInfo, pAllocator, pInstance,
+                                      false, 0, 0, 0, NULL);
+}
+
+#if defined(_WIN32)
+VkResult
+vn_helios_create_direct_instance(uint32_t adapter_luid_low,
+                                 int32_t adapter_luid_high,
+                                 uint32_t endpoint_capacity,
+                                 VkInstance *out_instance,
+                                 int32_t *out_status)
+{
+   const VkApplicationInfo app = {
+      .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+      .pApplicationName = "Helios direct translator",
+      .applicationVersion = HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+      .pEngineName = "Helios direct translator",
+      .engineVersion = HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+      .apiVersion = VN_MAX_API_VERSION,
+   };
+   const VkInstanceCreateInfo create = {
+      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+      .pApplicationInfo = &app,
+   };
+   if (!out_instance || !out_status)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   *out_instance = VK_NULL_HANDLE;
+   *out_status = HELIOS_TRANSLATOR_STATUS_SESSION_INIT;
+   return vn_create_instance_internal(&create, NULL, out_instance, true,
+                                      adapter_luid_low, adapter_luid_high,
+                                      endpoint_capacity, out_status);
+}
+#endif
 
 VKAPI_ATTR void VKAPI_CALL
 vn_DestroyInstance(VkInstance _instance,

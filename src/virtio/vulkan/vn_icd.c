@@ -15,6 +15,13 @@
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
 {
+#if defined(_WIN32)
+   /* The A5 entry point is resolved on the already-held ICD module.  Vending
+    * it through the Vulkan loader would turn the loader into a second route
+    * and defeat the module-provenance boundary. */
+   if (pName && !strcmp(pName, HELIOS_ICD_CREATE_TRANSLATOR_V1_NAME))
+      return NULL;
+#endif
    return vn_GetInstanceProcAddr(instance, pName);
 }
 

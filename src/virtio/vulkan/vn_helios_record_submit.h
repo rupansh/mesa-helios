@@ -90,6 +90,9 @@ vn_helios_record_context_create(struct vn_instance *instance,
 HeliosTranslatorStatusCode
 vn_helios_record_context_destroy(struct vn_helios_record_context *context);
 HeliosTranslatorStatusCode
+vn_helios_record_context_can_destroy(
+   struct vn_helios_record_context *context);
+HeliosTranslatorStatusCode
 vn_helios_record_scope_open(struct vn_helios_record_context *context,
                             HeliosTranslatorScope *out_scope);
 HeliosTranslatorStatusCode
@@ -101,10 +104,22 @@ vn_helios_record_scope_copy(HeliosTranslatorScope scope,
 HeliosTranslatorStatusCode
 vn_helios_record_scope_close(HeliosTranslatorScope scope,
                              const HeliosOuterScopeCloseV1 *close);
+bool
+vn_helios_record_scope_identity(HeliosTranslatorScope scope,
+                                struct vn_instance **out_instance,
+                                uint64_t *out_context_generation);
 void
 vn_helios_record_query_refusals(
    const struct vn_instance *instance,
    HeliosTranslatorRefusalCountersV1 *out_counters);
+void
+vn_helios_record_note_loader_provenance(struct vn_instance *instance);
+void
+vn_helios_record_note_foreign_handle(struct vn_instance *instance);
+void
+vn_helios_record_note_withheld_proc(struct vn_instance *instance);
+void
+vn_helios_record_note_reentrant_join(struct vn_instance *instance);
 
 #endif /* _WIN32 */
 #endif /* VN_HELIOS_RECORD_SUBMIT_H */

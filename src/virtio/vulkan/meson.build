@@ -138,6 +138,10 @@ if with_platform_windows
   # synchronously seal bounded Venus payloads; normal mode submits the same
   # generated queue opcode subset through the queue's nonzero HVC1 context.
   libvn_files += files('vn_helios_record_submit.c')
+  # A5: the sole versioned private export.  It owns the record-only instance
+  # tag, exact endpoint/context graph, procedure provenance checks, and HQA1
+  # descriptor construction; it adds no second transport.
+  libvn_files += files('vn_helios_direct_dispatch.c')
   vn_deps += cc.find_library('gdi32')
   # Current mingw-w64's gdi32 import library predates the WDDM 3.1 thunk even
   # though the stock target gdi32.dll exports it.  Generate a one-symbol import
@@ -226,7 +230,8 @@ libvulkan_virtio = shared_library(
   link_depends : vulkan_icd_link_depends,
   # Export the 3 vk_icd* loader entrypoints on Windows (gnu_symbol_visibility
   # 'hidden' otherwise hides vk_icdGetInstanceProcAddr). Ignored on ELF.
-  vs_module_defs : vulkan_api_def,
+  vs_module_defs : with_platform_windows ?
+    files('vn_helios_exports.def')[0] : vulkan_api_def,
   gnu_symbol_visibility : 'hidden',
   # On Windows libname_prefix='' so the manifest expects vulkan_virtio.dll; mingw
   # would otherwise produce libvulkan_virtio.dll. '' on Windows, default elsewhere.
