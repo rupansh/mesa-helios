@@ -883,8 +883,12 @@ vn_GetMemoryWin32HandlePropertiesKHR(
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
+   const bool exact_image =
+      payload_desc.allocation_kind == HELIOS_HWA2_KIND_IMAGE;
    vn_renderer_bo_unref(dev->renderer, bo);
    vn_renderer_helios_external_memory_destroy(dev->renderer, external);
+   if (!exact_image)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    pMemoryWin32HandleProperties->memoryTypeBits =
       UINT32_C(1) << VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL;
