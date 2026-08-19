@@ -27,9 +27,11 @@ if with_platform_wayland
 endif
 
 if with_platform_windows
-  files_vulkan_wsi += files('wsi_common_win32.cpp')
+  # The old in-ICD D3D11/DXGI/DComp vehicle is not a compatibility path for
+  # the later present layer.  Keep the common WSI symbols fail-closed without
+  # loading graphics runtimes from vulkan_virtio.dll.
+  files_vulkan_wsi += files('wsi_common_win32_failclosed.c')
   files_vulkan_wsi += files('wsi_helios_present_sync.c')
-  platform_deps += dep_dxheaders
 else
   files_vulkan_wsi += files('wsi_common_headless.c')
 endif

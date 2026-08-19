@@ -96,6 +96,19 @@ static const driOptionDescription vn_dri_options[] = {
 static VkResult
 vn_instance_init_renderer_versions(struct vn_instance *instance)
 {
+#if defined(_WIN32)
+   /* K11 created this session's sole host VkInstance before renderer creation
+    * returned.  A7 will populate generic discovery; A3 must not issue a second
+    * instance command merely to rediscover the pinned protocol ceiling. */
+   uint32_t instance_version = instance->renderer->info.vk_xml_version;
+   if (instance_version < VN_MIN_RENDERER_VERSION)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   instance->renderer_api_version =
+      MAX2(instance->base.vk.app_info.api_version, VN_MIN_RENDERER_VERSION);
+   instance->renderer_version =
+      MIN2(instance_version, instance->renderer_api_version);
+   return VK_SUCCESS;
+#else
    uint32_t instance_version = 0;
    VkResult result = vn_call_vkEnumerateInstanceVersion(instance->ring.ring,
                                                         &instance_version);
@@ -133,6 +146,7 @@ vn_instance_init_renderer_versions(struct vn_instance *instance)
    instance->renderer_version = instance_version;
 
    return VK_SUCCESS;
+#endif
 }
 
 static inline void
@@ -331,10 +345,22 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (result != VK_SUCCESS)
       goto out_mtx_destroy;
 
+#if defined(_WIN32)
+   /* The K11 INIT owns exactly one host instance under this fixed private
+    * handle.  It is scoped by the directly owned renderer/session object, not
+    * by PID, TLS, a name, or any process-global lookup. */
+   vn_object_set_id(instance, 1, VK_OBJECT_TYPE_INSTANCE);
+   instance_handle = vn_instance_to_handle(instance);
+#endif
+
    vn_cs_renderer_protocol_info_init(instance);
 
    vn_renderer_shmem_pool_init(instance->renderer, &instance->cs_shmem_pool,
+#if defined(_WIN32)
+                               4u << 20);
+#else
                                8u << 20);
+#endif
 
    vn_renderer_shmem_pool_init(instance->renderer,
                                &instance->reply_shmem_pool, 1u << 20);
@@ -367,8 +393,13 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       local_create_info.pApplicationInfo = &local_app_info;
    }
 
+#if defined(_WIN32)
+   /* INIT already created the sole host VkInstance. */
+   result = VK_SUCCESS;
+#else
    result = vn_call_vkCreateInstance(instance->ring.ring, pCreateInfo, NULL,
                                      &instance_handle);
+#endif
    if (result != VK_SUCCESS)
       goto out_ring_fini;
 
@@ -445,11 +476,13 @@ vn_DestroyInstance(VkInstance _instance,
    mtx_destroy(&instance->ring_idx_mutex);
 
    if (instance->renderer) {
+#if !defined(_WIN32)
       struct vn_ring_submit_command ring_submit;
       vn_submit_vkDestroyInstance(instance->ring.ring, 0, _instance, NULL,
                                   &ring_submit);
       if (ring_submit.ring_seqno_valid)
          vn_ring_wait_seqno(instance->ring.ring, ring_submit.ring_seqno);
+#endif
 
       vn_instance_fini_ring(instance);
 

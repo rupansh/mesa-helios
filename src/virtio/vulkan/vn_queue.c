@@ -1732,16 +1732,6 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
                                     sem->external_payload.ring_seqno);
       batch.cs_data = local_data;
       batch.cs_size = vn_cs_encoder_get_len(&local_enc);
-
-      /* The signal batch already waits for THIS exact async queue-submit
-       * sequence and submits on its graphics ring.  Tag that existing batch
-       * only when a registered UMD stream has a representable monotonic
-       * value.  No sequence means no host ordering proof, so stay legacy. */
-      if (sem->helios_present_stream_cookie && value > 0 &&
-          value <= UINT32_MAX) {
-         batch.present_cookie = sem->helios_present_stream_cookie;
-         batch.present_value32 = (uint32_t)value;
-      }
    }
 
    const struct vn_renderer_submit submit = {
@@ -1753,48 +1743,6 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
    return VK_SUCCESS;
 #endif
 }
-
-#if DETECT_OS_WINDOWS
-/* Private UMD-facing ICD export.  This is deliberately not a Vulkan extension:
- * bridge_icd_exports resolves it by DLL export name so an older ICD simply
- * leaves the UMD correlation zero and preserves its old CPU gate. */
-__declspec(dllexport) bool
-helios_venus_register_present_stream(VkDevice device,
-                                     VkSemaphore semaphore,
-                                     uint64_t *out_cookie);
-
-__declspec(dllexport) bool
-helios_venus_register_present_stream(VkDevice device,
-                                     VkSemaphore semaphore,
-                                     uint64_t *out_cookie)
-{
-   if (out_cookie)
-      *out_cookie = 0;
-   if (!device || !semaphore || !out_cookie || VN_PERF(NO_ASYNC_QUEUE_SUBMIT))
-      return false;
-
-   struct vn_device *dev = vn_device_from_handle(device);
-   struct vn_semaphore *sem = vn_semaphore_from_handle(semaphore);
-   if (!dev || !sem || sem->helios_present_stream_cookie ||
-       sem->type != VK_SEMAPHORE_TYPE_TIMELINE || !sem->is_external ||
-       sem->external_handle_types !=
-          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
-       sem->payload != &sem->permanent || !sem->permanent.win32_sync)
-      return false;
-
-   uint64_t cookie = 0;
-   if (!vn_renderer_helios_present_stream_register(dev->renderer, &cookie) ||
-       !cookie)
-      return false;
-
-   /* This exact Vulkan semaphore owns this stream until DestroySemaphore.
-    * A second registration is refused above rather than guessing identity from
-    * process/queue/creation timing. */
-   sem->helios_present_stream_cookie = cookie;
-   *out_cookie = cookie;
-   return true;
-}
-#endif
 
 static VkResult
 vn_queue_submit(struct vn_queue_submission *submit)
@@ -3144,68 +3092,9 @@ vn_semaphore_init_payloads(struct vn_device *dev,
    sem->payload = &sem->permanent;
 
 #if DETECT_OS_WINDOWS
-   /* D3D12_FENCE_BIT joins the two opaque types: all three are backed by the
-    * same shareable WDDM monitored fence.
-    *
-    * ⚠ THREE CONDITIONS, NOT ONE. `d3d12_shared_fence_create` is the only caller
-    * that passes `shared = true` to vkd3d's `vkd3d_create_timeline_semaphore`,
-    * and that arm queries vkGetPhysicalDeviceExternalSemaphoreProperties for
-    * handleType = D3D12_FENCE_BIT with a TIMELINE VkSemaphoreTypeCreateInfo in
-    * pNext, then returns E_NOTIMPL ("D3D12-Fence shared timeline semaphores not
-    * supported by host") unless ALL THREE hold:
-    *   1. externalSemaphoreFeatures & EXPORTABLE_BIT
-    *   2. externalSemaphoreFeatures & IMPORTABLE_BIT
-    *   3. exportFromImportedHandleTypes & D3D12_FENCE_BIT
-    * (`vkd3d-proton-helios/libs/vkd3d/command.c`, in
-    * `vkd3d_create_timeline_semaphore` — cite the symbol, the line has moved.)
-    *
-    * This ICD satisfies all three, but only because of what it reports, not by
-    * accident: `vn_GetPhysicalDeviceExternalSemaphoreProperties`
-    * (vn_physical_device.c) selects the TIMELINE handle set for a TIMELINE
-    * query, and when the asked-for handleType is in that set it answers with
-    * compatibleHandleTypes = exportFromImportedHandleTypes = the whole set and
-    * features = EXPORTABLE | IMPORTABLE. The set itself is built by
-    * `vn_physical_device_init_external_semaphore_handles`, which puts
-    * D3D12_FENCE_BIT in the TIMELINE set on Windows (timeline only — a D3D12
-    * fence is a monotonic 64-bit value). Drop it there and condition 3 fails, so
-    * ID3D12Fence::CreateSharedHandle cannot work at all — independently of the
-    * WSI layer.
-    *
-    * ⚠ OPAQUE_WIN32_KMT_BIT is tested here but is deliberately NEVER advertised
-    * by `vn_physical_device_init_external_semaphore_handles` (dxgkrnl refuses a
-    * monitored fence with Shared=1 and no NtSecuritySharing). It stays in this
-    * predicate as a fail-safe superset: a caller that asks for it anyway still
-    * gets a SHAREABLE sync rather than a device-only one it would then fail to
-    * export. Do not read its presence here as an advertisement. */
-   if (sem->external_handle_types &
-       (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
-        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)) {
-      const VkExportSemaphoreWin32HandleInfoKHR *win32_export_info =
-         win32_export_info_pnext;
-      VkResult result = vn_renderer_sync_create(
-         dev->renderer, initial_val, VN_RENDERER_SYNC_SHAREABLE,
-         &sem->permanent.win32_sync);
-      if (result != VK_SUCCESS)
-         return result;
-
-      /* VkExportSemaphoreWin32HandleInfoKHR::name — publish the WDDM sync
-       * under a kernel object name so a consumer in another process/session
-       * can import it BY NAME (no handle duplication). Failure is loud and
-       * fatal for the create: a producer that thinks it exported a name
-       * nobody can open is worse than one that knows the export failed. */
-      if (win32_export_info && win32_export_info->name) {
-         result = vn_renderer_helios_sync_share_named(
-            dev->renderer, sem->permanent.win32_sync,
-            win32_export_info->name, win32_export_info->pAttributes);
-         if (result != VK_SUCCESS) {
-            vn_renderer_sync_destroy(dev->renderer,
-                                     sem->permanent.win32_sync);
-            sem->permanent.win32_sync = NULL;
-            return result;
-         }
-      }
-   }
+   (void)win32_export_info_pnext;
+   if (sem->external_handle_types)
+      return VK_ERROR_FEATURE_NOT_PRESENT; /* A6 owns export advertisement. */
 #endif
 
    return VK_SUCCESS;
@@ -3311,16 +3200,7 @@ vn_semaphore_feedback_init(struct vn_device *dev,
 
    if (sem->is_external) {
 #if DETECT_OS_WINDOWS
-      /* HELIOS feedback-shadow retire (WS2): EXPORTED timelines on this
-       * stack are self-signaled only (queue signal ops in the exporting
-       * process — the present fences; importers never signal), so the
-       * feedback slot is complete for them and gives the retire thread a
-       * sub-ms completion channel that bypasses the wire-fence response
-       * (measured 10-20 ms through QEMU's fence delivery). The wait/read
-       * paths keep their win32/WDDM-fold priority — the slot only ever
-       * ADDS an observer. HELIOS_RETIRE_FEEDBACK=0 restores the skip. */
-      if (!vn_renderer_helios_retire_feedback_enabled())
-         return VK_SUCCESS;
+      return VK_SUCCESS;
 #else
       return VK_SUCCESS;
 #endif
@@ -3503,16 +3383,6 @@ vn_CreateSemaphore(VkDevice device,
          goto out_payloads_fini;
    }
 
-#if DETECT_OS_WINDOWS
-   /* Feedback-shadow retire: hand the slot's GPU-written counter to the
-    * exported sync so the retire thread can observe completion through it
-    * (detached in vn_DestroySemaphore BEFORE the slot is pool-recycled). */
-   if (sem->feedback.slot && sem->permanent.win32_sync)
-      vn_renderer_helios_sync_set_feedback(dev->renderer,
-                                           sem->permanent.win32_sync,
-                                           sem->feedback.slot->counter);
-#endif
-
    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
    struct vn_semaphore_create_info local_info;
    const VkSemaphoreCreateInfo *host_create_info =
@@ -3570,28 +3440,7 @@ vn_DestroySemaphore(VkDevice device,
    if (!sem)
       return;
 
-#if DETECT_OS_WINDOWS
-   if (sem->helios_present_stream_cookie) {
-      /* Best effort before the semaphore's WDDM sync and renderer context can
-       * disappear.  The renderer also owns a teardown backstop for Vulkan
-       * device destruction with outstanding children. */
-      vn_renderer_helios_present_stream_unregister(
-         dev->renderer, sem->helios_present_stream_cookie);
-      sem->helios_present_stream_cookie = 0;
-   }
-#endif
-
    vn_async_vkDestroySemaphore(dev->primary_ring, device, semaphore, NULL);
-
-#if DETECT_OS_WINDOWS
-   /* Detach the feedback counter from the sync BEFORE the slot returns to
-    * the feedback pool — retire entries can outlive the semaphore (they
-    * hold sync refs) and must fall back to the wire fence rather than poll
-    * recycled slot memory. */
-   if (sem->feedback.slot && sem->permanent.win32_sync)
-      vn_renderer_helios_sync_set_feedback(dev->renderer,
-                                           sem->permanent.win32_sync, NULL);
-#endif
 
    if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
       vn_semaphore_feedback_fini(dev, sem);
@@ -3645,8 +3494,7 @@ vn_helios_sem_deadline_strikes(void)
    return strikes;
 }
 
-/* Defined in vn_renderer_helios.c: appends to the ProgramData Helios diag log
- * (dwm/WUDFHost stderr is invisible — the loss latch must never be silent). */
+/* Defined by the selected Windows renderer diagnostic sink. */
 void vn_renderer_helios_diag_log(const char *fmt, ...);
 
 static VkResult
@@ -4399,22 +4247,12 @@ vn_ImportSemaphoreWin32HandleKHR(
       vn_semaphore_from_handle(pImportSemaphoreWin32HandleInfo->semaphore);
    struct vn_sync_payload *temp = &sem->temporary;
    struct vn_renderer_sync *sync = NULL;
-   VkResult result;
-   if (!pImportSemaphoreWin32HandleInfo->handle &&
-       pImportSemaphoreWin32HandleInfo->name) {
-      /* Import BY NAME (exporter used VkExportSemaphoreWin32HandleInfoKHR::
-       * name) — the cross-process rendezvous that needs no handle
-       * duplication; NT handle types only. */
-      if (pImportSemaphoreWin32HandleInfo->handleType !=
-          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT)
-         return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-      result = vn_renderer_helios_sync_create_from_win32_name(
-         dev->renderer, pImportSemaphoreWin32HandleInfo->name, &sync);
-   } else {
-      result = vn_renderer_helios_sync_create_from_win32(
-         dev->renderer, pImportSemaphoreWin32HandleInfo->handleType,
-         pImportSemaphoreWin32HandleInfo->handle, &sync);
-   }
+   if (!pImportSemaphoreWin32HandleInfo->handle ||
+       pImportSemaphoreWin32HandleInfo->name)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   VkResult result = vn_renderer_helios_sync_create_from_win32(
+      dev->renderer, pImportSemaphoreWin32HandleInfo->handleType,
+      pImportSemaphoreWin32HandleInfo->handle, &sync);
 
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
@@ -4435,27 +4273,9 @@ vn_GetSemaphoreWin32HandleKHR(
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
-   struct vn_semaphore *sem =
-      vn_semaphore_from_handle(pGetWin32HandleInfo->semaphore);
-   struct vn_sync_payload *payload = sem->payload;
-   void *handle = NULL;
-
-   if (!payload->win32_sync) {
-      VkResult result =
-         vn_renderer_sync_create(dev->renderer, 0, VN_RENDERER_SYNC_SHAREABLE,
-                                 &payload->win32_sync);
-      if (result != VK_SUCCESS)
-         return vn_error(dev->instance, result);
-   }
-
-   VkResult result = vn_renderer_helios_sync_export_win32(
-      dev->renderer, payload->win32_sync, pGetWin32HandleInfo->handleType,
-      &handle);
-   if (result != VK_SUCCESS)
-      return vn_error(dev->instance, result);
-
-   *pHandle = (HANDLE)handle;
-   return VK_SUCCESS;
+   (void)pGetWin32HandleInfo;
+   *pHandle = NULL;
+   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 }
 #endif
 

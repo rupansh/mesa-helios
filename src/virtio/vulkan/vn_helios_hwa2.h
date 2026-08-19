@@ -9,7 +9,7 @@
  * is the mechanical C mirror of `protocol/src/wddm.rs`, and it is the ONLY
  * declaration this ICD uses. The standing project directive is that shared
  * private data has one declaration, in `protocol/`; the pre-retirement ICD
- * violated it by hand-copying four records into `vn_renderer_helios.c` with
+ * violated it by hand-copying four records into the retired renderer with
  * nothing but `sizeof` asserts, so a field REORDER inside the right number of
  * bytes passed every check in the tree (K4-CONTRACT §7 names that pair the
  * third cross-repo atomic pair, and lane-mesa A0 requires offset asserts rather
@@ -195,60 +195,7 @@ long helios_hwa2_reject_count(enum helios_hwa2_reject code);
 /* "size=3 magic=1" for every nonzero counter, or "none". For the perf dump. */
 void helios_hwa2_reject_summary(char *buf, size_t buf_bytes);
 
-/* ── The §10.3 identity gap: what HWA2 deliberately does not carry ────────────
- *
- * The retired 48-byte `HeliosWddmOpenIdentity` carried a host virtio/venus
- * `resource_id` at offset 24 and a Vulkan `memory_type_index` at offset 28.
- * NEITHER HAS AN HWA2 COUNTERPART AND NEITHER MAY BE ADDED — §10.3 via
- * `protocol/src/wddm.rs:355-361`: "No host resource token, resid, PID, process
- * handle, synchronization object, mutable value, or independently usable
- * identity. A host resid may live SOLELY inside the KMD allocation object; no
- * UMD, ICD, batch, or private descriptor can name or supply one."
- *
- * The replacement is not a field, it is a mechanism, and it is **mesa unit A3**:
- * the ICD stops naming host resources at all, names allocations by their index
- * in the `D3DDDI_ALLOCATIONLIST` plus HWA2's `allocation_generation` as the
- * anti-stale token, and the KMD patches the host resid into operand slots the
- * ICD wrote as zero (`HeliosNativeRenderPatch`). Until A3 lands, every path
- * that used to consume one of those two values refuses here — loudly, counted,
- * naming A3 — and never fabricates, substitutes or falls back.
- *
- * ⛔ An ICD in this state CANNOT import a Win32/D3D12 payload. That is the
- * retirement's intended intermediate state (K4-CONTRACT §5), not a regression
- * to be worked around.
- */
-enum helios_a3_gap_site {
-   /* vn_device_memory_import_win32: the payload validated, but there is no
-    * legal way to tell the host which object it is. */
-   HELIOS_A3_GAP_IMPORT_WIN32,
-   /* vn_GetMemoryWin32HandlePropertiesKHR: the payload no longer records a
-    * Vulkan memory type, and inventing one would be answering a question with
-    * a guess the subsequent import cannot honour. */
-   HELIOS_A3_GAP_HANDLE_PROPERTIES,
-   /* vn_renderer_helios_external_memory_create: the export used to hand the
-    * KMD `adopt_resource_id` so it would re-own this BO's venus resource.
-    * That is UMD-backing adoption, which K4 deletes outright. */
-   HELIOS_A3_GAP_EXPORT_ADOPTION,
-   /* The retired VidMm tracker exports, kept as symbols so an older bridge DLL
-    * still resolves them, and refusing so it can never believe an attestation
-    * that no longer exists (K4-CONTRACT §6: no successor). */
-   HELIOS_A3_GAP_VIDMM_TRACKER,
-   HELIOS_A3_GAP_SITE_COUNT,
-};
-
-/* Bump the site's counter and log it. The first refusal at a site logs the full
- * explanation; after that one line every 256 refusals, so a hot import loop
- * cannot turn the diag log into the failure. */
-void helios_a3_gap_refuse(enum helios_a3_gap_site site);
-long helios_a3_gap_refusals(enum helios_a3_gap_site site);
-const char *helios_a3_gap_site_name(enum helios_a3_gap_site site);
-/* "import_win32=12 handle_properties=1" for every nonzero site, or "none". */
-void helios_a3_gap_summary(char *buf, size_t buf_bytes);
-
-/* Implemented in vn_renderer_helios.c; declared here so this TU can reach the
- * one diag sink the whole ICD writes (C:\ProgramData\Helios\helios_icd_diag.log
- * — dwm and WUDFHost have no visible stderr, so a refusal that only reaches
- * stderr cannot be post-mortemed). */
+/* One process-local diagnostic sink shared by the HWA2/session/context paths. */
 void vn_renderer_helios_diag_log(const char *fmt, ...);
 
 #ifdef __cplusplus

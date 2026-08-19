@@ -118,12 +118,9 @@ if system_has_kms_drm
 endif
 
 if with_platform_windows
-  # Helios venus backend: the only vn_renderer backend on Windows. Gate 5a reaches
-  # the kmd_render WDDM adapter through the D3DKMT thunks (gdi32 exports:
-  # D3DKMTEnumAdapters2 / CreateDevice / CreateContext / Escape). setupapi is kept
-  # for the legacy device-interface helpers still referenced by the fail-clean
-  # IOCTL stub until those verbs move onto D3DKMT (Stage 2/3).
-  libvn_files += files('vn_renderer_helios.c')
+  # Escape-free per-instance HVM1 backend.  Only stock D3DKMT thunks are linked;
+  # the selected backend has no IOCTL/blob/name/resource-id carrier.
+  libvn_files += files('vn_renderer_helios_hvm.c')
   # HWA2 parse/validate. Separate TU because it is a transcription of
   # protocol/src/wddm.rs's validator and must be reviewable against it without
   # 5000 lines of transport in the way.
@@ -137,8 +134,21 @@ if with_platform_windows
   # platform-independent on purpose -- tools/hnr2_encode_probe.c compiles and
   # RUNS it on Linux against protocol/'s own validator.
   libvn_files += files('vn_helios_native_kmt.c')
-  vn_deps += cc.find_library('setupapi')
   vn_deps += cc.find_library('gdi32')
+  # Current mingw-w64's gdi32 import library predates the WDDM 3.1 thunk even
+  # though the stock target gdi32.dll exports it.  Generate a one-symbol import
+  # library at configure time; this remains an ordinary static import (and is
+  # intentionally not a LoadLibrary/GetProcAddress compatibility path).
+  helios_dlltool = find_program('dlltool')
+  helios_gdi32_native_fence_import = meson.current_build_dir() / 'libhelios_gdi32_native_fence.a'
+  run_command(
+    helios_dlltool,
+    '-d', meson.current_source_dir() / 'helios_gdi32_native_fence.def',
+    '-l', helios_gdi32_native_fence_import,
+    '-D', 'GDI32.dll',
+    check : true,
+  )
+  vn_link_args += helios_gdi32_native_fence_import
   # mingw-w64 ships no D3DKMT headers; use the real WDK ones (d3dkmthk.h +
   # d3dkmdt.h + d3dukmdt.h, the only WDK-only headers in the chain — they pull
   # only winapifamily.h, which mingw has) vendored under icd/win-build/wdk-include.
@@ -150,7 +160,7 @@ if with_platform_windows
   # wire records (HWA2/HOB1/HOS1/HOC1), mirroring protocol/src/wddm.rs. The
   # standing directive is that shared private data has one declaration, in
   # protocol/, and before this edge existed the ICD hand-copied four of those
-  # records into vn_renderer_helios.c with nothing but `sizeof` asserts — so a
+  # records into the retired renderer backend with nothing but `sizeof` asserts — so a
   # field reorder inside the right number of bytes passed every check on this
   # side. Including the real header brings its per-field `offsetof` assertions
   # with it, which is the compile-time cross-check K4-CONTRACT §7 requires of

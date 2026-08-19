@@ -1116,13 +1116,10 @@ vn_physical_device_init_external_memory(
    }
 
 #if DETECT_OS_WINDOWS
-   /* WSI/scanout prefers DMA_BUF, but native OPAQUE_WIN32 memory needs the
-    * opaque object-identity semantics that also work for optimal-tiled images.
-    * Keep the contracts separate and fall back only when OPAQUE_FD is absent. */
-   physical_dev->external_memory.win32_renderer_handle_type =
-      opaque_fd_exportable
-         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
-         : physical_dev->external_memory.renderer_handle_type;
+   /* A3 implements the exact C57 D3D12_RESOURCE import operation but does not
+    * advertise A6's external-memory profile.  In particular, OPAQUE_WIN32 is
+    * not a compatibility alias for that operation. */
+   physical_dev->external_memory.win32_renderer_handle_type = 0;
 #endif
 
    if (physical_dev->external_memory.renderer_handle_type) {
@@ -1130,22 +1127,12 @@ vn_physical_device_init_external_memory(
       physical_dev->external_memory.supported_handle_types |=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #else
+#if DETECT_OS_WINDOWS
+      physical_dev->external_memory.supported_handle_types = 0;
+#else
       physical_dev->external_memory.supported_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-#if DETECT_OS_WINDOWS
-      physical_dev->external_memory.supported_handle_types |=
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-      /* D3D12_RESOURCE_BIT: IMPORT ONLY. VK_LAYER_HELIOS_present creates each
-       * swapchain image as a shareable committed D3D12 texture and imports it
-       * here (docs/HELIOS_PRESENT_SYNC_RETIREMENT.md §10.3). The carrier is the
-       * same D3DKMTQueryResourceInfoFromNtHandle/OpenResourceFromNtHandle open
-       * the OPAQUE_WIN32 path already uses, because helios_umd12 makes every
-       * committed resource venus-exportable. Vulkan cannot EXPORT a D3D12
-       * resource — nothing here creates one — so the export half stays absent
-       * and vn_sanitize_image_format_properties clears EXPORTABLE for it. */
-      physical_dev->external_memory.supported_handle_types |=
-         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
 #endif
 #endif
    }
@@ -1240,13 +1227,6 @@ vn_physical_device_init_external_semaphore_handles(
          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
    }
 
-#if DETECT_OS_WINDOWS
-   if (physical_dev->instance->renderer->info.has_external_sync) {
-      physical_dev->renderer_sync_fd.semaphore_exportable = true;
-      physical_dev->renderer_sync_fd.semaphore_importable = true;
-   }
-#endif
-
    physical_dev->external_binary_semaphore_handles = 0;
    physical_dev->external_timeline_semaphore_handles = 0;
 
@@ -1254,24 +1234,6 @@ vn_physical_device_init_external_semaphore_handles(
 #if !DETECT_OS_WINDOWS
       physical_dev->external_binary_semaphore_handles =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-#else
-      /* NT handles only. The KMT (global-DWORD) flavor is unimplementable
-       * for the WDDM syncs backing these semaphores: dxgkrnl rejects a
-       * monitored fence with Shared=1 and no NtSecuritySharing (0xc000000d,
-       * proven live 2026-07-06), so a KMT export could never return a real
-       * global handle. Cross-process consumers import by NAME instead
-       * (VkImportSemaphoreWin32HandleInfoKHR::name). */
-      physical_dev->external_binary_semaphore_handles =
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
-      /* D3D12_FENCE_BIT is TIMELINE ONLY. A D3D12 fence is a monotonically
-       * increasing 64-bit value, which is a timeline semaphore and not a
-       * binary one; §10.3 imports Ready/Release as
-       * VkSemaphoreTypeCreateInfo{TIMELINE, initialValue=0}, and vkd3d exports
-       * its timeline semaphores under this type. Advertising it for binary
-       * semaphores would claim a payload nothing produces. */
-      physical_dev->external_timeline_semaphore_handles =
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
 #endif
    }
 }
@@ -1335,31 +1297,6 @@ vn_physical_device_get_native_extensions(
 #if !DETECT_OS_WINDOWS
       exts->KHR_external_memory_fd = true;
       exts->EXT_external_memory_dma_buf = true;
-#else
-      /* Helios: the fd-based external-memory extensions describe the WIRE
-       * (renderer-side) handle types; no POSIX fd ever crosses into the
-       * guest. Exposing VK_KHR_external_memory_fd here is required so that
-       * (a) the D3D bridge can legally chain VkExternalMemoryImageCreateInfo
-       * / VkExportMemoryAllocateInfo for shared surfaces, and (b) enabling it
-       * makes vn_device_fix_create_info add VK_KHR_external_memory_fd +
-       * VK_EXT_external_memory_dma_buf to the HOST device create — without
-       * which vkr's export-blob path (vkGetMemoryFdKHR) and dma_buf
-       * import-by-resource-id run against a host device that never enabled
-       * those extensions.
-       *
-       * VK_EXT_external_memory_dma_buf must ALSO be advertised to the guest so
-       * DXVK can legally enable it at vkCreateDevice and chain the DMA_BUF
-       * external handle type on the DWM scan-out primary — a virtio-gpu
-       * SET_SCANOUT_BLOB needs a DRM_FORMAT_MODIFIER + DMA_BUF-exported image
-       * (a plain OPTIMAL/LINEAR image exports as MOD_INVALID → host paints
-       * black; see icd/win-build/helios_vk_present.c:251-254). No POSIX fd
-       * crosses into the guest — the HOST exports the dmabuf from the res_id.
-       */
-      exts->KHR_external_memory_fd = true;
-      exts->EXT_external_memory_dma_buf = true;
-      /* Native guest ABI: NT handles are backed by shareable WDDM
-       * allocations which retain/adopt the renderer's Venus resource id. */
-      exts->KHR_external_memory_win32 = true;
 #endif /* !DETECT_OS_WINDOWS */
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */

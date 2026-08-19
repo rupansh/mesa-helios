@@ -26,7 +26,7 @@
 
 /* d3dkmthk.h's prototypes return NTSTATUS but it pulls no header that defines
  * it, and mingw's <windows.h> does not either. Same guard as
- * vn_renderer_helios.c. */
+ * the selected Windows renderer. */
 #ifndef _NTDEF_
 typedef LONG NTSTATUS, *PNTSTATUS;
 #endif
@@ -36,6 +36,7 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #include "helios_translation_session.h"
 
 struct helios_translation_session;
+struct helios_native_context;
 
 /*
  * Build the session: open the adapter, create the raw KMT device, create the one
@@ -71,6 +72,37 @@ void helios_session_capability(const struct helios_translation_session *s,
 /* The raw KMT device A2's queue contexts are created on. */
 D3DKMT_HANDLE helios_session_device_handle(
    const struct helios_translation_session *s);
+
+/*
+ * Execute the one reply-bearing normal-context operation admitted by A3:
+ *
+ *   vkSetReplyCommandStreamMESA(resourceId = 0) +
+ *   vkAllocateMemory(VK_COMMAND_GENERATE_REPLY_BIT_EXT,
+ *                    VkImportMemoryResourceInfoMESA(resourceId = 0))
+ *
+ * `payload` is a caller-owned, generated-Venus byte stream.  The session fills
+ * only the SetReply offset/size fields after checking the fixed generated
+ * layout; both host-resource operands remain zero.  `import_operand_offset`
+ * names the generated import operand and is repeated as the second typed patch.
+ * The first use is always this session's checked-out role-1 slot, and the
+ * second is exactly `target_allocation`/`target_generation`.
+ *
+ * Completion is the HVR1 publication produced only after the exact host
+ * AllocateMemory reply.  A C51 wait on `context` orders the CPU decode; no
+ * control-context milestone is substituted for it.
+ */
+VkResult helios_session_execute_allocate(
+   struct helios_translation_session *s,
+   struct helios_native_context *context,
+   void *payload,
+   uint64_t payload_bytes,
+   uint32_t import_operand_offset,
+   D3DKMT_HANDLE target_allocation,
+   uint64_t target_generation,
+   void *raw_reply,
+   uint64_t raw_reply_capacity,
+   uint64_t *raw_reply_bytes,
+   int32_t *reply_status);
 
 /*
  * One bounded C60 pure-control transaction on the HVC1 control context: encode
@@ -138,6 +170,9 @@ enum helios_session_refusal_site {
    HELIOS_SESSION_REFUSE_CONTROL_WAIT,
    HELIOS_SESSION_REFUSE_CONTROL_REPLY,
    HELIOS_SESSION_REFUSE_PAYLOAD_TOO_LARGE,
+   HELIOS_SESSION_REFUSE_EXEC_ALLOC_RENDER,
+   HELIOS_SESSION_REFUSE_EXEC_ALLOC_WAIT,
+   HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY,
    HELIOS_SESSION_REFUSE_SITE_COUNT,
 };
 

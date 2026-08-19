@@ -11,7 +11,15 @@
 struct vn_renderer_shmem {
    struct vn_refcount refcount;
 
+#if defined(_WIN32)
+   /* Process-local HVM1 capability.  The generation is the anti-stale half;
+    * neither field is a host resource identifier or a wire operand. */
+   uint32_t allocation_handle;
+   uint64_t allocation_generation;
+   uint32_t allocation_role;
+#else
    uint32_t res_id;
+#endif
    size_t mmap_size; /* for internal use only (i.e., munmap) */
    void *mmap_ptr;
 
@@ -22,7 +30,13 @@ struct vn_renderer_shmem {
 struct vn_renderer_bo {
    struct vn_refcount refcount;
 
+#if defined(_WIN32)
+   uint32_t allocation_handle;
+   uint64_t allocation_generation;
+   uint32_t allocation_role;
+#else
    uint32_t res_id;
+#endif
    /* for internal use only */
    size_t mmap_size;
    void *mmap_ptr;
@@ -38,7 +52,12 @@ struct vn_renderer_bo {
  * The main difference is that drm_syncobj can have unsignaled value 0.
  */
 struct vn_renderer_sync {
+#if defined(_WIN32)
+   uint32_t allocation_handle;
+   uint64_t allocation_generation;
+#else
    uint32_t sync_id;
+#endif
 };
 
 struct vn_renderer_info {
@@ -95,13 +114,6 @@ struct vn_renderer_submit_batch {
     * processing by the renderer.
     */
    uint32_t ring_idx;
-
-   /* Helios registered present-stream attribution.  Both fields are zero for
-    * every ordinary batch.  When present_value32 is nonzero, present_cookie
-    * is supplied to the 40-byte SUBMIT_VENUS header as its input fence_id;
-    * the KMD overwrites that field with its normal fresh wire fence id. */
-   uint64_t present_cookie;
-   uint32_t present_value32;
 
    /* syncs to update when the timeline is signaled */
    struct vn_renderer_sync *const *syncs;
@@ -172,11 +184,13 @@ struct vn_renderer_bo_ops {
                                    VkMemoryPropertyFlags flags,
                                    struct vn_renderer_bo **out_bo);
 
+#if !defined(_WIN32)
    VkResult (*create_from_resource_id)(struct vn_renderer *renderer,
                                        VkDeviceSize size,
                                        uint32_t res_id,
                                        VkMemoryPropertyFlags flags,
                                        struct vn_renderer_bo **out_bo);
+#endif
 
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
 
@@ -250,62 +264,9 @@ vn_renderer_helios_sync_create_from_win32(
    void *handle,
    struct vn_renderer_sync **out_sync);
 
-/* Open a NAMED NT-shared WDDM sync (the VkImportSemaphoreWin32HandleInfoKHR
- * `name` path). `name` is the Win32-style name the exporter used, e.g.
- * L"Global\\HeliosPresentFence_1234". */
-VkResult
-vn_renderer_helios_sync_create_from_win32_name(
-   struct vn_renderer *renderer,
-   const void *name /* LPCWSTR */,
-   struct vn_renderer_sync **out_sync);
-
-/* Publish an existing NT-shareable sync under a kernel object name (the
- * VkExportSemaphoreWin32HandleInfoKHR `name` path). `security_attributes` is
- * an optional LPSECURITY_ATTRIBUTES — the DACL must grant the consumer
- * principal access when it lives in another session/account (dwm ->
- * WUDFHost). The NT handle backing the name stays open until the sync is
- * destroyed. */
-VkResult
-vn_renderer_helios_sync_share_named(
-   struct vn_renderer *renderer,
-   struct vn_renderer_sync *sync,
-   const void *name /* LPCWSTR */,
-   const void *security_attributes /* LPSECURITY_ATTRIBUTES */);
-
-VkResult
-vn_renderer_helios_sync_export_win32(
-   struct vn_renderer *renderer,
-   struct vn_renderer_sync *sync,
-   VkExternalSemaphoreHandleTypeFlagBits handle_type,
-   void **out_handle);
-
-/* Feedback-shadow retire (WS2 wire-fence latency workaround): hand the
- * exported semaphore's vn feedback-slot counter VA to its helios_sync so
- * the retire thread can observe host completion through the GPU-written
- * feedback slot (~sub-ms) instead of the wire-fence response (measured
- * 10-20 ms through QEMU's fence delivery). Pass NULL to detach BEFORE the
- * slot is returned to the feedback pool (semaphore destroy) — a stale
- * pointer would poll recycled slot memory. */
-void
-vn_renderer_helios_sync_set_feedback(struct vn_renderer *renderer,
-                                     struct vn_renderer_sync *sync,
-                                     const volatile uint64_t *counter_va);
-
-/* HELIOS_RETIRE_FEEDBACK gate (absent/1 = ON, "0" = off). Read once per
- * process; also gates the feedback-slot allocation for exported timeline
- * semaphores in vn_semaphore_feedback_init. */
-bool
-vn_renderer_helios_retire_feedback_enabled(void);
-
-/* Registered monotonic present-stream lifecycle.  The renderer owns the KMD
- * registration table so a context teardown can best-effort unregister streams
- * whose VkSemaphore owner did not destroy them first. */
-bool
-vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
-                                           uint64_t *out_cookie);
-void
-vn_renderer_helios_present_stream_unregister(struct vn_renderer *renderer,
-                                             uint64_t cookie);
+/* The imported local handle is deliberately not exportable or nameable. */
+uint32_t
+vn_renderer_helios_sync_handle(const struct vn_renderer_sync *sync);
 #endif
 
 struct vn_renderer {
@@ -334,7 +295,7 @@ vn_renderer_create_vtest(struct vn_instance *instance,
  * parse/validate layer. */
 #include "vn_helios_hwa2.h"
 
-/* Helios IOCTL backend (vn_renderer_helios.c) — the only backend on Windows. */
+/* Escape-free per-instance HVM1 backend — the only backend on Windows. */
 VkResult
 vn_renderer_create_helios(struct vn_instance *instance,
                           const VkAllocationCallbacks *alloc,
@@ -342,40 +303,13 @@ vn_renderer_create_helios(struct vn_instance *instance,
 
 struct vn_renderer_helios_external_memory;
 
-/* Native VK_KHR_external_memory_win32 payloads. A payload is a WDDM allocation
- * carrying the immutable §10.3 HWA2 descriptor. ⛔ It no longer "owns or
- * retains the matching Venus resource id" — that was UMD-backing adoption, and
- * §10.3 forbids any UMD/ICD/descriptor naming a host resource at all. Until
- * mesa unit A3 lands the replacement mechanism (KMD-owned venus memory plus
- * KMD-side resid patching), the export path refuses and the import path can
- * validate a payload but cannot bind it. */
-VkResult
-vn_renderer_helios_external_memory_create(
-   struct vn_renderer *renderer,
-   struct vn_renderer_bo *bo,
-   uint64_t memory_id,
-   uint64_t allocation_size,
-   uint32_t memory_type_index,
-   struct vn_renderer_helios_external_memory **out_external);
-
 VkResult
 vn_renderer_helios_external_memory_open(
    struct vn_renderer *renderer,
    const VkImportMemoryWin32HandleInfoKHR *import_info,
    uint64_t allocation_size,
-   /* ⛔ THE OUTPUT CONTRACT CHANGED WITH THE §10.3 RETIREMENT.
-    *
-    * Gone: `out_resource_id` and `out_memory_type_index`. HWA2 carries neither
-    * a host resource token nor a Vulkan memory-type index, by design and not by
-    * omission, and no field may be added to carry them. Every former consumer
-    * refuses through `helios_a3_gap_refuse` (vn_helios_hwa2.h) until mesa unit
-    * A3 replaces the mechanism.
-    *
-    * `out_allocation_generation` is NOT their replacement. It is HWA2's nonzero
-    * KMD-assigned anti-stale token, "never an identity lookup key"; the identity
-    * is the opened WDDM allocation inside `out_external`. Pair them, never
-    * substitute one for the retired resid. */
-   uint64_t *out_allocation_generation,
+   /* There is deliberately no resource-id or memory-type output. Identity is
+    * the retained opened allocation plus the HWA2 generation stored in out_bo. */
    /* The size the payload actually has. For D3D12_RESOURCE_BIT the caller's
     * allocationSize is ignored per spec and may be 0, in which case this is
     * the only place the real size appears. */
@@ -384,24 +318,32 @@ vn_renderer_helios_external_memory_open(
     * C37/C43 format/extent agreement checks this function cannot (it does not
     * know what the caller intends to bind). May be NULL. */
    HeliosWddmAllocationDescV2 *out_desc,
+   struct vn_renderer_bo **out_bo,
    struct vn_renderer_helios_external_memory **out_external);
-
-VkResult
-vn_renderer_helios_external_memory_prepare_export(
-   struct vn_renderer *renderer,
-   struct vn_renderer_helios_external_memory *external,
-   const VkExportMemoryWin32HandleInfoKHR *export_info);
-
-VkResult
-vn_renderer_helios_external_memory_get_handle(
-   struct vn_renderer *renderer,
-   struct vn_renderer_helios_external_memory *external,
-   void **out_handle);
 
 void
 vn_renderer_helios_external_memory_destroy(
    struct vn_renderer *renderer,
    struct vn_renderer_helios_external_memory *external);
+
+/* A3's exact generated AllocateMemory/FreeMemory bootstrap.  The BO is the
+ * complete allocation-use closure and every wire resource operand is zero. */
+VkResult
+vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
+                                   VkDevice device,
+                                   const VkMemoryAllocateInfo *alloc_info,
+                                   VkDeviceMemory *memory,
+                                   struct vn_renderer_bo *bo);
+VkResult
+vn_renderer_helios_free_memory(struct vn_renderer *renderer,
+                               VkDevice device,
+                               VkDeviceMemory memory,
+                               struct vn_renderer_bo *bo);
+
+uint64_t
+vn_renderer_helios_session_generation(const struct vn_renderer *renderer);
+uint32_t
+vn_renderer_helios_endpoint_capacity(const struct vn_renderer *renderer);
 
 /* ⛔ `vn_renderer_helios_vidmm_alloc` / `_open_shared` / `_free` are DELETED.
  * They created and shared a content-free "tracking" WDDM allocation whose only
@@ -409,8 +351,7 @@ vn_renderer_helios_external_memory_destroy(
  * venus memory, through the legacy KMT global-share namespace §10.3 forbids.
  * The mechanism has NO SUCCESSOR (K4-CONTRACT §6) — nothing was folded into
  * HWA2, and re-adding it under another name is forbidden by §10.3's "no ...
- * independently usable identity". See the deletion note in vn_renderer_helios.c
- * for the accounting consequence, which is named rather than hidden. */
+ * independently usable identity". */
 #endif
 
 static inline VkResult
@@ -462,7 +403,12 @@ vn_renderer_shmem_create(struct vn_renderer *renderer, size_t size)
       renderer->shmem_ops.create(renderer, size);
    if (shmem) {
       assert(vn_refcount_is_valid(&shmem->refcount));
+#if !defined(_WIN32)
       assert(shmem->res_id);
+#else
+      assert(shmem->allocation_handle);
+      assert(shmem->allocation_generation);
+#endif
       assert(shmem->mmap_size >= size);
       assert(shmem->mmap_ptr);
    }
@@ -503,7 +449,12 @@ vn_renderer_bo_create_from_device_memory(
       return result;
 
    assert(vn_refcount_is_valid(&bo->refcount));
+#if !defined(_WIN32)
    assert(bo->res_id);
+#else
+   assert(bo->allocation_handle);
+   assert(bo->allocation_generation);
+#endif
    assert(!bo->mmap_size || bo->mmap_size >= size);
 
    *out_bo = bo;
@@ -524,13 +475,19 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
       return result;
 
    assert(vn_refcount_is_valid(&bo->refcount));
+#if !defined(_WIN32)
    assert(bo->res_id);
+#else
+   assert(bo->allocation_handle);
+   assert(bo->allocation_generation);
+#endif
    assert(!bo->mmap_size || bo->mmap_size >= size);
 
    *out_bo = bo;
    return VK_SUCCESS;
 }
 
+#if !defined(_WIN32)
 static inline VkResult
 vn_renderer_bo_create_from_resource_id(struct vn_renderer *renderer,
                                        VkDeviceSize size,
@@ -554,6 +511,7 @@ vn_renderer_bo_create_from_resource_id(struct vn_renderer *renderer,
    *out_bo = bo;
    return VK_SUCCESS;
 }
+#endif
 
 static inline struct vn_renderer_bo *
 vn_renderer_bo_ref(struct vn_renderer *renderer, struct vn_renderer_bo *bo)

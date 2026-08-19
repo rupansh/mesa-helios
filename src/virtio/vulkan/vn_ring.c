@@ -109,9 +109,7 @@ struct vn_ring {
 };
 
 #if DETECT_OS_WINDOWS
-/* ProgramData diag sink (vn_renderer_helios.c) — C:\Windows\Temp is not
- * writable from the restricted IddCx host process, so ring diags written
- * there silently vanished for WUDFHost (defect-0b audit, 2026-07-06). */
+/* Selected Windows renderer diagnostic sink. */
 void vn_renderer_helios_diag_log(const char *fmt, ...);
 
 /* Log on a power-of-two decay (1st, 2nd, 4th, ... occurrence). A dead ring
@@ -527,7 +525,11 @@ vn_ring_create(struct vn_instance *instance,
    const struct VkRingCreateInfoMESA info = {
       .sType = VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA,
       .pNext = &monitor_info,
+#if DETECT_OS_WINDOWS
+      .resourceId = 0,
+#else
       .resourceId = ring->shmem->res_id,
+#endif
       .size = layout->shmem_size,
       .idleTimeout = VN_RING_IDLE_TIMEOUT_NS,
       .headOffset = layout->head_offset,
@@ -539,12 +541,18 @@ vn_ring_create(struct vn_instance *instance,
       .extraSize = layout->extra_size,
    };
 
+#if !DETECT_OS_WINDOWS
    uint32_t create_ring_data[64];
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       create_ring_data, sizeof(create_ring_data));
    vn_encode_vkCreateRingMESA(&local_enc, 0, ring->id, &info);
    vn_renderer_submit_simple(instance->renderer, create_ring_data,
                              vn_cs_encoder_get_len(&local_enc));
+#else
+   /* K11 already owns the session namespace.  This is local encoder storage
+    * only; no VkRingMESA object or raw-resource ring exists on Windows. */
+   (void)info;
+#endif
 
    return ring;
 }
@@ -556,6 +564,7 @@ vn_ring_destroy(struct vn_ring *ring)
 
    const VkAllocationCallbacks *alloc = &ring->instance->base.vk.alloc;
 
+#if !DETECT_OS_WINDOWS
    uint32_t destroy_ring_data[4];
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       destroy_ring_data, sizeof(destroy_ring_data));
@@ -567,6 +576,7 @@ vn_ring_destroy(struct vn_ring *ring)
     */
    vn_renderer_submit_simple_sync(ring->instance->renderer, destroy_ring_data,
                                   vn_cs_encoder_get_len(&local_enc));
+#endif
 
    mtx_destroy(&ring->roundtrip_mutex);
 
@@ -705,7 +715,11 @@ vn_ring_submission_get_cs(struct vn_ring_submission *submit,
       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
       if (buf->committed_size) {
          descs[desc_count++] = (VkCommandStreamDescriptionMESA){
+#if DETECT_OS_WINDOWS
+            .resourceId = 0,
+#else
             .resourceId = buf->shmem->res_id,
+#endif
             .offset = buf->offset,
             .size = buf->committed_size,
          };
@@ -830,6 +844,15 @@ vn_ring_submit_locked(struct vn_ring *ring,
                       struct vn_renderer_shmem *extra_shmem,
                       uint32_t *ring_seqno)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   (void)cs;
+   (void)extra_shmem;
+   (void)ring_seqno;
+   /* Generic generated-object traffic belongs to A7.  Refuse synchronously;
+    * never manufacture a local completion or fall back to a shared ring. */
+   return VK_ERROR_DEVICE_LOST;
+#else
    if (unlikely(!helios_ring_shared_valid(ring)))
       return VK_ERROR_DEVICE_LOST;
 
@@ -870,6 +893,7 @@ vn_ring_submit_locked(struct vn_ring *ring,
       *ring_seqno = seqno;
 
    return VK_SUCCESS;
+#endif
 }
 
 VkResult
@@ -894,7 +918,11 @@ vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       set_reply_command_stream_data, sizeof(set_reply_command_stream_data));
    const struct VkCommandStreamDescriptionMESA stream = {
+#if DETECT_OS_WINDOWS
+      .resourceId = 0,
+#else
       .resourceId = shmem->res_id,
+#endif
       .offset = offset,
       .size = size,
    };

@@ -579,15 +579,8 @@ helios_hwa2_note_reject(const char *site,
 
    const long count = InterlockedIncrement(&helios_hwa2_reject_counters[reject->code]);
 
-   /* Same 1-then-every-256 throttle, and for the same reason, as
-    * `helios_a3_gap_refuse` below: `vn_renderer_helios_diag_log` does a
-    * fopen/vfprintf/fclose per call, and the reachable call sites are per-import
-    * — `vn_renderer_helios.c`'s `c57_open` arm runs under
-    * `vkGetMemoryWin32HandlePropertiesKHR`, which DWM and DXVK hit once per
-    * shared-surface import. On the split deploy this refusal's own message names
-    * — the case where EVERY import refuses — an unthrottled line would make the
-    * diag log itself the failure and would bury the throttled A3 lines it sits
-    * beside.
+   /* 1-then-every-256 keeps a split-deploy import loop from making diagnostics
+    * the failure while retaining an exact counter for every rejection.
     *
     * ⚠ NOTHING IS SOFTENED. The refusal is unchanged, `helios_hwa2_reject_count`
     * still counts every occurrence, `helios_hwa2_reject_summary` still prints
@@ -636,107 +629,6 @@ helios_hwa2_reject_summary(char *buf, size_t buf_bytes)
                   helios_hwa2_reject_name((enum helios_hwa2_reject)code), count);
       /* snprintf returns what it WOULD have written; stop on truncation rather
        * than advancing `used` past the buffer. */
-      if (written < 0 || (size_t)written >= buf_bytes - used)
-         return;
-      used += (size_t)written;
-      any = true;
-   }
-   if (!any)
-      snprintf(buf, buf_bytes, "none");
-}
-
-/* ── the §10.3 identity gap (mesa unit A3) ─────────────────────────────────── */
-
-static const char *const helios_a3_gap_site_names[HELIOS_A3_GAP_SITE_COUNT] = {
-   [HELIOS_A3_GAP_IMPORT_WIN32] = "import_win32",
-   [HELIOS_A3_GAP_HANDLE_PROPERTIES] = "handle_properties",
-   [HELIOS_A3_GAP_EXPORT_ADOPTION] = "export_adoption",
-   [HELIOS_A3_GAP_VIDMM_TRACKER] = "vidmm_tracker",
-};
-
-/* What each site can no longer obtain, and what will supply it. A refusal that
- * names nothing is why this project has burned round trips; these strings are
- * the instrument, so keep them specific. */
-static const char *const helios_a3_gap_site_reasons[HELIOS_A3_GAP_SITE_COUNT] = {
-   [HELIOS_A3_GAP_IMPORT_WIN32] =
-      "the payload's HWA2 descriptor validated, but HWA2 carries NO host resource id"
-      " (resource_id, offset 24 of the retired HeliosWddmOpenIdentity) and 10.3"
-      " forbids the ICD naming a host resource at all, so there is nothing legal to"
-      " put in VkImportMemoryResourceInfoMESA::resourceId. SUPPLIED BY: mesa unit A3"
-      " -- the ICD names allocations by D3DDDI_ALLOCATIONLIST index plus HWA2"
-      " allocation_generation, and the KMD patches the host resid in from"
-      " HeliosNativeRenderPatch",
-   [HELIOS_A3_GAP_HANDLE_PROPERTIES] =
-      "HWA2 carries NO Vulkan memory_type_index (retired trailer offset 28); its"
-      " memory_class is a 3-value protocol enum and 10.7 says a C57 D3D12_RESOURCE"
-      " import is never exposed through an ordinary memory type. Answering with a"
-      " guessed type would promise an import that the A3 gap then refuses."
-      " SUPPLIED BY: mesa units A6 (the two-type table) and A8, after A3",
-   [HELIOS_A3_GAP_EXPORT_ADOPTION] =
-      "the export used to hand the KMD adopt_resource_id so it would re-own this BO's"
-      " venus resource. That is UMD-backing adoption, which K4 deletes and 10.3"
-      " forbids reintroducing under another name. SUPPLIED BY: mesa unit A3 -- the KMD"
-      " owns the venus allocation (HVM1) and the ICD stops exporting one it named",
-   [HELIOS_A3_GAP_VIDMM_TRACKER] =
-      "the VidMm global-share tracker and its HELIOS_WDDM_ALLOC_KIND_TRACKING"
-      " allocation are deleted with UMD-backing adoption and have NO successor"
-      " (K4-CONTRACT 6): nothing was folded into HWA2 and nobody should look for it."
-      " The export is retained only so an older bridge DLL resolves it and gets a"
-      " refusal instead of a stale attestation",
-};
-
-static volatile LONG helios_a3_gap_counters[HELIOS_A3_GAP_SITE_COUNT];
-
-const char *
-helios_a3_gap_site_name(enum helios_a3_gap_site site)
-{
-   if ((unsigned)site >= HELIOS_A3_GAP_SITE_COUNT)
-      return "unknown_site";
-   return helios_a3_gap_site_names[site];
-}
-
-void
-helios_a3_gap_refuse(enum helios_a3_gap_site site)
-{
-   if ((unsigned)site >= HELIOS_A3_GAP_SITE_COUNT)
-      return;
-
-   const long count = InterlockedIncrement(&helios_a3_gap_counters[site]);
-   /* The first refusal at a site carries the whole explanation; after that one
-    * line every 256, because a compositor that retries an import per frame
-    * would otherwise make the diag log itself the failure. */
-   if (count == 1 || (count % 256) == 0) {
-      vn_renderer_helios_diag_log(
-         "A3 GAP REFUSAL site=%s count=%ld: %s. !! An ICD in this state cannot import"
-         " a Win32/D3D12 payload; that is the retirement's intended intermediate"
-         " state (K4-CONTRACT 5), not a regression to work around.",
-         helios_a3_gap_site_name(site), count, helios_a3_gap_site_reasons[site]);
-   }
-}
-
-long
-helios_a3_gap_refusals(enum helios_a3_gap_site site)
-{
-   if ((unsigned)site >= HELIOS_A3_GAP_SITE_COUNT)
-      return 0;
-   return helios_a3_gap_counters[site];
-}
-
-void
-helios_a3_gap_summary(char *buf, size_t buf_bytes)
-{
-   if (!buf || !buf_bytes)
-      return;
-   buf[0] = '\0';
-   size_t used = 0;
-   bool any = false;
-   for (unsigned site = 0; site < HELIOS_A3_GAP_SITE_COUNT; site++) {
-      const long count = helios_a3_gap_counters[site];
-      if (!count)
-         continue;
-      const int written =
-         snprintf(buf + used, buf_bytes - used, "%s%s=%ld", any ? " " : "",
-                  helios_a3_gap_site_names[site], count);
       if (written < 0 || (size_t)written >= buf_bytes - used)
          return;
       used += (size_t)written;

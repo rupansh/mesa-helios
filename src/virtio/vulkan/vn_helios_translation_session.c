@@ -43,6 +43,9 @@ static const char *const helios_session_site_names[HELIOS_SESSION_REFUSE_SITE_CO
    [HELIOS_SESSION_REFUSE_CONTROL_WAIT] = "control_wait",
    [HELIOS_SESSION_REFUSE_CONTROL_REPLY] = "control_reply",
    [HELIOS_SESSION_REFUSE_PAYLOAD_TOO_LARGE] = "payload_too_large",
+   [HELIOS_SESSION_REFUSE_EXEC_ALLOC_RENDER] = "exec_alloc_render",
+   [HELIOS_SESSION_REFUSE_EXEC_ALLOC_WAIT] = "exec_alloc_wait",
+   [HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY] = "exec_alloc_reply",
 };
 
 static volatile LONG helios_session_counters[HELIOS_SESSION_REFUSE_SITE_COUNT];
@@ -416,6 +419,180 @@ reply_refused:
    helios_session_refuse(reply_site, why, 0);
    helios_slot_release(s, slot_index);
    return VK_ERROR_DEVICE_LOST;
+}
+
+VkResult
+helios_session_execute_allocate(struct helios_translation_session *s,
+                                struct helios_native_context *context,
+                                void *payload,
+                                uint64_t payload_bytes,
+                                uint32_t import_operand_offset,
+                                D3DKMT_HANDLE target_allocation,
+                                uint64_t target_generation,
+                                void *raw_reply,
+                                uint64_t raw_reply_capacity,
+                                uint64_t *raw_reply_bytes,
+                                int32_t *reply_status)
+{
+   /* These are generated-Venus byte offsets, pinned by the A3 schema gate.
+    * They are not a second ABI: the KMD independently derives both resource
+    * offsets from the generated schema and rejects any disagreement. */
+   enum {
+      SET_REPLY_RESOURCE_OFFSET = 16,
+      SET_REPLY_STREAM_OFFSET_OFFSET = 20,
+      SET_REPLY_STREAM_SIZE_OFFSET = 28,
+      SET_REPLY_BYTES = 36,
+      RAW_ALLOCATE_REPLY_BYTES = 24,
+      OP_ALLOCATE_MEMORY = 21,
+   };
+
+   if (raw_reply_bytes)
+      *raw_reply_bytes = 0;
+   if (!s || !context || !payload || !raw_reply ||
+       raw_reply_capacity < RAW_ALLOCATE_REPLY_BYTES ||
+       payload_bytes <= SET_REPLY_BYTES ||
+       payload_bytes > HELIOS_HNR2_MAX_PAYLOAD_BYTES ||
+       import_operand_offset < SET_REPLY_BYTES ||
+       (import_operand_offset & 3u) != 0 ||
+       (uint64_t)import_operand_offset + sizeof(uint32_t) > payload_bytes ||
+       !target_allocation || !target_generation) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY,
+                            "invalid generated allocate transaction shape", 0);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   uint8_t *bytes = payload;
+   uint32_t zero = 1;
+   memcpy(&zero, bytes + SET_REPLY_RESOURCE_OFFSET, sizeof(zero));
+   uint32_t import_zero = 1;
+   memcpy(&import_zero, bytes + import_operand_offset, sizeof(import_zero));
+   if (zero != 0 || import_zero != 0) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY,
+                            "generated host-resource operand is not zero", 0);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   unsigned slot_index = 0;
+   uint64_t slot_generation = 0;
+   if (!helios_slot_acquire(s, &slot_index, &slot_generation))
+      return VK_ERROR_DEVICE_LOST;
+
+   const uint64_t stream_offset =
+      s->slots[slot_index].offset + HELIOS_HVR1_HEADER_SIZE;
+   const uint64_t stream_size = RAW_ALLOCATE_REPLY_BYTES;
+   memcpy(bytes + SET_REPLY_STREAM_OFFSET_OFFSET, &stream_offset,
+          sizeof(stream_offset));
+   memcpy(bytes + SET_REPLY_STREAM_SIZE_OFFSET, &stream_size,
+          sizeof(stream_size));
+
+   const struct helios_hnr2_allocation allocations[2] = {
+      {
+         .handle = s->pool,
+         .access = HELIOS_HNR2_ACCESS_WRITE,
+         .expected_generation = s->pool_generation,
+      },
+      {
+         .handle = target_allocation,
+         .access = HELIOS_HNR2_ACCESS_READ | HELIOS_HNR2_ACCESS_WRITE,
+         .expected_generation = target_generation,
+      },
+   };
+   const struct helios_hnr2_patch_input patches[2] = {
+      {
+         .payload_offset = SET_REPLY_RESOURCE_OFFSET,
+         .allocation_index = 0,
+         .operand_kind = HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32,
+      },
+      {
+         .payload_offset = import_operand_offset,
+         .allocation_index = 1,
+         .operand_kind = HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32,
+      },
+   };
+   const struct helios_hnr2_batch batch = {
+      .payload = payload,
+      .payload_bytes = payload_bytes,
+      .allocations = allocations,
+      .allocation_count = 2,
+      .patches = patches,
+      .patch_count = 2,
+      .has_reply = true,
+      .reply_allocation_index = 0,
+      .reply_offset = s->slots[slot_index].offset,
+      .reply_capacity_bytes =
+         HELIOS_HVR1_HEADER_SIZE + RAW_ALLOCATE_REPLY_BYTES,
+      .reply_slot_generation = slot_generation,
+   };
+
+   uint64_t batch_token = 0;
+   uint64_t progress = 0;
+   VkResult vr = helios_native_context_submit(
+      context, &batch, true, &batch_token, &progress);
+   if (vr != VK_SUCCESS) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_RENDER,
+                            "native allocate submit", (unsigned)vr);
+      helios_slot_release(s, slot_index);
+      if (vr == VK_ERROR_DEVICE_LOST)
+         helios_session_poison(s);
+      return vr;
+   }
+   vr = helios_native_context_wait(context, progress,
+                                   HELIOS_NATIVE_WAIT_INFINITE);
+   if (vr != VK_SUCCESS) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_WAIT,
+                            "native allocate C51 wait", (unsigned)vr);
+      helios_slot_release(s, slot_index);
+      if (vr == VK_ERROR_DEVICE_LOST)
+         helios_session_poison(s);
+      return vr;
+   }
+
+   const uint8_t *slot =
+      (const uint8_t *)s->pool_cpu + s->slots[slot_index].offset;
+   HeliosVenusReplyV1 r;
+   memcpy(&r, slot, sizeof(r));
+   const uint32_t flags = r.flags & HELIOS_HVR1_FLAG_MASK;
+   if (r.magic != HELIOS_HVR1_MAGIC ||
+       r.version != HELIOS_HVR1_VERSION ||
+       r.header_size != HELIOS_HVR1_HEADER_SIZE ||
+       r.package_generation != HELIOS_PACKAGE_GENERATION ||
+       r.session_generation != s->session_generation ||
+       r.slot_generation != slot_generation ||
+       r.batch_token != batch_token ||
+       r.snapshot_generation == 0 ||
+       r.opcode != OP_ALLOCATE_MEMORY ||
+       r.total_bytes != RAW_ALLOCATE_REPLY_BYTES ||
+       r.chunk_offset != 0 ||
+       r.chunk_bytes != RAW_ALLOCATE_REPLY_BYTES ||
+       flags != HELIOS_HVR1_FLAG_FINAL || r.flags != flags) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY,
+                            "malformed or stale HVR1 allocate reply", 0);
+      helios_slot_release(s, slot_index);
+      return VK_ERROR_DEVICE_LOST;
+   }
+
+   const uint8_t *raw = slot + HELIOS_HVR1_HEADER_SIZE;
+   uint32_t raw_opcode = 0;
+   int32_t raw_status = 0;
+   uint64_t output_present = 0;
+   memcpy(&raw_opcode, raw, sizeof(raw_opcode));
+   memcpy(&raw_status, raw + 4, sizeof(raw_status));
+   memcpy(&output_present, raw + 8, sizeof(output_present));
+   if (raw_opcode != OP_ALLOCATE_MEMORY || raw_status != r.status ||
+       output_present != 1) {
+      helios_session_refuse(HELIOS_SESSION_REFUSE_EXEC_ALLOC_REPLY,
+                            "raw allocate reply disagrees with HVR1", 0);
+      helios_slot_release(s, slot_index);
+      return VK_ERROR_DEVICE_LOST;
+   }
+
+   memcpy(raw_reply, raw, RAW_ALLOCATE_REPLY_BYTES);
+   if (raw_reply_bytes)
+      *raw_reply_bytes = RAW_ALLOCATE_REPLY_BYTES;
+   if (reply_status)
+      *reply_status = r.status;
+   helios_slot_release(s, slot_index);
+   return VK_SUCCESS;
 }
 
 VkResult

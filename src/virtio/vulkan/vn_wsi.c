@@ -129,39 +129,6 @@ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
       &physical_dev->instance->base.vk, pName);
 }
 
-#ifdef _WIN32
-/* Helios dcomp present vehicle: venus resource id + the creator's exact
- * allocation identity of a WSI frame image's memory. The resid is nonzero
- * only for bo-backed memory; whether the blob is SHAREABLE was decided at
- * allocation (export handle types -> USE_SHAREABLE; the WSI layer sets them
- * for vehicle-mode frame images). The identity pair is the typed-import
- * contract (C1): vkr's OPAQUE-fd import needs the exact creating size and
- * memory type. */
-static uint32_t
-vn_wsi_get_helios_resource_identity(VkDevice device,
-                                    VkDeviceMemory memory,
-                                    uint64_t *alloc_size,
-                                    uint32_t *memory_type_index)
-{
-   if (alloc_size)
-      *alloc_size = 0;
-   if (memory_type_index)
-      *memory_type_index = 0;
-   if (memory == VK_NULL_HANDLE)
-      return 0;
-
-   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
-   if (!mem || !mem->base_bo || !mem->base_bo->res_id)
-      return 0;
-
-   if (alloc_size)
-      *alloc_size = mem->base.vk.size;
-   if (memory_type_index)
-      *memory_type_index = mem->base.vk.memory_type_index;
-   return mem->base_bo->res_id;
-}
-#endif
-
 VkResult
 vn_wsi_init(struct vn_physical_device *physical_dev)
 {
@@ -236,10 +203,6 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
    physical_dev->wsi_device.supports_scanout = false;
    physical_dev->wsi_device.supports_modifiers =
       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
-#ifdef _WIN32
-   physical_dev->wsi_device.win32.get_helios_resource_identity =
-      vn_wsi_get_helios_resource_identity;
-#endif
    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
 
    return VK_SUCCESS;

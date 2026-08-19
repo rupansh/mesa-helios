@@ -151,7 +151,7 @@ uint32_t helios_hnr2_fragment_allocation_count(
 #include <vulkan/vulkan.h>
 #include <windows.h>
 
-/* Same guard as vn_renderer_helios.c: d3dkmthk.h's prototypes return NTSTATUS
+/* Same guard as the Windows renderer: d3dkmthk.h's prototypes return NTSTATUS
  * but nothing it includes defines it, and mingw's <windows.h> does not either. */
 #ifndef _NTDEF_
 typedef LONG NTSTATUS, *PNTSTATUS;
