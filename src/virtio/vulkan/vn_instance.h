@@ -65,6 +65,18 @@ struct vn_instance {
 
    bool engine_is_zink;
 
+#if defined(_WIN32)
+   /* A4 owns the submission mode and thread-current outer-scope key here.
+    * It is a direct child of this instance, never process-global state. */
+   struct vn_helios_submit_instance *helios_submit;
+
+   /* K11 endpoints are 1..64 and are never recycled within a session.
+    * Endpoint 1 belongs to the renderer's allocation bootstrap, leaving
+    * 2..64 for real queues.  The selected Windows backend mirrors that exact
+    * monotonic KMD assignment instead of using the generic reuse bitmap. */
+   uint32_t helios_next_ring_idx;
+#endif
+
    struct {
       mtx_t mutex;
       bool initialized;
@@ -102,11 +114,20 @@ static inline int
 vn_instance_acquire_ring_idx(struct vn_instance *instance)
 {
    mtx_lock(&instance->ring_idx_mutex);
+#if defined(_WIN32)
+   const uint32_t next = instance->helios_next_ring_idx;
+   int ring_idx = next && next < instance->renderer->info.max_timeline_count
+                     ? (int)next
+                     : -1;
+   if (ring_idx > 0)
+      instance->helios_next_ring_idx = next + 1;
+#else
    int ring_idx = ffsll(~instance->ring_idx_used_mask) - 1;
    if (ring_idx >= instance->renderer->info.max_timeline_count)
       ring_idx = -1;
    if (ring_idx > 0)
       instance->ring_idx_used_mask |= (1ULL << (uint32_t)ring_idx);
+#endif
    mtx_unlock(&instance->ring_idx_mutex);
 
    assert(ring_idx); /* never acquire the dedicated CPU ring */
@@ -120,10 +141,16 @@ vn_instance_release_ring_idx(struct vn_instance *instance, uint32_t ring_idx)
 {
    assert(ring_idx > 0);
 
+#if defined(_WIN32)
+   /* Deliberately consumed until vn_instance/session teardown.  K11 applies
+    * the same rule, so a late host completion can never target a new queue. */
+   (void)instance;
+#else
    mtx_lock(&instance->ring_idx_mutex);
    assert(instance->ring_idx_used_mask & (1ULL << ring_idx));
    instance->ring_idx_used_mask &= ~(1ULL << ring_idx);
    mtx_unlock(&instance->ring_idx_mutex);
+#endif
 }
 
 #endif /* VN_INSTANCE_H */

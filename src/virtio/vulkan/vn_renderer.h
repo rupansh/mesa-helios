@@ -344,6 +344,8 @@ uint64_t
 vn_renderer_helios_session_generation(const struct vn_renderer *renderer);
 uint32_t
 vn_renderer_helios_endpoint_capacity(const struct vn_renderer *renderer);
+uint32_t
+vn_renderer_helios_device_handle(const struct vn_renderer *renderer);
 
 /* ⛔ `vn_renderer_helios_vidmm_alloc` / `_open_shared` / `_free` are DELETED.
  * They created and shared a content-free "tracking" WDDM allocation whose only

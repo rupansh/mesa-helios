@@ -134,6 +134,10 @@ if with_platform_windows
   # platform-independent on purpose -- tools/hnr2_encode_probe.c compiles and
   # RUNS it on Linux against protocol/'s own validator.
   libvn_files += files('vn_helios_native_kmt.c')
+  # A4: exact per-instance mode ownership.  Record-only queue entry points
+  # synchronously seal bounded Venus payloads; normal mode submits the same
+  # generated queue opcode subset through the queue's nonzero HVC1 context.
+  libvn_files += files('vn_helios_record_submit.c')
   vn_deps += cc.find_library('gdi32')
   # Current mingw-w64's gdi32 import library predates the WDDM 3.1 thunk even
   # though the stock target gdi32.dll exports it.  Generate a one-symbol import

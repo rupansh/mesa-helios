@@ -13,6 +13,10 @@
 
 #include "vn_common.h"
 
+#if defined(_WIN32)
+struct helios_native_context;
+#endif
+
 struct vn_queue {
    struct vn_queue_base base;
 
@@ -24,6 +28,16 @@ struct vn_queue {
 
    /* only used if renderer supports multiple timelines */
    uint32_t ring_idx;
+
+#if defined(_WIN32)
+   /* A4 normal mode: one exact nonzero HVC1 context per real queue.  Emulated
+    * queues point at the owner's context with owner=false.  The mutex is the
+    * bounded queue-local append/seal mutex used only by record-only scopes. */
+   struct helios_native_context *helios_native_context;
+   bool helios_native_context_owner;
+   mtx_t helios_record_mutex;
+   bool helios_record_mutex_live;
+#endif
 
    /* wait fence used for vn_QueueWaitIdle */
    VkFence wait_fence;

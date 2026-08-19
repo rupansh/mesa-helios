@@ -160,6 +160,14 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 
 struct helios_native_context;
 
+/* One imported monitored-fence dependency.  The handle is the exact
+ * process-local object returned by D3DKMTOpenNativeFenceFromNtHandle; it is
+ * never serialized into HNR2. */
+struct helios_native_fence_point {
+   uint32_t handle;
+   uint64_t value;
+};
+
 enum helios_native_context_kind {
    /* Both HVC1 queue ordinals UINT32_MAX. One per raw KMT device; carries only
     * C60 pure control, and its C51 value is NEVER a GPU-complete fact. */
@@ -197,6 +205,21 @@ VkResult helios_native_context_submit(struct helios_native_context *c,
                                       bool signal_progress,
                                       uint64_t *out_batch_token,
                                       uint64_t *out_progress_value);
+
+/* Queue form of submit.  Imported native-fence waits, every HNR2 fragment,
+ * imported native-fence signals, and the optional C51 signal are enqueued in
+ * exactly that order while holding the one context lock.  No CPU wait, helper
+ * context, or renderer timeline participates. */
+VkResult helios_native_context_submit_ordered(
+   struct helios_native_context *c,
+   const struct helios_native_fence_point *waits,
+   uint32_t wait_count,
+   const struct helios_hnr2_batch *batch,
+   const struct helios_native_fence_point *signals,
+   uint32_t signal_count,
+   bool signal_progress,
+   uint64_t *out_batch_token,
+   uint64_t *out_progress_value);
 
 /*
  * C51 CPU waits. `timeout_ns == UINT64_MAX` blocks inside KMT with no event;
@@ -237,6 +260,8 @@ enum helios_native_refusal_site {
    HELIOS_NATIVE_REFUSE_SIGNAL,
    HELIOS_NATIVE_REFUSE_WAIT,
    HELIOS_NATIVE_REFUSE_WAIT_ARMS,
+   HELIOS_NATIVE_REFUSE_NATIVE_FENCE_WAIT,
+   HELIOS_NATIVE_REFUSE_NATIVE_FENCE_SIGNAL,
    HELIOS_NATIVE_REFUSE_CONTEXT_LOST,
    HELIOS_NATIVE_REFUSE_SITE_COUNT,
 };

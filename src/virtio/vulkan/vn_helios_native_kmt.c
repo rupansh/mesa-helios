@@ -510,6 +510,8 @@ static const char *const helios_native_site_names[HELIOS_NATIVE_REFUSE_SITE_COUN
    [HELIOS_NATIVE_REFUSE_SIGNAL] = "signal",
    [HELIOS_NATIVE_REFUSE_WAIT] = "wait",
    [HELIOS_NATIVE_REFUSE_WAIT_ARMS] = "wait_arms",
+   [HELIOS_NATIVE_REFUSE_NATIVE_FENCE_WAIT] = "native_fence_wait",
+   [HELIOS_NATIVE_REFUSE_NATIVE_FENCE_SIGNAL] = "native_fence_signal",
    [HELIOS_NATIVE_REFUSE_CONTEXT_LOST] = "context_lost",
 };
 
@@ -721,15 +723,19 @@ helios_native_context_destroy(struct helios_native_context *c)
    else
       LeaveCriticalSection(&c->lock);
 
-   if (c->fence) {
-      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT ds = { .hSyncObject = c->fence };
-      HELIOS_IGNORE_STATUS(D3DKMTDestroySynchronizationObject(&ds));
-      c->fence = 0;
-   }
+   /* A lost context can still own an accepted Render or imported-fence
+    * operation even though no trustworthy C51 value remains to join.  Cancel
+    * and drain that exact context before revoking the progress object any of
+    * its already-enqueued signals can still reference. */
    if (c->context) {
       D3DKMT_DESTROYCONTEXT dc = { .hContext = c->context };
       HELIOS_IGNORE_STATUS(D3DKMTDestroyContext(&dc));
       c->context = 0;
+   }
+   if (c->fence) {
+      D3DKMT_DESTROYSYNCHRONIZATIONOBJECT ds = { .hSyncObject = c->fence };
+      HELIOS_IGNORE_STATUS(D3DKMTDestroySynchronizationObject(&ds));
+      c->fence = 0;
    }
    for (unsigned i = 0; i < HELIOS_NATIVE_MAX_WAIT_ARMS; i++) {
       if (c->arms[i].event)
@@ -797,6 +803,9 @@ helios_native_resize_lists(struct helios_native_context *c,
 static VkResult
 helios_native_signal_locked(struct helios_native_context *c, uint64_t *out_value)
 {
+   if (c->enqueued == UINT64_MAX)
+      return helios_native_lose(c, HELIOS_NATIVE_REFUSE_SIGNAL,
+                                "progress value exhausted", 0);
    const uint64_t target = c->enqueued + 1;
    D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU sig;
    memset(&sig, 0, sizeof(sig));
@@ -816,13 +825,64 @@ helios_native_signal_locked(struct helios_native_context *c, uint64_t *out_value
    return VK_SUCCESS;
 }
 
-VkResult
-helios_native_context_submit(struct helios_native_context *c,
-                             const struct helios_hnr2_batch *batch,
-                             bool signal_progress, uint64_t *out_batch_token,
-                             uint64_t *out_progress_value)
+static VkResult
+helios_native_enqueue_fence_points_locked(
+   struct helios_native_context *c,
+   const struct helios_native_fence_point *points,
+   uint32_t count,
+   bool signal)
 {
-   if (!c || !batch)
+   for (uint32_t i = 0; i < count; i++) {
+      if (!points[i].handle)
+         return helios_native_lose(
+            c, signal ? HELIOS_NATIVE_REFUSE_NATIVE_FENCE_SIGNAL
+                      : HELIOS_NATIVE_REFUSE_NATIVE_FENCE_WAIT,
+            "zero imported native-fence handle", 0);
+
+      D3DKMT_HANDLE handle = points[i].handle;
+      uint64_t value = points[i].value;
+      NTSTATUS st;
+      if (signal) {
+         D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMGPU op;
+         memset(&op, 0, sizeof(op));
+         op.hContext = c->context;
+         op.ObjectCount = 1;
+         op.ObjectHandleArray = &handle;
+         op.MonitoredFenceValueArray = &value;
+         st = D3DKMTSignalSynchronizationObjectFromGpu(&op);
+      } else {
+         D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU op;
+         memset(&op, 0, sizeof(op));
+         op.hContext = c->context;
+         op.ObjectCount = 1;
+         op.ObjectHandleArray = &handle;
+         op.MonitoredFenceValueArray = &value;
+         st = D3DKMTWaitForSynchronizationObjectFromGpu(&op);
+      }
+      if (st != 0)
+         return helios_native_lose(
+            c, signal ? HELIOS_NATIVE_REFUSE_NATIVE_FENCE_SIGNAL
+                      : HELIOS_NATIVE_REFUSE_NATIVE_FENCE_WAIT,
+            signal ? "SignalSynchronizationObjectFromGpu(imported)"
+                   : "WaitForSynchronizationObjectFromGpu(imported)",
+            (unsigned)st);
+   }
+   return VK_SUCCESS;
+}
+
+VkResult
+helios_native_context_submit_ordered(
+   struct helios_native_context *c,
+   const struct helios_native_fence_point *waits,
+   uint32_t wait_count,
+   const struct helios_hnr2_batch *batch,
+   const struct helios_native_fence_point *signals,
+   uint32_t signal_count,
+   bool signal_progress,
+   uint64_t *out_batch_token,
+   uint64_t *out_progress_value)
+{
+   if (!c || !batch || (wait_count && !waits) || (signal_count && !signals))
       return VK_ERROR_INITIALIZATION_FAILED;
    if (out_batch_token)
       *out_batch_token = 0;
@@ -849,6 +909,26 @@ helios_native_context_submit(struct helios_native_context *c,
       return VK_ERROR_DEVICE_LOST;
    }
 
+   /* KMD owns exactly 64 immutable executor slots per context.  Every queue
+    * call requests a C51 milestone, so waiting the oldest unretired milestone
+    * before admitting the 65th is exact bounded backpressure, not polling and
+    * not a synthetic completion.  The wait helper releases the lock. */
+   while (signal_progress &&
+          c->enqueued - c->completed >=
+             HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS) {
+      const uint64_t retire =
+         c->enqueued - HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS + 1;
+      const VkResult waited = helios_native_wait_locked_release(
+         c, retire, HELIOS_NATIVE_WAIT_INFINITE);
+      if (waited != VK_SUCCESS)
+         return waited;
+      EnterCriticalSection(&c->lock);
+      if (c->lost) {
+         LeaveCriticalSection(&c->lock);
+         return VK_ERROR_DEVICE_LOST;
+      }
+   }
+
    /* The KMD emits one output patch location per use record, so the COMMIT
     * needs both lists at least `allocation_count` long. */
    if (batch->allocation_count > c->allocation_list_entries ||
@@ -865,6 +945,24 @@ helios_native_context_submit(struct helios_native_context *c,
          LeaveCriticalSection(&c->lock);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
+   }
+
+   if (c->next_batch_token == UINT64_MAX) {
+      const VkResult r = helios_native_lose(
+         c, HELIOS_NATIVE_REFUSE_ENCODE, "batch token exhausted", 0);
+      LeaveCriticalSection(&c->lock);
+      return r;
+   }
+
+   /* Nothing above this point submitted queue work.  Imported waits come
+    * only after every pure bound check and the optional list resize, so a
+    * preflight refusal cannot leave an otherwise-live context blocked on a
+    * dependency for a batch the caller was told did not submit. */
+   VkResult result = helios_native_enqueue_fence_points_locked(
+      c, waits, wait_count, false);
+   if (result != VK_SUCCESS) {
+      LeaveCriticalSection(&c->lock);
+      return result;
    }
 
    const uint64_t token = c->next_batch_token + 1;
@@ -954,12 +1052,29 @@ helios_native_context_submit(struct helios_native_context *c,
    if (out_batch_token)
       *out_batch_token = token;
 
-   VkResult result = VK_SUCCESS;
+   result = helios_native_enqueue_fence_points_locked(
+      c, signals, signal_count, true);
+   if (result != VK_SUCCESS) {
+      LeaveCriticalSection(&c->lock);
+      return result;
+   }
+
    if (signal_progress)
       result = helios_native_signal_locked(c, out_progress_value);
 
    LeaveCriticalSection(&c->lock);
    return result;
+}
+
+VkResult
+helios_native_context_submit(struct helios_native_context *c,
+                             const struct helios_hnr2_batch *batch,
+                             bool signal_progress, uint64_t *out_batch_token,
+                             uint64_t *out_progress_value)
+{
+   return helios_native_context_submit_ordered(
+      c, NULL, 0, batch, NULL, 0, signal_progress, out_batch_token,
+      out_progress_value);
 }
 
 VkResult

@@ -11,15 +11,14 @@
 
 #ifdef _WIN32
 
-#include "vn_renderer.h"
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
-
 #include <windows.h>
+
+#include "vn_renderer.h"
 #ifndef _NTDEF_
 typedef LONG NTSTATUS, *PNTSTATUS;
 #endif
@@ -35,14 +34,14 @@ typedef LONG NTSTATUS, *PNTSTATUS;
 #include "vn_instance.h"
 
 #define HELIOS_CPU_VISIBLE_MAX_BYTES (UINT64_C(1024) * UINT64_C(4096))
-#define HELIOS_PRIVATE_DATA_LIMIT (1024u * 1024u)
-#define HELIOS_SESSION_ENDPOINTS 64u
-#define HELIOS_PAGE_BYTES UINT64_C(4096)
+#define HELIOS_PRIVATE_DATA_LIMIT    (1024u * 1024u)
+#define HELIOS_SESSION_ENDPOINTS     64u
+#define HELIOS_PAGE_BYTES            UINT64_C(4096)
 
-#define HELIOS_IGNORE_STATUS(call)                                             \
-   do {                                                                        \
-      NTSTATUS ignored_ = (call);                                              \
-      (void)ignored_;                                                          \
+#define HELIOS_IGNORE_STATUS(call)                                           \
+   do {                                                                      \
+      NTSTATUS ignored_ = (call);                                            \
+      (void)ignored_;                                                        \
    } while (0)
 
 struct helios_allocation {
@@ -129,8 +128,8 @@ helios_round_page(uint64_t size)
 {
    if (!size || size > UINT32_MAX)
       return 0;
-   const uint64_t rounded = (size + HELIOS_PAGE_BYTES - 1) &
-                            ~(HELIOS_PAGE_BYTES - 1);
+   const uint64_t rounded =
+      (size + HELIOS_PAGE_BYTES - 1) & ~(HELIOS_PAGE_BYTES - 1);
    return rounded >= size && rounded <= UINT32_MAX ? rounded : 0;
 }
 
@@ -143,8 +142,9 @@ helios_close_enum_adapter(D3DKMT_HANDLE adapter)
    HELIOS_IGNORE_STATUS(D3DKMTCloseAdapter(&close));
 }
 
-/* Direct OS-owned adapter discovery.  There is no probe Escape and no fallback:
- * exactly one adapter must identify itself as Helios through registry info. */
+/* Direct OS-owned adapter discovery.  There is no probe Escape and no
+ * fallback: exactly one adapter must identify itself as Helios through
+ * registry info. */
 static VkResult
 helios_find_adapter(struct helios *helios)
 {
@@ -195,9 +195,8 @@ helios_find_adapter(struct helios *helios)
       helios_close_enum_adapter(adapters[i].hAdapter);
    free(adapters);
 
-   if (matches != 1 ||
-       (helios->adapter_luid.LowPart == 0 &&
-        helios->adapter_luid.HighPart == 0)) {
+   if (matches != 1 || (helios->adapter_luid.LowPart == 0 &&
+                        helios->adapter_luid.HighPart == 0)) {
       memset(&helios->adapter_luid, 0, sizeof(helios->adapter_luid));
       return VK_ERROR_INITIALIZATION_FAILED;
    }
@@ -278,18 +277,17 @@ helios_allocation_create(struct helios *helios,
                                    : HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE;
    switch (role) {
    case HELIOS_HVM1_ROLE_VULKAN_HOST_VISIBLE:
-      hvm1.access = HELIOS_HVM1_ACCESS_CPU_READ |
-                    HELIOS_HVM1_ACCESS_CPU_WRITE |
-                    HELIOS_HVM1_ACCESS_HOST_READ |
-                    HELIOS_HVM1_ACCESS_HOST_WRITE;
+      hvm1.access =
+         HELIOS_HVM1_ACCESS_CPU_READ | HELIOS_HVM1_ACCESS_CPU_WRITE |
+         HELIOS_HVM1_ACCESS_HOST_READ | HELIOS_HVM1_ACCESS_HOST_WRITE;
       break;
    case HELIOS_HVM1_ROLE_FEEDBACK:
-      hvm1.access = HELIOS_HVM1_ACCESS_CPU_READ |
-                    HELIOS_HVM1_ACCESS_HOST_WRITE;
+      hvm1.access =
+         HELIOS_HVM1_ACCESS_CPU_READ | HELIOS_HVM1_ACCESS_HOST_WRITE;
       break;
    case HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL:
-      hvm1.access = HELIOS_HVM1_ACCESS_HOST_READ |
-                    HELIOS_HVM1_ACCESS_HOST_WRITE;
+      hvm1.access =
+         HELIOS_HVM1_ACCESS_HOST_READ | HELIOS_HVM1_ACCESS_HOST_WRITE;
       break;
    default:
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -419,12 +417,11 @@ helios_bo_create_from_device_memory(
    struct helios_bo *bo = calloc(1, sizeof(*bo));
    if (!bo)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
-   const uint32_t role =
-      (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-         ? HELIOS_HVM1_ROLE_VULKAN_HOST_VISIBLE
-         : HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL;
-   VkResult result = helios_allocation_create(
-      helios_from_renderer(renderer), size, role, &bo->allocation);
+   const uint32_t role = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                            ? HELIOS_HVM1_ROLE_VULKAN_HOST_VISIBLE
+                            : HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL;
+   VkResult result = helios_allocation_create(helios_from_renderer(renderer),
+                                              size, role, &bo->allocation);
    if (result != VK_SUCCESS) {
       free(bo);
       return result;
@@ -646,10 +643,20 @@ vn_renderer_helios_sync_create_from_win32(
    uint8_t reserved_or = 0;
    for (size_t i = 40; i < HNF1_BYTES; i++)
       reserved_or |= open.PrivateDriverData[i];
+   for (size_t i = 0; i < sizeof(open.NativeFenceMapping.Reserved); i++)
+      reserved_or |= open.NativeFenceMapping.Reserved[i];
+   for (size_t i = 0; i < sizeof(open.Reserved); i++)
+      reserved_or |= open.Reserved[i];
+   const uintptr_t current_cpu =
+      (uintptr_t)open.NativeFenceMapping.CurrentValueCpuVa;
    if (st != 0 || !open.hSyncObject ||
        !open.NativeFenceMapping.CurrentValueCpuVa ||
        !open.NativeFenceMapping.CurrentValueGpuVa ||
        !open.NativeFenceMapping.MonitoredValueGpuVa ||
+       (current_cpu & (sizeof(uint64_t) - 1)) ||
+       (open.NativeFenceMapping.CurrentValueGpuVa & (sizeof(uint64_t) - 1)) ||
+       (open.NativeFenceMapping.MonitoredValueGpuVa &
+        (sizeof(uint64_t) - 1)) ||
        helios_load_u32(open.PrivateDriverData, 0) != HNF1_MAGIC ||
        helios_load_u16(open.PrivateDriverData, 4) != HNF1_ABI ||
        helios_load_u16(open.PrivateDriverData, 6) != HNF1_BYTES ||
@@ -763,12 +770,10 @@ vn_renderer_helios_external_memory_open(
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
-   void *resource_private = resource_private_bytes
-                               ? calloc(1, resource_private_bytes)
-                               : NULL;
-   void *total_private = total_private_bytes
-                            ? calloc(1, total_private_bytes)
-                            : NULL;
+   void *resource_private =
+      resource_private_bytes ? calloc(1, resource_private_bytes) : NULL;
+   void *total_private =
+      total_private_bytes ? calloc(1, total_private_bytes) : NULL;
    if ((resource_private_bytes && !resource_private) ||
        (total_private_bytes && !total_private)) {
       free(total_private);
@@ -800,22 +805,20 @@ vn_renderer_helios_external_memory_open(
    const bool desc_valid =
       st == 0 && open.hResource && open.NumAllocations == 1 &&
       allocation_info[0].hAllocation &&
-      helios_hwa2_from_private_data(
-         allocation_info[0].pPrivateDriverData,
-         allocation_info[0].PrivateDriverDataSize, total_private,
-         total_private_bytes, &desc, &reject) &&
-      helios_hwa2_validate_create_output(
-         &desc, HELIOS_PACKAGE_GENERATION, &reject);
+      helios_hwa2_from_private_data(allocation_info[0].pPrivateDriverData,
+                                    allocation_info[0].PrivateDriverDataSize,
+                                    total_private, total_private_bytes, &desc,
+                                    &reject) &&
+      helios_hwa2_validate_create_output(&desc, HELIOS_PACKAGE_GENERATION,
+                                         &reject);
    const bool admitted =
       desc_valid &&
       (desc.allocation_kind == HELIOS_HWA2_KIND_BUFFER ||
        desc.allocation_kind == HELIOS_HWA2_KIND_IMAGE) &&
-      (desc.flags & (HELIOS_HWA2_FLAG_SHARED |
-                     HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)) ==
-         (HELIOS_HWA2_FLAG_SHARED |
-          HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED) &&
-      desc.byte_size &&
-      !open.hKeyedMutex && !open.hSyncObject;
+      (desc.flags &
+       (HELIOS_HWA2_FLAG_SHARED | HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)) ==
+         (HELIOS_HWA2_FLAG_SHARED | HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED) &&
+      desc.byte_size && !open.hKeyedMutex && !open.hSyncObject;
 
    /* Vulkan ignores allocationSize for D3D12_RESOURCE imports.  Keeping it in
     * the signature makes that deliberate and prevents a later caller from
@@ -960,13 +963,14 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
    uint64_t raw_reply_bytes = 0;
    int32_t reply_status = VK_ERROR_DEVICE_LOST;
    EnterCriticalSection(&helios->bootstrap_lock);
-   VkResult result = helios->bootstrap
-      ? helios_session_execute_allocate(
-           helios->session, helios->bootstrap, payload, payload_size,
-           (uint32_t)import_operand_offset, bo->allocation.allocation,
-           bo->allocation.generation, raw_reply, sizeof(raw_reply),
-           &raw_reply_bytes, &reply_status)
-      : VK_ERROR_DEVICE_LOST;
+   VkResult result =
+      helios->bootstrap
+         ? helios_session_execute_allocate(
+              helios->session, helios->bootstrap, payload, payload_size,
+              (uint32_t)import_operand_offset, bo->allocation.allocation,
+              bo->allocation.generation, raw_reply, sizeof(raw_reply),
+              &raw_reply_bytes, &reply_status)
+         : VK_ERROR_DEVICE_LOST;
    if (result != VK_SUCCESS && helios->bootstrap) {
       /* Render may have been accepted before its progress signal/wait failed.
        * Destroying this exact context is the only permitted cancel/drain; the
@@ -984,8 +988,8 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
    struct vn_cs_decoder decoder =
       VN_CS_DECODER_INITIALIZER(raw_reply, sizeof(raw_reply));
    VkDeviceMemory returned_memory = *memory;
-   result = vn_decode_vkAllocateMemory_reply(
-      &decoder, device, &local, NULL, &returned_memory);
+   result = vn_decode_vkAllocateMemory_reply(&decoder, device, &local, NULL,
+                                             &returned_memory);
    if ((int32_t)result != reply_status ||
        (result == VK_SUCCESS && returned_memory != *memory))
       return VK_ERROR_DEVICE_LOST;
@@ -1027,13 +1031,13 @@ vn_renderer_helios_free_memory(struct vn_renderer *renderer,
    uint64_t batch_token = 0;
    uint64_t progress = 0;
    EnterCriticalSection(&helios->bootstrap_lock);
-   VkResult result = helios->bootstrap
-      ? helios_native_context_submit(
-           helios->bootstrap, &batch, true, &batch_token, &progress)
-      : VK_ERROR_DEVICE_LOST;
+   VkResult result = helios->bootstrap ? helios_native_context_submit(
+                                            helios->bootstrap, &batch, true,
+                                            &batch_token, &progress)
+                                       : VK_ERROR_DEVICE_LOST;
    if (result == VK_SUCCESS)
-      result = helios_native_context_wait(
-         helios->bootstrap, progress, HELIOS_NATIVE_WAIT_INFINITE);
+      result = helios_native_context_wait(helios->bootstrap, progress,
+                                          HELIOS_NATIVE_WAIT_INFINITE);
    if (result != VK_SUCCESS && helios->bootstrap) {
       /* See AllocateMemory above: context destruction precedes allocation
        * revocation even when the terminal host result cannot be observed. */
@@ -1058,6 +1062,15 @@ vn_renderer_helios_endpoint_capacity(const struct vn_renderer *renderer)
 {
    return helios_session_endpoint_capacity(
       helios_from_renderer_const(renderer)->session);
+}
+
+uint32_t
+vn_renderer_helios_device_handle(const struct vn_renderer *renderer)
+{
+   const struct helios *helios = helios_from_renderer_const(renderer);
+   return helios && helios->session
+             ? helios_session_device_handle(helios->session)
+             : 0;
 }
 
 static VkResult
@@ -1089,8 +1102,12 @@ helios_renderer_info_init(struct helios *helios)
    info->vk_ext_command_serialization_spec_version = 1;
    info->vk_mesa_venus_protocol_spec_version = 4;
    memset(info->vk_extension_mask, 0, sizeof(info->vk_extension_mask));
+   /* `max_timeline_count` is an exclusive ring-index limit and ring zero is
+    * control-only.  K11 publishes 64 nonzero endpoints, hence 65 indices;
+    * the dedicated allocation bootstrap consumes endpoint 1 and real queues
+    * consume the remaining 2..64 in exact creation order. */
    info->max_timeline_count =
-      helios_session_endpoint_capacity(helios->session);
+      helios_session_endpoint_capacity(helios->session) + 1;
    info->has_dma_buf_import = false;
    info->has_external_sync = true;
    info->has_implicit_fencing = false;
@@ -1155,9 +1172,8 @@ vn_renderer_create_helios(struct vn_instance *instance,
                           struct vn_renderer **out_renderer)
 {
    *out_renderer = NULL;
-   struct helios *helios = vk_zalloc(
-      alloc, sizeof(*helios), VN_DEFAULT_ALIGN,
-      VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   struct helios *helios = vk_zalloc(alloc, sizeof(*helios), VN_DEFAULT_ALIGN,
+                                     VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
    if (!helios)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    helios->instance = instance;
@@ -1172,9 +1188,9 @@ vn_renderer_create_helios(struct vn_instance *instance,
          helios->adapter_luid, HELIOS_SESSION_ENDPOINTS, &helios->session);
    if (result == VK_SUCCESS) {
       helios->device = helios_session_device_handle(helios->session);
-      result = helios_native_context_create(
-         helios->device, HELIOS_NATIVE_CONTEXT_QUEUE, 0, 0,
-         &helios->bootstrap);
+      result = helios_native_context_create(helios->device,
+                                            HELIOS_NATIVE_CONTEXT_QUEUE, 0, 0,
+                                            &helios->bootstrap);
    }
    if (result == VK_SUCCESS) {
       D3DKMT_CREATEPAGINGQUEUE create;
@@ -1225,14 +1241,17 @@ vn_renderer_create_helios(struct vn_instance *instance,
 /* venus never compiles SPIR-V in the guest, but vk_util's object needs these
  * link symbols in the lean Windows ICD. */
 struct nir_spirv_specialization;
-struct nir_spirv_specialization *vtn_alloc_specialization(uint32_t count);
-bool vtn_add_specialization_entry(struct nir_spirv_specialization *spec,
-                                  uint32_t slot,
-                                  uint32_t entry_id,
-                                  uint32_t entry_size,
-                                  const void *entry_data,
-                                  bool defined_on_module);
-void vtn_free_specialization(struct nir_spirv_specialization *spec);
+struct nir_spirv_specialization *
+vtn_alloc_specialization(uint32_t count);
+bool
+vtn_add_specialization_entry(struct nir_spirv_specialization *spec,
+                             uint32_t slot,
+                             uint32_t entry_id,
+                             uint32_t entry_size,
+                             const void *entry_data,
+                             bool defined_on_module);
+void
+vtn_free_specialization(struct nir_spirv_specialization *spec);
 
 struct nir_spirv_specialization *
 vtn_alloc_specialization(uint32_t count)

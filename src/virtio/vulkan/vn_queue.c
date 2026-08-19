@@ -25,12 +25,16 @@
 #include "vn_renderer.h"
 #include "vn_wsi.h"
 
-#include "util/os_time.h"
-#include "util/u_debug.h"
+#if DETECT_OS_WINDOWS
+#include "vn_helios_record_submit.h"
+#endif
 
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "util/os_time.h"
+#include "util/u_debug.h"
 
 #if DETECT_OS_WINDOWS
 #include <windows.h>
@@ -39,7 +43,8 @@
 /* queue commands */
 
 #if DETECT_OS_WINDOWS
-void vn_renderer_helios_diag_log(const char *fmt, ...);
+void
+vn_renderer_helios_diag_log(const char *fmt, ...);
 #endif
 
 struct helios_queue_submit2_perf {
@@ -102,11 +107,11 @@ helios_queue_submit2_perf_write(void)
          fp = stderr;
    }
 
-#define HELIOS_AVG_US(ns)                                                      \
-   ((double)(ns) / 1000.0 /                                                    \
-    (double)(helios_queue_submit2_perf.calls ?                                \
-                helios_queue_submit2_perf.calls :                             \
-                1))
+#define HELIOS_AVG_US(ns)                                                    \
+   ((double)(ns) / 1000.0 /                                                  \
+    (double)(helios_queue_submit2_perf.calls                                 \
+                ? helios_queue_submit2_perf.calls                            \
+                : 1))
 
    fprintf(fp,
            "Helios QueueSubmit2 pid=%lu mono_ms=%" PRIu64 " calls=%" PRIu64
@@ -121,8 +126,7 @@ helios_queue_submit2_perf_write(void)
 #else
            0ul,
 #endif
-           os_time_get_nano() / 1000000ull,
-           helios_queue_submit2_perf.calls,
+           os_time_get_nano() / 1000000ull, helios_queue_submit2_perf.calls,
            helios_queue_submit2_perf.tls_ns / 1000000.0,
            HELIOS_AVG_US(helios_queue_submit2_perf.tls_ns),
            helios_queue_submit2_perf.wsi_flush_ns / 1000000.0,
@@ -161,8 +165,7 @@ helios_queue_submit2_perf_note(uint64_t tls_ns,
    helios_queue_submit2_perf.submit_ns += submit_ns;
    helios_queue_submit2_perf.wsi_fence_wait_ns += wsi_fence_wait_ns;
 
-   if (helios_queue_submit2_perf.calls %
-          helios_queue_submit2_perf.interval ==
+   if (helios_queue_submit2_perf.calls % helios_queue_submit2_perf.interval ==
        0)
       helios_queue_submit2_perf_write();
 }
@@ -483,11 +486,10 @@ helios_diag_one_semaphore(struct vn_queue_submission *submit,
    *out_has_win32 = payload && payload->win32_sync ? 1u : 0u;
    *out_value = 0;
    if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE) {
-      *out_value = signal
-                      ? vn_get_signal_semaphore_counter(submit, batch_index,
-                                                        sem_index)
-                      : vn_get_wait_semaphore_counter(submit, batch_index,
-                                                      sem_index);
+      *out_value =
+         signal
+            ? vn_get_signal_semaphore_counter(submit, batch_index, sem_index)
+            : vn_get_wait_semaphore_counter(submit, batch_index, sem_index);
    }
 }
 
@@ -503,7 +505,8 @@ helios_diag_queue_submit_shape(struct vn_queue_submission *submit,
 
    struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
    vn_renderer_helios_diag_log(
-      "HELIOS submit-shape #%u %s type=%s batches=%u fence=%llu qring=%u seq=%u",
+      "HELIOS submit-shape #%u %s type=%s batches=%u fence=%llu qring=%u "
+      "seq=%u",
       n, phase, helios_submit_batch_type_name(submit->batch_type),
       submit->batch_count, (unsigned long long)submit->fence_handle,
       queue->ring_idx, seqno);
@@ -536,9 +539,9 @@ helios_diag_queue_submit_shape(struct vn_queue_submission *submit,
          "sig0={id=%llu type=%u payload=%u win32=%u value=%llu}",
          n, i, wait_count, cmd_count, signal_count,
          (unsigned long long)wait_id, wait_type, wait_payload, wait_win32,
-         (unsigned long long)wait_value,
-         (unsigned long long)signal_id, signal_type, signal_payload,
-         signal_win32, (unsigned long long)signal_value);
+         (unsigned long long)wait_value, (unsigned long long)signal_id,
+         signal_type, signal_payload, signal_win32,
+         (unsigned long long)signal_value);
    }
 }
 #endif
@@ -1101,7 +1104,8 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
    uint64_t wait_value = 0;
    if (vn_get_wait_semaphore_count(submit, batch_index)) {
       wait_sem_handle = vn_get_wait_semaphore(submit, batch_index, 0);
-      struct vn_semaphore *wait_sem = vn_semaphore_from_handle(wait_sem_handle);
+      struct vn_semaphore *wait_sem =
+         vn_semaphore_from_handle(wait_sem_handle);
       wait_sem_id = wait_sem ? wait_sem->base.id : 0;
       wait_value = vn_get_wait_semaphore_counter(submit, batch_index, 0);
    }
@@ -1111,9 +1115,8 @@ vn_queue_submission_add_semaphore_feedback(struct vn_queue_submission *submit,
     * vn_semaphore_get_feedback_cmd. */
    const uint64_t counter =
       vn_get_signal_semaphore_counter(submit, batch_index, signal_index);
-   struct vn_semaphore_feedback_cmd *sfb_cmd =
-      vn_semaphore_get_feedback_cmd(dev, sem, counter, wait_sem_handle,
-                                    wait_sem_id, wait_value);
+   struct vn_semaphore_feedback_cmd *sfb_cmd = vn_semaphore_get_feedback_cmd(
+      dev, sem, counter, wait_sem_handle, wait_sem_id, wait_value);
    if (!sfb_cmd)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -1368,8 +1371,8 @@ vn_queue_submission_cleanup(struct vn_queue_submission *submit)
 
 #if DETECT_OS_WINDOWS
 static void
-helios_queue_submission_stamp_feedback_seqno(struct vn_queue_submission *submit,
-                                             uint32_t ring_seqno)
+helios_queue_submission_stamp_feedback_seqno(
+   struct vn_queue_submission *submit, uint32_t ring_seqno)
 {
    if (!(submit->feedback_types & VN_FEEDBACK_TYPE_SEMAPHORE))
       return;
@@ -1400,11 +1403,12 @@ helios_queue_submission_stamp_feedback_seqno(struct vn_queue_submission *submit,
 }
 
 static bool
-helios_should_fence_internal_timeline_submit(struct vn_queue_submission *submit,
-                                             uint64_t *out_wait_sem_id,
-                                             uint64_t *out_wait_value,
-                                             uint64_t *out_signal_sem_id,
-                                             uint64_t *out_signal_value)
+helios_should_fence_internal_timeline_submit(
+   struct vn_queue_submission *submit,
+   uint64_t *out_wait_sem_id,
+   uint64_t *out_wait_value,
+   uint64_t *out_signal_sem_id,
+   uint64_t *out_signal_value)
 {
    static int cached = -1;
    static uint32_t probe_count;
@@ -1471,8 +1475,8 @@ helios_should_fence_internal_timeline_submit(struct vn_queue_submission *submit,
    if (!has_wait || !has_cmd || !has_internal_timeline_signal)
       return false;
 
-   const uint32_t limit =
-      MAX2(1, debug_get_num_option("HELIOS_FENCE_INTERNAL_TIMELINE_LIMIT", 8));
+   const uint32_t limit = MAX2(
+      1, debug_get_num_option("HELIOS_FENCE_INTERNAL_TIMELINE_LIMIT", 8));
    const uint32_t n = p_atomic_inc_return(&probe_count);
    return n <= limit;
 }
@@ -1487,9 +1491,8 @@ helios_wait_probe_fence(struct vn_device *dev,
                         uint64_t signal_sem_id,
                         uint64_t signal_value)
 {
-   const uint64_t timeout_ms =
-      MAX2(1, debug_get_num_option("HELIOS_FENCE_INTERNAL_TIMELINE_MS",
-                                   2000));
+   const uint64_t timeout_ms = MAX2(
+      1, debug_get_num_option("HELIOS_FENCE_INTERNAL_TIMELINE_MS", 2000));
    const int64_t start_ns = os_time_get_nano();
    const int64_t deadline_ns = start_ns + (int64_t)timeout_ms * 1000000;
    VkResult result = VK_NOT_READY;
@@ -1599,8 +1602,8 @@ helios_try_fold_wait_only_submit(struct vn_device *dev,
          return VK_SUCCESS;
 
       for (uint32_t j = 0; j < wait_count; j++) {
-         struct vn_semaphore *sem = vn_semaphore_from_handle(
-            vn_get_wait_semaphore(submit, i, j));
+         struct vn_semaphore *sem =
+            vn_semaphore_from_handle(vn_get_wait_semaphore(submit, i, j));
          if (sem->type != VK_SEMAPHORE_TYPE_TIMELINE)
             return VK_SUCCESS;
       }
@@ -1610,11 +1613,9 @@ helios_try_fold_wait_only_submit(struct vn_device *dev,
       const uint32_t wait_count = vn_get_wait_semaphore_count(submit, i);
       for (uint32_t j = 0; j < wait_count; j++) {
          VkSemaphore sem = vn_get_wait_semaphore(submit, i, j);
-         const uint64_t value =
-            vn_get_wait_semaphore_counter(submit, i, j);
-         VkResult result =
-            helios_wait_for_timeline_value(vk_device_to_handle(&dev->base.vk),
-                                           sem, value);
+         const uint64_t value = vn_get_wait_semaphore_counter(submit, i, j);
+         VkResult result = helios_wait_for_timeline_value(
+            vk_device_to_handle(&dev->base.vk), sem, value);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -1629,18 +1630,20 @@ helios_try_fold_wait_only_submit(struct vn_device *dev,
  *
  * Returns true iff `value` STRICTLY advances the max (i.e. this is a fresh,
  * monotonic host signal the caller should forward). Returns false iff a value
- * >= `value` was already forwarded to the host: the explicit vn_SignalSemaphore
- * forward must then be SKIPPED, because re-forwarding it trips
- * VUID-VkSemaphoreSignalInfo-value-03258 (host: "value N must be greater than
- * current M"), which kills the renderer context and drops dwm into a terminal
- * VK_ERROR_DEVICE_LOST loop (black desktop). Skipping is semantically safe: a
- * prior signal already advanced the timeline past `value`.
+ * >= `value` was already forwarded to the host: the explicit
+ * vn_SignalSemaphore forward must then be SKIPPED, because re-forwarding it
+ * trips VUID-VkSemaphoreSignalInfo-value-03258 (host: "value N must be
+ * greater than current M"), which kills the renderer context and drops dwm
+ * into a terminal VK_ERROR_DEVICE_LOST loop (black desktop). Skipping is
+ * semantically safe: a prior signal already advanced the timeline past
+ * `value`.
  *
  * The queue-submit signal path calls this to RECORD progress (ignoring the
- * result — queued signals are monotonic per app contract and are already baked
- * into the forwarded batch); vn_SignalSemaphore calls it to gate the explicit
- * host forward. Lock-free CAS loop so it is valid for win32 timelines with no
- * feedback slot (whose counter_mtx is never initialized). */
+ * result — queued signals are monotonic per app contract and are already
+ * baked into the forwarded batch); vn_SignalSemaphore calls it to gate the
+ * explicit host forward. Lock-free CAS loop so it is valid for win32
+ * timelines with no feedback slot (whose counter_mtx is never initialized).
+ */
 static bool
 helios_sem_claim_host_signal(struct vn_semaphore *sem, uint64_t value)
 {
@@ -1648,8 +1651,8 @@ helios_sem_claim_host_signal(struct vn_semaphore *sem, uint64_t value)
    for (;;) {
       if (value <= prev)
          return false;
-      uint64_t got = p_atomic_cmpxchg(&sem->helios_max_forwarded_host_value,
-                                      prev, value);
+      uint64_t got =
+         p_atomic_cmpxchg(&sem->helios_max_forwarded_host_value, prev, value);
       if (got == prev)
          return true;
       prev = got;
@@ -1674,8 +1677,7 @@ helios_sem_should_forward_host_signal(VkDevice dev_handle,
 
    if (!helios_sem_claim_host_signal(sem, value)) {
       *out_forward = false;
-      *out_seen_value =
-         p_atomic_read(&sem->helios_max_forwarded_host_value);
+      *out_seen_value = p_atomic_read(&sem->helios_max_forwarded_host_value);
       *out_seen_source = "local-max";
       return VK_SUCCESS;
    }
@@ -1823,7 +1825,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
 #if DETECT_OS_WINDOWS
       helios_probe_fence != VK_NULL_HANDLE ? helios_probe_fence :
 #endif
-                                             submit->fence_handle;
+                                           submit->fence_handle;
 
    phase_t0 = os_time_get_nano();
    if (VN_PERF(NO_ASYNC_QUEUE_SUBMIT)) {
@@ -1840,7 +1842,8 @@ vn_queue_submit(struct vn_queue_submission *submit)
       if (result != VK_SUCCESS) {
 #if DETECT_OS_WINDOWS
          if (helios_probe_fence != VK_NULL_HANDLE)
-            vn_DestroyFence(helios_probe_dev_handle, helios_probe_fence, NULL);
+            vn_DestroyFence(helios_probe_dev_handle, helios_probe_fence,
+                            NULL);
 #endif
          vn_queue_submission_cleanup(submit);
          return vn_error(instance, result);
@@ -1853,14 +1856,14 @@ vn_queue_submit(struct vn_queue_submission *submit)
             submit->submit2_batches, submit_fence_handle, &ring_submit);
       } else {
          vn_submit_vkQueueSubmit(dev->primary_ring, 0, submit->queue_handle,
-                                 submit->batch_count,
-                                 submit->submit_batches, submit_fence_handle,
-                                 &ring_submit);
+                                 submit->batch_count, submit->submit_batches,
+                                 submit_fence_handle, &ring_submit);
       }
       if (!ring_submit.ring_seqno_valid) {
 #if DETECT_OS_WINDOWS
          if (helios_probe_fence != VK_NULL_HANDLE)
-            vn_DestroyFence(helios_probe_dev_handle, helios_probe_fence, NULL);
+            vn_DestroyFence(helios_probe_dev_handle, helios_probe_fence,
+                            NULL);
 #endif
          vn_queue_submission_cleanup(submit);
          return vn_error(instance, VK_ERROR_DEVICE_LOST);
@@ -1938,8 +1941,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
                sem->type == VK_SEMAPHORE_TYPE_TIMELINE
                   ? vn_get_signal_semaphore_counter(submit, i, j)
                   : 1;
-            result =
-               vn_signal_win32_external_semaphore(dev, sem, value);
+            result = vn_signal_win32_external_semaphore(dev, sem, value);
             if (result != VK_SUCCESS) {
                vn_queue_submission_cleanup(submit);
                return vn_error(instance, result);
@@ -1966,6 +1968,12 @@ vn_QueueSubmit(VkQueue queue,
 {
    VN_TRACE_FUNC();
 
+#if DETECT_OS_WINDOWS
+   struct vn_queue *vn_queue = vn_queue_from_handle(queue);
+   struct vn_device *dev = vn_device_from_vk(vn_queue->base.vk.base.device);
+   return vn_error(dev->instance, vn_helios_queue_submit(
+                                     vn_queue, submitCount, pSubmits, fence));
+#else
    vn_tls_set_async_pipeline_create();
    vn_wsi_flush(vn_queue_from_handle(queue));
    VK_FROM_HANDLE(vk_queue, queue_vk, queue);
@@ -1981,6 +1989,7 @@ vn_QueueSubmit(VkQueue queue,
    };
 
    return vn_queue_submit(&submit);
+#endif
 }
 
 static VkResult
@@ -2027,7 +2036,8 @@ vn_queue_submit_2_to_1(struct vn_device *dev,
          _cmd_dev_indices[i] = submit->pCommandBufferInfos[i].deviceMask;
       }
       for (uint32_t i = 0; i < submit->signalSemaphoreInfoCount; i++) {
-         _signal_dev_indices[i] = submit->pSignalSemaphoreInfos[i].deviceIndex;
+         _signal_dev_indices[i] =
+            submit->pSignalSemaphoreInfos[i].deviceIndex;
       }
       _group = (VkDeviceGroupSubmitInfo){
          .sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_SUBMIT_INFO,
@@ -2129,6 +2139,11 @@ vn_QueueSubmit2(VkQueue _queue,
    VK_FROM_HANDLE(vk_queue, queue_vk, _queue);
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
    struct vn_queue *queue = vn_queue_from_handle(_queue);
+
+#if DETECT_OS_WINDOWS
+   return vn_error(dev->instance, vn_helios_queue_submit2(queue, submitCount,
+                                                          pSubmits, fence));
+#else
    VkResult result;
    uint64_t helios_start_ns;
    uint64_t helios_tls_ns = 0;
@@ -2167,10 +2182,9 @@ vn_QueueSubmit2(VkQueue _queue,
                    __func__, submitCount, (void *)(uintptr_t)fence,
                    vk_Result_to_str(result));
          }
-         helios_queue_submit2_perf_note(helios_tls_ns, helios_wsi_flush_ns,
-                                        helios_cache_flush_ns,
-                                        helios_submit_ns,
-                                        helios_wsi_fence_wait_ns);
+         helios_queue_submit2_perf_note(
+            helios_tls_ns, helios_wsi_flush_ns, helios_cache_flush_ns,
+            helios_submit_ns, helios_wsi_fence_wait_ns);
          return result;
       }
    } else {
@@ -2188,10 +2202,9 @@ vn_QueueSubmit2(VkQueue _queue,
                       vk_Result_to_str(result));
             }
             helios_submit_ns = os_time_get_nano() - helios_start_ns;
-            helios_queue_submit2_perf_note(helios_tls_ns, helios_wsi_flush_ns,
-                                           helios_cache_flush_ns,
-                                           helios_submit_ns,
-                                           helios_wsi_fence_wait_ns);
+            helios_queue_submit2_perf_note(
+               helios_tls_ns, helios_wsi_flush_ns, helios_cache_flush_ns,
+               helios_submit_ns, helios_wsi_fence_wait_ns);
             return result;
          }
       }
@@ -2213,6 +2226,7 @@ vn_QueueSubmit2(VkQueue _queue,
                                   helios_wsi_fence_wait_ns);
 
    return result;
+#endif
 }
 
 static VkResult
@@ -2398,6 +2412,12 @@ vn_QueueBindSparse(VkQueue queue,
    VN_TRACE_FUNC();
    VK_FROM_HANDLE(vk_queue, queue_vk, queue);
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
+
+#if DETECT_OS_WINDOWS
+   return vn_error(dev->instance, vn_helios_queue_bind_sparse(
+                                     vn_queue_from_handle(queue),
+                                     bindInfoCount, pBindInfo, fence));
+#else
    VkResult result;
 
    vn_wsi_flush(vn_queue_from_handle(queue));
@@ -2441,6 +2461,7 @@ vn_QueueBindSparse(VkQueue queue,
    }
 
    return VK_SUCCESS;
+#endif
 }
 
 static void
@@ -2455,6 +2476,10 @@ vn_QueueWaitIdle(VkQueue _queue)
    struct vn_queue *queue = vn_queue_from_handle(_queue);
    VkDevice dev_handle = vk_device_to_handle(queue->base.vk.base.device);
    struct vn_device *dev = vn_device_from_handle(dev_handle);
+
+#if DETECT_OS_WINDOWS
+   return vn_result(dev->instance, vn_helios_queue_wait_idle(queue));
+#else
    VkResult result;
 
    vn_wsi_flush(queue);
@@ -2486,6 +2511,7 @@ vn_QueueWaitIdle(VkQueue _queue)
       vn_device_memory_invalidate_coherent_cached_mappings(dev);
 
    return vn_result(dev->instance, result);
+#endif
 }
 
 /* fence commands */
@@ -2617,10 +2643,9 @@ vn_fence_fix_create_info(const VkFenceCreateInfo *create_info,
       switch (src->sType) {
       case VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO:
          memcpy(&local_info->export, src, sizeof(local_info->export));
-         local_info->export.handleTypes &=
-            ~(VkExternalFenceHandleTypeFlags)(
-               VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-               VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
+         local_info->export.handleTypes &= ~(
+            VkExternalFenceHandleTypeFlags)(VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                            VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
          if (!local_info->export.handleTypes)
             break;
          next = &local_info->export;
@@ -3119,7 +3144,8 @@ vn_semaphore_wait_external(struct vn_device *dev, struct vn_semaphore *sem)
 }
 
 struct vn_semaphore_feedback_cmd *
-vn_semaphore_get_feedback_cmd(struct vn_device *dev, struct vn_semaphore *sem,
+vn_semaphore_get_feedback_cmd(struct vn_device *dev,
+                              struct vn_semaphore *sem,
                               uint64_t counter,
                               VkSemaphore wait_sem_handle,
                               uint64_t wait_sem_id,
@@ -3298,11 +3324,10 @@ vn_semaphore_fix_create_info(const VkSemaphoreCreateInfo *create_info,
          break;
       case VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO:
          memcpy(&local_info->export, src, sizeof(local_info->export));
-         local_info->export.handleTypes &=
-            ~(VkExternalSemaphoreHandleTypeFlags)(
-               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
-               VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT);
+         local_info->export.handleTypes &= ~(
+            VkExternalSemaphoreHandleTypeFlags)(VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                                VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+                                                VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT);
          if (!local_info->export.handleTypes)
             break;
          next = &local_info->export;
@@ -3397,9 +3422,10 @@ vn_CreateSemaphore(VkDevice device,
       result = vn_call_vkCreateSemaphore(dev->primary_ring, device,
                                          host_create_info, NULL, &sem_handle);
       if (result != VK_SUCCESS) {
-         vn_log(dev->instance,
-                "external semaphore host create failed: %d (handleTypes 0x%x)",
-                result, export_info ? export_info->handleTypes : 0);
+         vn_log(
+            dev->instance,
+            "external semaphore host create failed: %d (handleTypes 0x%x)",
+            result, export_info ? export_info->handleTypes : 0);
          if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
             vn_semaphore_feedback_fini(dev, sem);
          goto out_payloads_fini;
@@ -3495,7 +3521,8 @@ vn_helios_sem_deadline_strikes(void)
 }
 
 /* Defined by the selected Windows renderer diagnostic sink. */
-void vn_renderer_helios_diag_log(const char *fmt, ...);
+void
+vn_renderer_helios_diag_log(const char *fmt, ...);
 
 static VkResult
 vn_get_semaphore_counter_value(VkDevice dev_handle,
@@ -3688,8 +3715,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                sem->feedback.last_signal_wait_sem_handle;
             const uint64_t wait_sem_id =
                sem->feedback.last_signal_wait_sem_id;
-            const uint64_t wait_value =
-               sem->feedback.last_signal_wait_value;
+            const uint64_t wait_value = sem->feedback.last_signal_wait_value;
             VkSemaphore pending_wait_sem_handle = VK_NULL_HANDLE;
             uint64_t pending_wait_sem_id = 0;
             uint64_t pending_wait_value = 0;
@@ -3732,9 +3758,10 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
             if (wait_sem && wait_sem->type == VK_SEMAPHORE_TYPE_TIMELINE) {
                if (wait_sem->feedback.slot) {
                   simple_mtx_lock(&wait_sem->feedback.counter_mtx);
-                  wait_slot = vn_feedback_get_counter(wait_sem->feedback.slot);
-                  wait_slot = MAX2(wait_slot,
-                                   wait_sem->feedback.signaled_counter);
+                  wait_slot =
+                     vn_feedback_get_counter(wait_sem->feedback.slot);
+                  wait_slot =
+                     MAX2(wait_slot, wait_sem->feedback.signaled_counter);
                   simple_mtx_unlock(&wait_sem->feedback.counter_mtx);
                }
                wait_result = vn_call_vkGetSemaphoreCounterValue(
@@ -3747,14 +3774,13 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                                              pending_ring_seqno)
                   : false;
             const uint32_t max_strikes = vn_helios_sem_deadline_strikes();
-            vn_log(dev->instance,
-                   "HELIOS: semaphore forward-progress deadline window %u/%u "
-                   "with zero movement (slot=%" PRIu64 " renderer=%" PRIu64
-                   ")%s",
-                   strikes, max_strikes, counter, tmp,
-                   strikes >= max_strikes
-                      ? " — treating renderer context as lost"
-                      : "");
+            vn_log(
+               dev->instance,
+               "HELIOS: semaphore forward-progress deadline window %u/%u "
+               "with zero movement (slot=%" PRIu64 " renderer=%" PRIu64 ")%s",
+               strikes, max_strikes, counter, tmp,
+               strikes >= max_strikes ? " — treating renderer context as lost"
+                                      : "");
             vn_renderer_helios_diag_log(
                "HELIOS sem-deadline strike %u/%u slot=%llu renderer=%llu "
                "sem=%llu reason=%s sig_queue=%llu family=%u ring=%u "
@@ -3764,8 +3790,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
                "wait0_slot=%llu wait0_renderer=%llu wait0_result=%d "
                "ring_seqno=%u ring_done=%u}%s",
                strikes, max_strikes, (unsigned long long)counter,
-               (unsigned long long)tmp,
-               (unsigned long long)sem->base.id,
+               (unsigned long long)tmp, (unsigned long long)sem->base.id,
                relax_state->reason_str ? relax_state->reason_str : "?",
                (unsigned long long)sig_queue_id, sig_family, sig_ring,
                (unsigned long long)sig_value,
@@ -3853,8 +3878,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
             vn_renderer_helios_diag_log(
                "HELIOS win32-sem self-read served by WDDM fence: sem=%llu "
                "wddm=%llu host/slot=%llu (first rescue this process)",
-               (unsigned long long)sem->base.id,
-               (unsigned long long)sync_val,
+               (unsigned long long)sem->base.id, (unsigned long long)sync_val,
                (unsigned long long)*out_value);
          }
          *out_value = sync_val;
@@ -3887,15 +3911,15 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
    /* Helios: the HOST timeline for a WDDM-folded semaphore is advanced
     * monotonically by the queue-submit signal path (vn_queue_submit ->
     * vn_submit_vkQueueSubmit2). An explicit vkSignalSemaphore that lags that
-    * progress (the DXVK present model races a CPU signal against the GPU queue
-    * signal on the same shared timeline) would forward a value <= the host
-    * counter and trip VUID-VkSemaphoreSignalInfo-value-03258, killing the host
-    * context and dropping dwm into a terminal DEVICE_LOST / black-desktop loop.
-    * Skip the host forward for such a stale/redundant signal: a prior signal
-    * already advanced the timeline past `value`, so it still reaches at least
-    * `value` (timeline monotonicity) and no progress is lost. The guest-side
-    * effects below (feedback slot update + WDDM win32_sync fence write) are
-    * ALWAYS performed. */
+    * progress (the DXVK present model races a CPU signal against the GPU
+    * queue signal on the same shared timeline) would forward a value <= the
+    * host counter and trip VUID-VkSemaphoreSignalInfo-value-03258, killing
+    * the host context and dropping dwm into a terminal DEVICE_LOST /
+    * black-desktop loop. Skip the host forward for such a stale/redundant
+    * signal: a prior signal already advanced the timeline past `value`, so it
+    * still reaches at least `value` (timeline monotonicity) and no progress
+    * is lost. The guest-side effects below (feedback slot update + WDDM
+    * win32_sync fence write) are ALWAYS performed. */
 #if DETECT_OS_WINDOWS
    bool forward_host_signal = true;
    uint64_t stale_seen_value = 0;
@@ -3947,9 +3971,8 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
 
 #if DETECT_OS_WINDOWS
    if (sem->payload->win32_sync) {
-      VkResult result = vn_renderer_sync_write(dev->renderer,
-                                               sem->payload->win32_sync,
-                                               pSignalInfo->value);
+      VkResult result = vn_renderer_sync_write(
+         dev->renderer, sem->payload->win32_sync, pSignalInfo->value);
       if (result != VK_SUCCESS)
          return vn_error(dev->instance, result);
    }
@@ -4058,8 +4081,7 @@ vn_WaitSemaphores(VkDevice device,
             const char *stale_seen_source = NULL;
             VkResult guard_result = helios_sem_should_forward_host_signal(
                device, pWaitInfo->pSemaphores[i], sem, pWaitInfo->pValues[i],
-               &forward_host_signal, &stale_seen_value,
-               &stale_seen_source);
+               &forward_host_signal, &stale_seen_value, &stale_seen_source);
             if (guard_result != VK_SUCCESS)
                return vn_result(dev->instance, guard_result);
 
@@ -4245,9 +4267,11 @@ vn_ImportSemaphoreWin32HandleKHR(
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pImportSemaphoreWin32HandleInfo->semaphore);
-   struct vn_sync_payload *temp = &sem->temporary;
    struct vn_renderer_sync *sync = NULL;
-   if (!pImportSemaphoreWin32HandleInfo->handle ||
+   if (!sem || sem->base.vk.device != &dev->base.vk ||
+       sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||
+       pImportSemaphoreWin32HandleInfo->flags != 0 ||
+       !pImportSemaphoreWin32HandleInfo->handle ||
        pImportSemaphoreWin32HandleInfo->name)
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    VkResult result = vn_renderer_helios_sync_create_from_win32(
@@ -4257,10 +4281,13 @@ vn_ImportSemaphoreWin32HandleKHR(
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
 
-   vn_sync_payload_release(dev, temp);
-   temp->type = VN_SYNC_TYPE_IMPORTED_WIN32_SYNC;
-   temp->win32_sync = sync;
-   sem->payload = temp;
+   /* C16's D3D12_FENCE import is permanent (`flags=0`).  Replacing the
+    * temporary slot would incorrectly restore the unrelated device-only
+    * payload after the first wait and could close the native object early. */
+   vn_sync_payload_release(dev, &sem->permanent);
+   sem->permanent.type = VN_SYNC_TYPE_IMPORTED_WIN32_SYNC;
+   sem->permanent.win32_sync = sync;
+   sem->payload = &sem->permanent;
 
    return VK_SUCCESS;
 }

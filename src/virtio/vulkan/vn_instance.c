@@ -20,6 +20,10 @@
 #include "vn_renderer.h"
 #include "vn_ring.h"
 
+#if defined(_WIN32)
+#include "vn_helios_record_submit.h"
+#endif
+
 /*
  * Instance extensions add instance-level or physical-device-level
  * functionalities.  It seems renderer support is either unnecessary or
@@ -60,8 +64,9 @@ static const struct vk_instance_extension_table
       /* Helios: present to a Win32 window via the common Mesa WSI. With no
        * dma-buf on Windows, vn_wsi_init selects the software WSI device, so
        * VK_KHR_swapchain present uses wsi_common_win32's GDI/DIB blit of the
-       * host-visible swapchain image into the HWND (zero-copy windowed present
-       * is impossible on virtio-gpu — no overlay planes; see wsi-present-plan). */
+       * host-visible swapchain image into the HWND (zero-copy windowed
+       * present is impossible on virtio-gpu — no overlay planes; see
+       * wsi-present-plan). */
       .KHR_win32_surface = true,
 #endif
 #ifndef VK_USE_PLATFORM_WIN32_KHR
@@ -322,6 +327,12 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    VkInstance instance_handle = vn_instance_to_handle(instance);
    /* ring_idx = 0 reserved for CPU timeline */
    instance->ring_idx_used_mask = 0x1;
+#if defined(_WIN32)
+   /* The renderer's dedicated allocation bootstrap is the first nonzero K11
+    * endpoint.  Real VkQueue objects therefore begin at the next immutable
+    * endpoint and remain numerically aligned with their KMD HVC1 contexts. */
+   instance->helios_next_ring_idx = 2;
+#endif
 
    mtx_init(&instance->physical_device.mutex, mtx_plain);
    mtx_init(&instance->ring_idx_mutex, mtx_plain);
@@ -351,6 +362,12 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     * by PID, TLS, a name, or any process-global lookup. */
    vn_object_set_id(instance, 1, VK_OBJECT_TYPE_INSTANCE);
    instance_handle = vn_instance_to_handle(instance);
+
+   result = vn_helios_submit_instance_init(instance);
+   if (result != VK_SUCCESS) {
+      vn_renderer_destroy(instance->renderer, alloc);
+      goto out_mtx_destroy;
+   }
 #endif
 
    vn_cs_renderer_protocol_info_init(instance);
@@ -405,14 +422,15 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    driParseOptionInfo(&instance->available_dri_options, vn_dri_options,
                       ARRAY_SIZE(vn_dri_options));
-   driParseConfigFiles(&instance->dri_options, &instance->available_dri_options,
-                       &(driConfigFileParseParams) {
-                          .driverName = "venus",
-                          .applicationName = instance->base.vk.app_info.app_name,
-                          .applicationVersion = instance->base.vk.app_info.app_version,
-                          .engineName = instance->base.vk.app_info.engine_name,
-                          .engineVersion = instance->base.vk.app_info.engine_version,
-                       });
+   driParseConfigFiles(
+      &instance->dri_options, &instance->available_dri_options,
+      &(driConfigFileParseParams){
+         .driverName = "venus",
+         .applicationName = instance->base.vk.app_info.app_name,
+         .applicationVersion = instance->base.vk.app_info.app_version,
+         .engineName = instance->base.vk.app_info.engine_name,
+         .engineVersion = instance->base.vk.app_info.engine_version,
+      });
 
    instance->renderer->info.has_implicit_fencing =
       driQueryOptionb(&instance->dri_options, "venus_implicit_fencing");
@@ -440,6 +458,9 @@ out_shmem_pool_fini:
    vn_renderer_shmem_pool_fini(instance->renderer,
                                &instance->reply_shmem_pool);
    vn_renderer_shmem_pool_fini(instance->renderer, &instance->cs_shmem_pool);
+#if defined(_WIN32)
+   vn_helios_submit_instance_fini(instance);
+#endif
    vn_renderer_destroy(instance->renderer, alloc);
 
 out_mtx_destroy:
@@ -492,6 +513,9 @@ vn_DestroyInstance(VkInstance _instance,
       vn_renderer_shmem_pool_fini(instance->renderer,
                                   &instance->cs_shmem_pool);
 
+#if defined(_WIN32)
+      vn_helios_submit_instance_fini(instance);
+#endif
       vn_renderer_destroy(instance->renderer, alloc);
    }
 

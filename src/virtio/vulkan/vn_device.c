@@ -20,6 +20,10 @@
 #include "vn_queue.h"
 #include "vn_ring.h"
 
+#if defined(_WIN32)
+#include "vn_helios_record_submit.h"
+#endif
+
 /* device commands */
 
 static void
@@ -38,10 +42,17 @@ vn_queue_fini(struct vn_queue *queue)
       simple_mtx_destroy(&queue->async_present.queue_mutex);
       mtx_destroy(&queue->async_present.mutex);
       cnd_destroy(&queue->async_present.cond);
-
-      vn_DestroyFence(dev_handle, queue->async_present.fence, NULL);
    }
 
+#if defined(_WIN32)
+   /* Stop every queue producer first, then join and destroy the exact HVC1
+    * context before releasing any Vulkan helper object or renderer storage
+    * that already-enqueued work can still name. */
+   vn_helios_submit_queue_fini(queue);
+#endif
+
+   if (queue->async_present.initialized)
+      vn_DestroyFence(dev_handle, queue->async_present.fence, NULL);
    if (queue->wait_fence != VK_NULL_HANDLE) {
       vn_DestroyFence(dev_handle, queue->wait_fence, NULL);
    }
@@ -74,6 +85,12 @@ vn_queue_init(struct vn_device *dev,
       queue->base.id = shared_queue->base.id;
       queue->can_feedback = shared_queue->can_feedback;
       queue->ring_idx = shared_queue->ring_idx;
+#if defined(_WIN32)
+      result = vn_helios_submit_queue_init(
+         dev, queue, queue_info->queueFamilyIndex, queue_index, shared_queue);
+      if (result != VK_SUCCESS)
+         goto out_queue_fini;
+#endif
       return VK_SUCCESS;
    }
 
@@ -83,7 +100,8 @@ vn_queue_init(struct vn_device *dev,
    const int ring_idx = vn_instance_acquire_ring_idx(dev->instance);
    if (ring_idx < 0) {
       vn_log(dev->instance, "failed binding VkQueue to renderer timeline");
-      return VK_ERROR_INITIALIZATION_FAILED;
+      result = VK_ERROR_INITIALIZATION_FAILED;
+      goto out_queue_fini;
    }
    queue->ring_idx = (uint32_t)ring_idx;
 
@@ -103,8 +121,34 @@ vn_queue_init(struct vn_device *dev,
    vn_call_vkGetDeviceQueue2(dev->primary_ring, vn_device_to_handle(dev),
                              &device_queue_info, &queue_handle);
 
+#if defined(_WIN32)
+   result = vn_helios_submit_queue_init(
+      dev, queue, queue_info->queueFamilyIndex, queue_index, NULL);
+   if (result != VK_SUCCESS)
+      goto out_ring_idx_release;
+#endif
+
    return VK_SUCCESS;
+
+#if defined(_WIN32)
+out_ring_idx_release:
+   vn_instance_release_ring_idx(dev->instance, queue->ring_idx);
+#endif
+out_queue_fini:
+   vn_cached_storage_fini(&queue->storage);
+   vn_queue_base_fini(&queue->base);
+   return result;
 }
+
+#if defined(_WIN32)
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_DeviceWaitIdle(VkDevice device)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   return vn_result(dev->instance, vn_helios_device_wait_idle(dev));
+}
+#endif
 
 static VkResult
 vn_device_init_queues(struct vn_device *dev,
@@ -133,8 +177,8 @@ vn_device_init_queues(struct vn_device *dev,
          result =
             vn_queue_init(dev, &queues[count], queue_info, j, shared_queue);
          if (result != VK_SUCCESS) {
-            for (uint32_t k = 0; k < count; k++)
-               vn_queue_fini(&queues[k]);
+            for (uint32_t k = count; k > 0; k--)
+               vn_queue_fini(&queues[k - 1]);
             vk_free(alloc, queues);
 
             return result;
@@ -359,8 +403,7 @@ vn_device_fix_create_info(const struct vn_device *dev,
    if (app_exts->KHR_external_memory_win32) {
       /* Native WDDM frontend extension.  The renderer device receives the
        * fd/dma-buf wire extension selected above, never a Win32 name. */
-      block_exts[block_count++] =
-         VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME;
+      block_exts[block_count++] = VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME;
    }
 
    if (app_exts->KHR_external_semaphore_win32) {
@@ -369,7 +412,8 @@ vn_device_fix_create_info(const struct vn_device *dev,
        * the Win32 device extension and must only receive the renderer-side
        * semaphore extension names it actually supports.
        */
-      block_exts[block_count++] = VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME;
+      block_exts[block_count++] =
+         VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME;
    }
 #endif
 
@@ -704,8 +748,11 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    vn_image_reqs_cache_fini(dev);
    vn_buffer_reqs_cache_fini(dev);
 
-   for (uint32_t i = 0; i < dev->queue_count; i++)
-      vn_queue_fini(&dev->queues[i]);
+   /* Emulated queues directly borrow the immediately preceding queue's HVC1
+    * context.  Retire queues in reverse construction order so every borrower
+    * is stopped before the sole owning context is joined and destroyed. */
+   for (uint32_t i = dev->queue_count; i > 0; i--)
+      vn_queue_fini(&dev->queues[i - 1]);
 
    vn_feedback_cmd_pools_fini(dev);
 
@@ -719,7 +766,8 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
     */
    {
       struct vn_ring_submit_command ring_submit;
-      vn_submit_vkDestroyDevice(dev->primary_ring, 0, device, NULL, &ring_submit);
+      vn_submit_vkDestroyDevice(dev->primary_ring, 0, device, NULL,
+                                &ring_submit);
       if (ring_submit.ring_seqno_valid)
          vn_ring_wait_seqno(dev->primary_ring, ring_submit.ring_seqno);
    }
