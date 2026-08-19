@@ -21,8 +21,129 @@
 
 #include "vn_android.h"
 #include "vn_instance.h"
+#if DETECT_OS_WINDOWS
+#include "vn_helios_record_submit.h"
+#endif
 
 #define IMAGE_FORMAT_CACHE_MAX_ENTRIES 100
+
+#if DETECT_OS_WINDOWS
+#define VN_HELIOS_NORMAL_DESCRIPTOR_CLASS_LIMIT 256u
+#define VN_HELIOS_NORMAL_DESCRIPTOR_RESOURCE_CLASSES 8u
+#define VN_HELIOS_NORMAL_NON_DESCRIPTOR_USE_RESERVE 512u
+#define VN_HELIOS_NORMAL_MAX_GENERATED_USES                              \
+   (VN_HELIOS_NORMAL_DESCRIPTOR_CLASS_LIMIT *                            \
+       VN_HELIOS_NORMAL_DESCRIPTOR_RESOURCE_CLASSES +                    \
+    VN_HELIOS_NORMAL_NON_DESCRIPTOR_USE_RESERVE)
+#define VN_HELIOS_NORMAL_MAX_GENERATED_OPERANDS                          \
+   (VN_HELIOS_NORMAL_MAX_GENERATED_USES * 2u)
+static_assert(VN_HELIOS_NORMAL_MAX_GENERATED_USES <=
+                 HELIOS_HNR2_MAX_USE_RECORDS,
+              "A6 normal-loader use closure exceeds HNR2");
+static_assert(VN_HELIOS_NORMAL_MAX_GENERATED_OPERANDS <=
+                 HELIOS_HNR2_MAX_PATCH_RECORDS,
+              "A6 normal-loader operand closure exceeds HNR2");
+
+static bool
+vn_physical_device_is_helios_normal_loader(
+   const struct vn_physical_device *physical_dev)
+{
+   return vn_helios_submit_instance_mode(physical_dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_NORMAL;
+}
+
+static void
+vn_physical_device_apply_helios_normal_feature_profile(
+   struct vn_physical_device *physical_dev)
+{
+   if (!vn_physical_device_is_helios_normal_loader(physical_dev))
+      return;
+
+   struct vk_features *feats = &physical_dev->base.vk.supported_features;
+   feats->descriptorIndexing = false;
+   feats->shaderInputAttachmentArrayDynamicIndexing = false;
+   feats->shaderUniformTexelBufferArrayDynamicIndexing = false;
+   feats->shaderStorageTexelBufferArrayDynamicIndexing = false;
+   feats->shaderUniformBufferArrayNonUniformIndexing = false;
+   feats->shaderSampledImageArrayNonUniformIndexing = false;
+   feats->shaderStorageBufferArrayNonUniformIndexing = false;
+   feats->shaderStorageImageArrayNonUniformIndexing = false;
+   feats->shaderInputAttachmentArrayNonUniformIndexing = false;
+   feats->shaderUniformTexelBufferArrayNonUniformIndexing = false;
+   feats->shaderStorageTexelBufferArrayNonUniformIndexing = false;
+   feats->descriptorBindingUniformBufferUpdateAfterBind = false;
+   feats->descriptorBindingSampledImageUpdateAfterBind = false;
+   feats->descriptorBindingStorageImageUpdateAfterBind = false;
+   feats->descriptorBindingStorageBufferUpdateAfterBind = false;
+   feats->descriptorBindingUniformTexelBufferUpdateAfterBind = false;
+   feats->descriptorBindingStorageTexelBufferUpdateAfterBind = false;
+   feats->descriptorBindingUpdateUnusedWhilePending = false;
+   feats->descriptorBindingPartiallyBound = false;
+   feats->descriptorBindingVariableDescriptorCount = false;
+   feats->runtimeDescriptorArray = false;
+   feats->descriptorBindingInlineUniformBlockUpdateAfterBind = false;
+   feats->descriptorBindingAccelerationStructureUpdateAfterBind = false;
+   feats->mutableDescriptorType = false;
+   feats->descriptorBuffer = false;
+   feats->descriptorBufferCaptureReplay = false;
+   feats->descriptorBufferImageLayoutIgnored = false;
+   feats->descriptorBufferPushDescriptors = false;
+   feats->descriptorHeap = false;
+   feats->descriptorHeapCaptureReplay = false;
+   feats->shaderUniformBufferUnsizedArray = false;
+}
+
+static void
+vn_physical_device_apply_helios_normal_property_profile(
+   struct vn_physical_device *physical_dev)
+{
+   if (!vn_physical_device_is_helios_normal_loader(physical_dev))
+      return;
+
+   struct vk_properties *props = &physical_dev->base.vk.properties;
+#define VN_HELIOS_CLAMP_DESCRIPTOR(field)                                 \
+   props->field = MIN2(props->field, VN_HELIOS_NORMAL_DESCRIPTOR_CLASS_LIMIT)
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorSamplers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorUniformBuffers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorStorageBuffers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorSampledImages);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorStorageImages);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorInputAttachments);
+   props->maxPerStageResources =
+      MIN2(props->maxPerStageResources,
+           VN_HELIOS_NORMAL_MAX_GENERATED_USES);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetSamplers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetUniformBuffers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetUniformBuffersDynamic);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetStorageBuffers);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetStorageBuffersDynamic);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetSampledImages);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetStorageImages);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetInputAttachments);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxPerStageDescriptorAccelerationStructures);
+   VN_HELIOS_CLAMP_DESCRIPTOR(maxDescriptorSetAccelerationStructures);
+
+   props->maxPerStageDescriptorUpdateAfterBindSamplers = 0;
+   props->maxPerStageDescriptorUpdateAfterBindUniformBuffers = 0;
+   props->maxPerStageDescriptorUpdateAfterBindStorageBuffers = 0;
+   props->maxPerStageDescriptorUpdateAfterBindSampledImages = 0;
+   props->maxPerStageDescriptorUpdateAfterBindStorageImages = 0;
+   props->maxPerStageDescriptorUpdateAfterBindInputAttachments = 0;
+   props->maxDescriptorSetUpdateAfterBindSamplers = 0;
+   props->maxDescriptorSetUpdateAfterBindUniformBuffers = 0;
+   props->maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = 0;
+   props->maxDescriptorSetUpdateAfterBindStorageBuffers = 0;
+   props->maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = 0;
+   props->maxDescriptorSetUpdateAfterBindSampledImages = 0;
+   props->maxDescriptorSetUpdateAfterBindStorageImages = 0;
+   props->maxDescriptorSetUpdateAfterBindInputAttachments = 0;
+   props->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = 0;
+   props->maxDescriptorSetUpdateAfterBindAccelerationStructures = 0;
+   props->maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 0;
+   props->maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 0;
+#undef VN_HELIOS_CLAMP_DESCRIPTOR
+}
+#endif
 
 /** Add `elem` to the pNext chain of `head`. */
 #define VN_ADD_PNEXT(head, s_type, elem)                                     \
@@ -438,7 +559,7 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
       feats->memoryUnmapReserve = true;
    }
 
-#ifdef VN_USE_WSI_PLATFORM
+#if defined(VN_USE_WSI_PLATFORM) && !DETECT_OS_WINDOWS
    feats->presentId = supported_exts->KHR_present_id;
    feats->presentId2 = supported_exts->KHR_present_id2;
    feats->presentWait = supported_exts->KHR_present_wait;
@@ -466,6 +587,12 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
       feats->extendedDynamicState3RepresentativeFragmentTestEnable = false;
       feats->extendedDynamicState3ShadingRateImageEnable = false;
    }
+
+#if DETECT_OS_WINDOWS
+   /* HVM1 has no protected-memory arm in this package generation. */
+   feats->protectedMemory = false;
+   vn_physical_device_apply_helios_normal_feature_profile(physical_dev);
+#endif
 }
 
 static void
@@ -902,6 +1029,9 @@ vn_physical_device_init_properties(struct vn_physical_device *physical_dev)
    if (vk_android_get_front_buffer_usage())
       props->sharedImage = true;
 
+#if DETECT_OS_WINDOWS
+   vn_physical_device_apply_helios_normal_property_profile(physical_dev);
+#endif
    vn_physical_device_sanitize_properties(physical_dev);
 }
 
@@ -947,6 +1077,8 @@ vn_physical_device_init_queue_family_properties(
          ~VK_QUEUE_VIDEO_DECODE_BIT_KHR;
       props[i].queueFamilyProperties.queueFlags &=
          ~VK_QUEUE_VIDEO_ENCODE_BIT_KHR;
+      props[i].queueFamilyProperties.queueFlags &=
+         ~VK_QUEUE_SPARSE_BINDING_BIT;
    }
 #endif
 
@@ -983,7 +1115,7 @@ vn_physical_device_init_queue_family_properties(
    return VK_SUCCESS;
 }
 
-static void
+static VkResult
 vn_physical_device_init_memory_properties(
    struct vn_physical_device *physical_dev)
 {
@@ -996,6 +1128,98 @@ vn_physical_device_init_memory_properties(
       ring, vn_physical_device_to_handle(physical_dev), &props2);
 
    physical_dev->memory_properties = props2.memoryProperties;
+
+#if DETECT_OS_WINDOWS
+   const VkPhysicalDeviceMemoryProperties renderer_props =
+      props2.memoryProperties;
+   uint32_t renderer_device_local = VK_MAX_MEMORY_TYPES;
+   uint32_t renderer_host_visible = VK_MAX_MEMORY_TYPES;
+
+   /* The guest profile is about the HVM1 allocation, not the renderer's heap
+    * topology.  Select renderer backing by exact capabilities only.  Host
+    * visibility/cacheability does not leak into the KMD-owned HLM1 mapping:
+    * role 4 is never mapped and role 2 is always WC.  The renderer's declared
+    * type order breaks ties; protected/lazy types remain forbidden. */
+   for (uint32_t i = 0; i < renderer_props.memoryTypeCount; i++) {
+      const VkMemoryPropertyFlags flags =
+         renderer_props.memoryTypes[i].propertyFlags;
+      const VkMemoryPropertyFlags forbidden =
+         VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+         VK_MEMORY_PROPERTY_PROTECTED_BIT;
+      if (renderer_device_local == VK_MAX_MEMORY_TYPES &&
+          (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+          !(flags & forbidden))
+         renderer_device_local = i;
+      if (renderer_host_visible == VK_MAX_MEMORY_TYPES &&
+          (flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+          !(flags & forbidden))
+         renderer_host_visible = i;
+   }
+
+   if (renderer_device_local == VK_MAX_MEMORY_TYPES ||
+       renderer_host_visible == VK_MAX_MEMORY_TYPES) {
+      vn_log(instance,
+             "HELIOS_A6_RENDERER_MEMORY_PROFILE_UNAVAILABLE: local=%u "
+             "host_visible=%u",
+             renderer_device_local, renderer_host_visible);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   const uint32_t local_heap =
+      renderer_props.memoryTypes[renderer_device_local].heapIndex;
+   const uint32_t visible_heap =
+      renderer_props.memoryTypes[renderer_host_visible].heapIndex;
+   uint64_t hlm1_heap_size = 0;
+   if (local_heap >= renderer_props.memoryHeapCount ||
+       visible_heap >= renderer_props.memoryHeapCount ||
+       !renderer_props.memoryHeaps[local_heap].size ||
+       !renderer_props.memoryHeaps[visible_heap].size ||
+       (renderer_props.memoryHeaps[local_heap].flags &
+        VK_MEMORY_HEAP_MULTI_INSTANCE_BIT) ||
+       (renderer_props.memoryHeaps[visible_heap].flags &
+        VK_MEMORY_HEAP_MULTI_INSTANCE_BIT)) {
+      vn_log(instance, "HELIOS_A6_RENDERER_HEAP_PROFILE_UNAVAILABLE");
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   if (vn_renderer_helios_local_heap_size(instance->renderer,
+                                          &hlm1_heap_size) != VK_SUCCESS ||
+       !hlm1_heap_size) {
+      vn_log(instance, "HELIOS_A6_HLM1_HEAP_PROFILE_UNAVAILABLE");
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   physical_dev->helios_renderer_memory_type_indices
+      [VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL] = renderer_device_local;
+   physical_dev->helios_renderer_memory_type_indices
+      [VN_HELIOS_MEMORY_TYPE_HOST_VISIBLE] = renderer_host_visible;
+
+   VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
+   memset(props, 0, sizeof(*props));
+   props->memoryHeapCount = 1;
+   props->memoryHeaps[0] = (VkMemoryHeap){
+      /* HLM1 is the authority; the host renderer heaps are additional hard
+       * backing limits, so advertise only their conservative intersection. */
+      .size = MIN3(hlm1_heap_size,
+                   renderer_props.memoryHeaps[local_heap].size,
+                   renderer_props.memoryHeaps[visible_heap].size),
+      .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+   };
+   props->memoryTypeCount = VN_HELIOS_MEMORY_TYPE_COUNT;
+   props->memoryTypes[VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      .heapIndex = 0,
+   };
+   props->memoryTypes[VN_HELIOS_MEMORY_TYPE_HOST_VISIBLE] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      .heapIndex = 0,
+   };
+   return VK_SUCCESS;
+#else
 
    /* Kernel makes every mapping coherent. If a memory type is truly
     * incoherent, it's better to remove the host-visible flag than silently
@@ -1025,6 +1249,8 @@ vn_physical_device_init_memory_properties(
       props->memoryTypes[first_coherent].propertyFlags |=
          VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
    }
+   return VK_SUCCESS;
+#endif
 }
 
 static void
@@ -1116,10 +1342,13 @@ vn_physical_device_init_external_memory(
    }
 
 #if DETECT_OS_WINDOWS
-   /* A3 implements the exact C57 D3D12_RESOURCE import operation but does not
-    * advertise A6's external-memory profile.  In particular, OPAQUE_WIN32 is
-    * not a compatibility alias for that operation. */
+   /* A3/A6 implement the exact C57 D3D12_RESOURCE import operation, but the
+    * package checkpoint requires the capability to remain unadvertised until
+    * A7 proves complete allocation/operand closure.  OPAQUE_WIN32 is never a
+    * compatibility alias.  A7 may change this zero only at its verified
+    * activation boundary. */
    physical_dev->external_memory.win32_renderer_handle_type = 0;
+   physical_dev->external_memory.supported_handle_types = 0;
 #endif
 
    if (physical_dev->external_memory.renderer_handle_type) {
@@ -1128,7 +1357,7 @@ vn_physical_device_init_external_memory(
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #else
 #if DETECT_OS_WINDOWS
-      physical_dev->external_memory.supported_handle_types = 0;
+      /* Kept zero at the A7 activation boundary above. */
 #else
       physical_dev->external_memory.supported_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
@@ -1230,12 +1459,17 @@ vn_physical_device_init_external_semaphore_handles(
    physical_dev->external_binary_semaphore_handles = 0;
    physical_dev->external_timeline_semaphore_handles = 0;
 
+#if DETECT_OS_WINDOWS
+   /* The exact HNF1 D3D12_FENCE import is implemented, but is part of the same
+    * A7 activation boundary as D3D12_RESOURCE.  Do not expose a partial lower
+    * profile merely because the renderer supports timeline semaphores. */
+   physical_dev->external_timeline_semaphore_handles = 0;
+#else
    if (physical_dev->instance->renderer->info.has_external_sync) {
-#if !DETECT_OS_WINDOWS
       physical_dev->external_binary_semaphore_handles =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
-#endif
    }
+#endif
 }
 
 static void
@@ -1263,14 +1497,18 @@ vn_physical_device_get_native_extensions(
           VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT) {
          exts->KHR_external_semaphore_fd = true;
       }
-#if DETECT_OS_WINDOWS
-      if (physical_dev->external_binary_semaphore_handles &
-          (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
-           VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)) {
-         exts->KHR_external_semaphore_win32 = true;
-      }
-#endif
    }
+
+#if DETECT_OS_WINDOWS
+   /* D3D12_FENCE is opened directly through KMT.  It neither depends on the
+    * renderer sync-fd capability nor advertises an export direction. */
+   exts->KHR_external_memory_win32 =
+      physical_dev->external_memory.supported_handle_types ==
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+   exts->KHR_external_semaphore_win32 =
+      physical_dev->external_timeline_semaphore_handles ==
+      VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+#endif
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    if (physical_dev->external_memory.renderer_handle_type &&
@@ -1301,7 +1539,7 @@ vn_physical_device_get_native_extensions(
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
 
-#ifdef VN_USE_WSI_PLATFORM
+#if defined(VN_USE_WSI_PLATFORM) && !DETECT_OS_WINDOWS
    if (physical_dev->renderer_sync_fd.semaphore_importable) {
       exts->KHR_incremental_present = true;
 #ifndef VK_USE_PLATFORM_WIN32_KHR
@@ -1328,7 +1566,7 @@ vn_physical_device_get_native_extensions(
       physical_dev->instance->renderer->info.pci.has_bus_info ||
       (!physical_dev->instance->renderer->info.pci.hide_renderer_bus_info &&
        renderer_exts->EXT_pci_bus_info);
-#endif /* VN_USE_WSI_PLATFORM */
+#endif /* VN_USE_WSI_PLATFORM && !Windows */
 
    /* Use common implementation but enable only when the renderer supports
     * VK_KHR_acceleration_structure because VK_KHR_deferred_host_operations is
@@ -1592,6 +1830,24 @@ vn_physical_device_init_supported_extensions(
             physical_dev->extension_spec_versions[i], props->specVersion);
       }
    }
+
+#if DETECT_OS_WINDOWS
+   /* Renderer heap-budget arrays do not describe the one KMD-owned HLM1
+    * heap.  Keep the dynamic extension absent until it can return that exact
+    * heap's WDDM budget rather than mismatched renderer indices. */
+   physical_dev->base.vk.supported_extensions.EXT_memory_budget = false;
+
+   if (vn_physical_device_is_helios_normal_loader(physical_dev)) {
+      /* Tier-3/unbounded descriptor vehicles remain available only to the
+       * private record-only translator profile. */
+      physical_dev->base.vk.supported_extensions.EXT_descriptor_heap = false;
+      physical_dev->base.vk.supported_extensions.EXT_descriptor_buffer = false;
+      physical_dev->base.vk.supported_extensions.EXT_mutable_descriptor_type =
+         false;
+      physical_dev->base.vk.supported_extensions.VALVE_mutable_descriptor_type =
+         false;
+   }
+#endif
 }
 
 static VkResult
@@ -1793,14 +2049,27 @@ vn_physical_device_init(struct vn_physical_device *physical_dev)
    if (result != VK_SUCCESS)
       goto fail;
 
+#if DETECT_OS_WINDOWS
+   /* The Android queue-count workaround and sparse binding are not alternative
+    * identities for the one-engine HVC1/HNR2 lane. */
+   physical_dev->emulate_second_queue = -1;
+   physical_dev->sparse_binding_disabled = true;
+#endif
    if (physical_dev->sparse_binding_disabled)
       vn_physical_device_disable_sparse_binding(physical_dev);
 
-   vn_physical_device_init_memory_properties(physical_dev);
+   result = vn_physical_device_init_memory_properties(physical_dev);
+   if (result != VK_SUCCESS)
+      goto fail;
 
+#if DETECT_OS_WINDOWS
+   /* A6 removes the lower Windows present path.  No unadvertised WSI object is
+    * initialized as a compatibility carrier for the future present layer. */
+#else
    result = vn_wsi_init(physical_dev);
    if (result != VK_SUCCESS)
       goto fail;
+#endif
 
    simple_mtx_init(&physical_dev->mutex, mtx_plain);
    util_sparse_array_init(&physical_dev->format_properties,
@@ -1827,7 +2096,9 @@ vn_physical_device_fini(struct vn_physical_device *physical_dev)
    simple_mtx_destroy(&physical_dev->mutex);
    util_sparse_array_finish(&physical_dev->format_properties);
 
+#if !DETECT_OS_WINDOWS
    vn_wsi_fini(physical_dev);
+#endif
    vk_free(alloc, physical_dev->extension_spec_versions);
    vk_free(alloc, physical_dev->queue_family_properties);
 
@@ -3184,17 +3455,35 @@ vn_GetPhysicalDeviceExternalSemaphoreProperties(
       pExternalSemaphoreInfo->pNext, SEMAPHORE_TYPE_CREATE_INFO);
    const VkSemaphoreType sem_type =
       type_info ? type_info->semaphoreType : VK_SEMAPHORE_TYPE_BINARY;
+#if DETECT_OS_WINDOWS
+   if (sem_type == VK_SEMAPHORE_TYPE_TIMELINE &&
+       pExternalSemaphoreInfo->handleType ==
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT) {
+      pExternalSemaphoreProperties->compatibleHandleTypes =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures =
+         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+      return;
+   }
+#endif
    const VkExternalSemaphoreHandleTypeFlags valid_handles =
       sem_type == VK_SEMAPHORE_TYPE_BINARY
          ? physical_dev->external_binary_semaphore_handles
          : physical_dev->external_timeline_semaphore_handles;
    if (pExternalSemaphoreInfo->handleType & valid_handles) {
       pExternalSemaphoreProperties->compatibleHandleTypes = valid_handles;
+#if DETECT_OS_WINDOWS
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures =
+         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+#else
       pExternalSemaphoreProperties->exportFromImportedHandleTypes =
          valid_handles;
       pExternalSemaphoreProperties->externalSemaphoreFeatures =
          VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+#endif
    } else {
       pExternalSemaphoreProperties->compatibleHandleTypes = 0;
       pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;

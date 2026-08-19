@@ -73,6 +73,12 @@ void helios_session_capability(const struct helios_translation_session *s,
 D3DKMT_HANDLE helios_session_device_handle(
    const struct helios_translation_session *s);
 
+/* Exact WDDM local-segment capacity backing the one A6 HLM1 Vulkan heap.
+ * This is an OS-owned adapter query on this session's directly owned adapter;
+ * there is no registry estimate or renderer-heap substitution. */
+VkResult helios_session_local_heap_size(
+   const struct helios_translation_session *s, uint64_t *out_size);
+
 /*
  * Execute the one reply-bearing normal-context operation admitted by A3:
  *

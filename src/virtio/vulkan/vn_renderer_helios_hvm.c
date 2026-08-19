@@ -1110,6 +1110,16 @@ vn_renderer_helios_device_handle(const struct vn_renderer *renderer)
 }
 
 VkResult
+vn_renderer_helios_local_heap_size(const struct vn_renderer *renderer,
+                                   uint64_t *out_size)
+{
+   const struct helios *helios = helios_from_renderer_const(renderer);
+   return helios && helios->session
+             ? helios_session_local_heap_size(helios->session, out_size)
+             : VK_ERROR_INITIALIZATION_FAILED;
+}
+
+VkResult
 vn_renderer_helios_build_queue_attach(
    const struct vn_renderer *renderer,
    const HeliosTranslationEndpointV1 *endpoint,

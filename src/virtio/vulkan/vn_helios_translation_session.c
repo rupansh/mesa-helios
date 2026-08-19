@@ -1003,4 +1003,29 @@ helios_session_device_handle(const struct helios_translation_session *s)
    return s ? s->device : 0;
 }
 
+VkResult
+helios_session_local_heap_size(const struct helios_translation_session *s,
+                               uint64_t *out_size)
+{
+   if (out_size)
+      *out_size = 0;
+   if (!s || !s->adapter || !out_size)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   D3DKMT_SEGMENTGROUPSIZEINFO sizes;
+   memset(&sizes, 0, sizeof(sizes));
+   sizes.PhysicalAdapterIndex = 0;
+   D3DKMT_QUERYADAPTERINFO query;
+   memset(&query, 0, sizeof(query));
+   query.hAdapter = s->adapter;
+   query.Type = KMTQAITYPE_GETSEGMENTGROUPSIZE;
+   query.pPrivateDriverData = &sizes;
+   query.PrivateDriverDataSize = sizeof(sizes);
+   if (D3DKMTQueryAdapterInfo(&query) != 0 || !sizes.LocalMemory)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   *out_size = sizes.LocalMemory;
+   return VK_SUCCESS;
+}
+
 #endif /* _WIN32 */

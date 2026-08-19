@@ -514,6 +514,9 @@ vn_device_memory_alloc(struct vn_device *dev,
    struct vn_device_memory_alloc_info local_info;
    alloc_info = vn_device_memory_fix_alloc_info(
       alloc_info, 0, false, &local_info);
+   local_info.alloc.memoryTypeIndex =
+      vn_physical_device_renderer_memory_type_index(
+         dev->physical_device, mem->base.vk.memory_type_index);
    VkResult result = vn_device_memory_bo_init(dev, mem);
    if (result != VK_SUCCESS)
       return result;
@@ -577,6 +580,28 @@ vn_device_memory_import_win32(
    const VkMemoryAllocateInfo *alloc_info,
    const VkImportMemoryWin32HandleInfoKHR *import_info)
 {
+   const VkMemoryDedicatedAllocateInfo *dedicated =
+      vk_find_struct_const(alloc_info->pNext,
+                           MEMORY_DEDICATED_ALLOCATE_INFO);
+   struct vn_image *dedicated_image =
+      dedicated && dedicated->image != VK_NULL_HANDLE
+         ? vn_image_from_handle(dedicated->image)
+         : NULL;
+   if (import_info->handleType !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT ||
+       !import_info->handle || import_info->name ||
+       alloc_info->memoryTypeIndex != VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL ||
+       !dedicated_image ||
+       dedicated_image->base.vk.base.device != &dev->base.vk ||
+       dedicated_image->base.vk.external_handle_types !=
+          VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT ||
+       dedicated->buffer != VK_NULL_HANDLE ||
+       !(dedicated_image->requirements[0].memory.memoryRequirements
+            .memoryTypeBits &
+         (UINT32_C(1) << VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL)) ||
+       mem->base.vk.export_handle_types)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
    uint64_t payload_size = 0;
    HeliosWddmAllocationDescV2 payload_desc;
    struct vn_renderer_bo *bo = NULL;
@@ -586,11 +611,18 @@ vn_device_memory_import_win32(
       &payload_desc, &bo, &external);
    if (result != VK_SUCCESS)
       return result;
+   if (payload_desc.allocation_kind != HELIOS_HWA2_KIND_IMAGE) {
+      vn_renderer_bo_unref(dev->renderer, bo);
+      vn_renderer_helios_external_memory_destroy(dev->renderer, external);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
 
    struct vn_device_memory_alloc_info clean_info;
    VkMemoryAllocateInfo local = *vn_device_memory_fix_alloc_info(
       alloc_info, 0, false, &clean_info);
    local.allocationSize = payload_size;
+   local.memoryTypeIndex = vn_physical_device_renderer_memory_type_index(
+      dev->physical_device, VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL);
    VkDeviceMemory memory = vn_device_memory_to_handle(mem);
    result = vn_renderer_helios_allocate_memory(
       dev->renderer, vn_device_to_handle(dev), &local, &memory, bo);
@@ -829,25 +861,10 @@ vn_GetMemoryWin32HandlePropertiesKHR(
    struct vn_device *dev = vn_device_from_handle(device);
    pMemoryWin32HandleProperties->memoryTypeBits = 0;
 
-   /* Vulkan forbids this query for opaque Win32 handle types. A3 accepts only
-    * the exact D3D12_RESOURCE carrier, but A6 has not yet published the two
-    * memory types or the corresponding external-memory capability.
-    *
-    * ⛔ IT CAN NO LONGER BE ANSWERED. The old answer read the payload's Vulkan
-    * `memory_type_index` out of the WDDM allocation's private data. HWA2 does
-    * not carry one: its `memory_class` is a three-value protocol enum
-    * (device-local / shared / CPU-visible) whose own documentation says "no
-    * Vulkan memory-type index", and §10.7 states that a C57 D3D12_RESOURCE
-    * import "is a separate allocation class ... never exposed through an
-    * ordinary memory type".
-    *
-    * The payload is still opened and validated, deliberately: that is what
-    * makes a split deploy or a malformed descriptor diagnosable by name here
-    * rather than at the import. Only the ANSWER is refused.
-    *
-    * ⚠ Why not report the ICD's current device-local memory type instead?
-    * That would pre-advertise A6's mapping and pretend HWA2's memory_class is a
-    * Vulkan memory-type index. SUPPLIED BY: Mesa A6, after A3. */
+   /* Vulkan forbids this query for opaque Win32 handle types.  C57 is an
+    * import allocation class rather than an HVM1 memory role, but Vulkan still
+    * requires one compatible allocation index.  A6 maps it only to guest role
+    * 4; HWA2's memory_class is never interpreted as an index. */
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
@@ -869,9 +886,9 @@ vn_GetMemoryWin32HandlePropertiesKHR(
    vn_renderer_bo_unref(dev->renderer, bo);
    vn_renderer_helios_external_memory_destroy(dev->renderer, external);
 
-   /* A6 hard boundary: memoryTypeBits stays zero. The successful exact open
-    * above proves only C57 carrier validity, never a Vulkan memory-type map. */
-   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   pMemoryWin32HandleProperties->memoryTypeBits =
+      UINT32_C(1) << VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL;
+   return VK_SUCCESS;
 }
 #endif
 

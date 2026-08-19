@@ -393,7 +393,8 @@ vn_device_fix_create_info(const struct vn_device *dev,
     * follows). Enable the extension for the renderer device whenever WSI
     * rides a < 1.2 renderer instance. Mirrored by
     * vn_device_init's helios_host_timeline_procs. */
-   if (has_wsi && !app_exts->KHR_timeline_semaphore &&
+   if ((has_wsi || app_exts->KHR_external_semaphore_win32) &&
+       !app_exts->KHR_timeline_semaphore &&
        renderer_exts->KHR_timeline_semaphore &&
        physical_dev->instance->renderer_api_version < VK_API_VERSION_1_2) {
       extra_exts[extra_count++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
@@ -578,13 +579,14 @@ vn_device_init(struct vn_device *dev,
    {
       const struct vk_device_extension_table *app_exts =
          &dev->base.vk.enabled_extensions;
-      const bool has_wsi_exts =
+      const bool needs_native_timeline =
          app_exts->KHR_swapchain || app_exts->ANDROID_native_buffer ||
-         app_exts->ANDROID_external_memory_android_hardware_buffer;
+         app_exts->ANDROID_external_memory_android_hardware_buffer ||
+         app_exts->KHR_external_semaphore_win32;
       dev->helios_host_timeline_procs =
          instance->renderer_api_version >= VK_API_VERSION_1_2 ||
          app_exts->KHR_timeline_semaphore ||
-         (has_wsi_exts &&
+         (needs_native_timeline &&
           physical_dev->renderer_extensions.KHR_timeline_semaphore);
    }
 

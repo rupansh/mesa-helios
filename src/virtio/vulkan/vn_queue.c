@@ -4270,6 +4270,8 @@ vn_ImportSemaphoreWin32HandleKHR(
    struct vn_renderer_sync *sync = NULL;
    if (!sem || sem->base.vk.device != &dev->base.vk ||
        sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||
+       pImportSemaphoreWin32HandleInfo->handleType !=
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT ||
        pImportSemaphoreWin32HandleInfo->flags != 0 ||
        !pImportSemaphoreWin32HandleInfo->handle ||
        pImportSemaphoreWin32HandleInfo->name)

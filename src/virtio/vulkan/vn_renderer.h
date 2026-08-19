@@ -347,6 +347,9 @@ uint32_t
 vn_renderer_helios_endpoint_capacity(const struct vn_renderer *renderer);
 uint32_t
 vn_renderer_helios_device_handle(const struct vn_renderer *renderer);
+VkResult
+vn_renderer_helios_local_heap_size(const struct vn_renderer *renderer,
+                                   uint64_t *out_size);
 
 /* A5's sole capability crossing: fill the complete HQA1 packet inside the
  * renderer that directly owns the HTS1 session.  The capability is never

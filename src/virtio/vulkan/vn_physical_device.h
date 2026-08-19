@@ -112,6 +112,12 @@ struct vn_physical_device {
    int emulate_second_queue;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
+#if DETECT_OS_WINDOWS
+   /* A6 exposes two guest HLM1 roles, but the renderer still consumes its own
+    * VkMemoryType indices.  Keep the exact per-physical-device translation;
+    * never reinterpret a guest index as a renderer index. */
+   uint32_t helios_renderer_memory_type_indices[2];
+#endif
 
    struct {
       VkExternalMemoryHandleTypeFlagBits renderer_handle_type;
@@ -146,6 +152,55 @@ VK_DEFINE_HANDLE_CASTS(vn_physical_device,
                        base.vk.base,
                        VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
+
+#define VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL 0u
+#define VN_HELIOS_MEMORY_TYPE_HOST_VISIBLE 1u
+#define VN_HELIOS_MEMORY_TYPE_COUNT        2u
+
+static inline uint32_t
+vn_physical_device_renderer_memory_type_index(
+   const struct vn_physical_device *physical_dev,
+   uint32_t guest_memory_type_index)
+{
+#if DETECT_OS_WINDOWS
+   assert(guest_memory_type_index < VN_HELIOS_MEMORY_TYPE_COUNT);
+   return physical_dev
+      ->helios_renderer_memory_type_indices[guest_memory_type_index];
+#else
+   (void)physical_dev;
+   return guest_memory_type_index;
+#endif
+}
+
+static inline uint32_t
+vn_physical_device_guest_memory_type_bits(
+   const struct vn_physical_device *physical_dev,
+   uint32_t renderer_memory_type_bits)
+{
+#if DETECT_OS_WINDOWS
+   uint32_t guest_bits = 0;
+   for (uint32_t guest = 0; guest < VN_HELIOS_MEMORY_TYPE_COUNT; guest++) {
+      const uint32_t renderer =
+         physical_dev->helios_renderer_memory_type_indices[guest];
+      if (renderer < VK_MAX_MEMORY_TYPES &&
+          (renderer_memory_type_bits & (UINT32_C(1) << renderer)))
+         guest_bits |= UINT32_C(1) << guest;
+   }
+   return guest_bits;
+#else
+   (void)physical_dev;
+   return renderer_memory_type_bits;
+#endif
+}
+
+static inline void
+vn_physical_device_sanitize_memory_requirements(
+   const struct vn_physical_device *physical_dev,
+   VkMemoryRequirements *requirements)
+{
+   requirements->memoryTypeBits = vn_physical_device_guest_memory_type_bits(
+      physical_dev, requirements->memoryTypeBits);
+}
 
 /*
  * Helios transports fd-based Vulkan external-memory handle types over the

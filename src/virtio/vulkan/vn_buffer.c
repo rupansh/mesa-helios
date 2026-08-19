@@ -290,6 +290,9 @@ vn_buffer_init(struct vn_device *dev,
          .buffer = buf_handle,
       },
       &buf->requirements.memory);
+   vn_physical_device_sanitize_memory_requirements(
+      dev->physical_device,
+      &buf->requirements.memory.memoryRequirements);
 
    /* If cacheable, store mem requirements from the synchronous call */
    if (entry) {
@@ -604,6 +607,8 @@ vn_GetDeviceBufferMemoryRequirements(
    /* Make the host call if not found in cache or not cacheable */
    vn_call_vkGetDeviceBufferMemoryRequirements(dev->primary_ring, device,
                                                pInfo, pMemoryRequirements);
+   vn_physical_device_sanitize_memory_requirements(
+      dev->physical_device, &pMemoryRequirements->memoryRequirements);
 
    /* If cacheable, store mem requirements from the host call */
    if (entry)

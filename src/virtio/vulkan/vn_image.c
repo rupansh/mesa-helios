@@ -349,6 +349,9 @@ vn_image_init_memory_requirements(struct vn_image *img,
             .image = img_handle,
          },
          &img->requirements[0].memory);
+      vn_physical_device_sanitize_memory_requirements(
+         dev->physical_device,
+         &img->requirements[0].memory.memoryRequirements);
 
       /* AHB backed image requires dedicated allocation */
       if (img->deferred) {
@@ -370,6 +373,9 @@ vn_image_init_memory_requirements(struct vn_image *img,
                .image = img_handle,
             },
             &img->requirements[i].memory);
+         vn_physical_device_sanitize_memory_requirements(
+            dev->physical_device,
+            &img->requirements[i].memory.memoryRequirements);
       }
    }
 }
@@ -407,11 +413,13 @@ vn_image_init(struct vn_device *dev,
    return VK_SUCCESS;
 }
 
-VkResult
-vn_image_create(struct vn_device *dev,
-                const VkImageCreateInfo *create_info,
-                const VkAllocationCallbacks *alloc,
-                struct vn_image **out_img)
+static VkResult
+vn_image_create_with_renderer_info(
+   struct vn_device *dev,
+   const VkImageCreateInfo *create_info,
+   const VkImageCreateInfo *renderer_create_info,
+   const VkAllocationCallbacks *alloc,
+   struct vn_image **out_img)
 {
    struct vn_image *img =
       vk_image_create(&dev->base.vk, create_info, alloc, sizeof(*img));
@@ -420,7 +428,7 @@ vn_image_create(struct vn_device *dev,
 
    vn_object_set_id(img, vn_get_next_obj_id(), VK_OBJECT_TYPE_IMAGE);
 
-   VkResult result = vn_image_init(dev, create_info, img);
+   VkResult result = vn_image_init(dev, renderer_create_info, img);
    if (result != VK_SUCCESS) {
       vk_image_destroy(&dev->base.vk, alloc, &img->base.vk);
       return result;
@@ -429,6 +437,16 @@ vn_image_create(struct vn_device *dev,
    *out_img = img;
 
    return VK_SUCCESS;
+}
+
+VkResult
+vn_image_create(struct vn_device *dev,
+                const VkImageCreateInfo *create_info,
+                const VkAllocationCallbacks *alloc,
+                struct vn_image **out_img)
+{
+   return vn_image_create_with_renderer_info(
+      dev, create_info, create_info, alloc, out_img);
 }
 
 VkResult
@@ -620,6 +638,9 @@ vn_CreateImage(VkDevice device,
 #endif
    } else {
       struct vn_image_create_info local_info;
+#if DETECT_OS_WINDOWS
+      const VkImageCreateInfo *app_create_info = pCreateInfo;
+#endif
       /* Helios: also inject external info into LINEAR images with no
        * external info of their own. The Win32 software swapchain creates
        * its present images without the wsi_image_create_info marker and
@@ -647,7 +668,16 @@ vn_CreateImage(VkDevice device,
             pCreateInfo, renderer_handle_type, &local_info);
       }
 
+#if DETECT_OS_WINDOWS
+      /* The renderer consumes its own external handle type, while the direct
+       * guest object must retain the exact type the caller requested.  In
+       * particular, the later C57 dedicated import and A7 presentable-image
+       * validation must see D3D12_RESOURCE rather than a renderer fd type. */
+      result = vn_image_create_with_renderer_info(
+         dev, app_create_info, pCreateInfo, alloc, &img);
+#else
       result = vn_image_create(dev, pCreateInfo, alloc, &img);
+#endif
    }
 
    if (result != VK_SUCCESS)
@@ -1104,6 +1134,9 @@ vn_GetDeviceImageMemoryRequirements(
 
          vn_call_vkGetDeviceImageMemoryRequirements(
             dev->primary_ring, device, &req_info[i], &reqs[i].memory);
+         vn_physical_device_sanitize_memory_requirements(
+            dev->physical_device,
+            &reqs[i].memory.memoryRequirements);
       }
       vn_image_fill_reqs(&reqs[plane], pMemoryRequirements);
       vn_image_store_reqs_in_cache(dev, key, plane_count, reqs);
@@ -1113,6 +1146,8 @@ vn_GetDeviceImageMemoryRequirements(
    } else {
       vn_call_vkGetDeviceImageMemoryRequirements(dev->primary_ring, device,
                                                  pInfo, pMemoryRequirements);
+      vn_physical_device_sanitize_memory_requirements(
+         dev->physical_device, &pMemoryRequirements->memoryRequirements);
    }
 }
 
