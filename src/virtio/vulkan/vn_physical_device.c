@@ -2308,8 +2308,10 @@ enumerate_physical_devices(struct vn_instance *instance,
       struct vk_physical_device_dispatch_table dispatch_table;
       vk_physical_device_dispatch_table_from_entrypoints(
          &dispatch_table, &vn_physical_device_entrypoints, true);
+#ifdef VN_USE_WSI_PLATFORM
       vk_physical_device_dispatch_table_from_entrypoints(
          &dispatch_table, &wsi_physical_device_entrypoints, false);
+#endif
       result = vn_physical_device_base_init(
          &physical_dev->base, &instance->base, NULL, &dispatch_table);
       if (result != VK_SUCCESS) {

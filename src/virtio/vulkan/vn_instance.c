@@ -94,8 +94,8 @@ vn_instance_init_renderer_versions(struct vn_instance *instance)
 {
 #if defined(_WIN32)
    /* K11 created this session's sole host VkInstance before renderer creation
-    * returned.  A7 will populate generic discovery; A3 must not issue a second
-    * instance command merely to rediscover the pinned protocol ceiling. */
+    * returned.  Direct A5 discovery owns the pinned protocol ceiling; the
+    * lower ICD must not issue a second instance command to rediscover it. */
    uint32_t instance_version = instance->renderer->info.vk_xml_version;
    if (instance_version < VN_MIN_RENDERER_VERSION)
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -160,6 +160,13 @@ vn_instance_fini_ring(struct vn_instance *instance)
 static VkResult
 vn_instance_init_ring(struct vn_instance *instance)
 {
+#if DETECT_OS_WINDOWS
+   /* A8 keeps only a serialization facade for exact HVC1 transactions.  It
+    * has no generic ring layout, shared storage, or independent sequence
+    * space. */
+   instance->ring.ring =
+      vn_ring_create(instance, NULL, 0, false /* is_tls_ring */);
+#else
    /* 32-bit seqno for renderer roundtrips */
    static const size_t extra_size = sizeof(uint32_t);
 
@@ -174,6 +181,7 @@ vn_instance_init_ring(struct vn_instance *instance)
 
    instance->ring.ring = vn_ring_create(instance, &layout, direct_order,
                                         false /* is_tls_ring */);
+#endif
    if (!instance->ring.ring)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -327,8 +335,10 @@ vn_create_instance_internal(const VkInstanceCreateInfo *pCreateInfo,
    struct vk_instance_dispatch_table dispatch_table;
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &vn_instance_entrypoints, true);
+#ifdef VN_USE_WSI_PLATFORM
    vk_instance_dispatch_table_from_entrypoints(
       &dispatch_table, &wsi_instance_entrypoints, false);
+#endif
    result = vn_instance_base_init(&instance->base,
                                   &vn_instance_supported_extensions,
                                   &dispatch_table, pCreateInfo, alloc);

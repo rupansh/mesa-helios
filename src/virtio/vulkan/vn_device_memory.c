@@ -189,6 +189,14 @@ static bool
 vn_device_memory_needs_wait_alloc(struct vn_device *dev,
                                   struct vn_device_memory *mem)
 {
+#if DETECT_OS_WINDOWS
+   /* A8 HVC1 allocation calls are already host-terminal and publish no ring
+    * sequence.  Clear stale generic bookkeeping without constructing a
+    * vkWaitRingSeqnoMESA command. */
+   (void)dev;
+   mem->bo_ring_seqno_valid = false;
+   return false;
+#else
    if (!mem->bo_ring_seqno_valid)
       return false;
 
@@ -200,12 +208,14 @@ vn_device_memory_needs_wait_alloc(struct vn_device *dev,
     * - mem import is done upon bo destroy
     */
    return !vn_ring_get_seqno_status(dev->primary_ring, mem->bo_ring_seqno);
+#endif
 }
 
 static inline VkResult
 vn_device_memory_bo_init(struct vn_device *dev, struct vn_device_memory *mem)
 {
    struct vn_renderer_submit_batch *batch = NULL;
+#if !DETECT_OS_WINDOWS
    struct vn_renderer_submit_batch local_batch;
    uint32_t local_data[8];
    if (vn_device_memory_needs_wait_alloc(dev, mem)) {
@@ -220,6 +230,7 @@ vn_device_memory_bo_init(struct vn_device *dev, struct vn_device_memory *mem)
       };
       batch = &local_batch;
    }
+#endif
 
    const struct vk_device_memory *mem_vk = &mem->base.vk;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
@@ -240,6 +251,7 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
    if (!mem->base_bo)
       return;
 
+#if !DETECT_OS_WINDOWS
    if (vn_device_memory_needs_wait_alloc(dev, mem)) {
       uint32_t local_data[8];
       struct vn_cs_encoder local_enc =
@@ -250,6 +262,9 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
       vn_renderer_submit_simple(dev->renderer, local_data,
                                 vn_cs_encoder_get_len(&local_enc));
    }
+#else
+   mem->bo_ring_seqno_valid = false;
+#endif
 
    vn_renderer_bo_release_resource(dev->renderer, mem->base_bo);
    vn_renderer_bo_unref(dev->renderer, mem->base_bo);

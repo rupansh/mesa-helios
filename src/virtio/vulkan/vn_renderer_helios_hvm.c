@@ -1033,6 +1033,36 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
 }
 
 VkResult
+vn_renderer_helios_control_generated(struct vn_renderer *renderer,
+                                     void *payload,
+                                     size_t payload_size,
+                                     void *reply,
+                                     size_t reply_size,
+                                     int32_t *reply_status)
+{
+   struct helios *helios = helios_from_renderer(renderer);
+   if (!helios || !helios->session || !payload || !payload_size || !reply ||
+       !reply_size)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   uint64_t reply_bytes = 0;
+   return helios_session_control_generated(
+      helios->session, payload, payload_size, reply, reply_size,
+      &reply_bytes, reply_status);
+}
+
+VkResult
+vn_renderer_helios_control_no_reply(struct vn_renderer *renderer,
+                                    const void *payload,
+                                    size_t payload_size)
+{
+   struct helios *helios = helios_from_renderer(renderer);
+   if (!helios || !helios->session)
+      return VK_ERROR_DEVICE_LOST;
+   return helios_session_control_no_reply(helios->session, payload,
+                                          payload_size);
+}
+
+VkResult
 vn_renderer_helios_free_memory(struct vn_renderer *renderer,
                                VkDevice device,
                                VkDeviceMemory memory,

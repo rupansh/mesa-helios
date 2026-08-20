@@ -297,6 +297,13 @@ vn_relax(struct vn_relax_state *state)
 struct vn_ring *
 vn_tls_get_ring(struct vn_instance *instance)
 {
+#if DETECT_OS_WINDOWS
+   /* The A8 Windows backend has one directly owned HVC1 serialization
+    * facade.  Per-thread generic rings would recreate shared ring identity
+    * and an independent sequence space, so all callers use the primary
+    * facade. */
+   return instance->ring.ring;
+#else
    if (VN_PERF(NO_MULTI_RING))
       return instance->ring.ring;
 
@@ -347,6 +354,7 @@ vn_tls_get_ring(struct vn_instance *instance)
    list_add(&tls_ring->vk_head, &instance->ring.tls_rings);
 
    return tls_ring->ring;
+#endif
 }
 
 void

@@ -123,6 +123,10 @@ struct helios_translation_session {
    bool poisoned;
 
    CRITICAL_SECTION lock;
+   /* The KMD owns one HVC1 assembler and the stock host context has one fixed
+    * control-fence token.  Serialize complete finite transactions across all
+    * primary/TLS ring facades; this is not an identity or a work queue. */
+   CRITICAL_SECTION control_lock;
    CONDITION_VARIABLE slot_free;
 
    uint64_t session_generation;
@@ -227,6 +231,7 @@ helios_transact(struct helios_translation_session *s, const void *payload,
                 uint64_t reply_capacity, uint64_t *reply_bytes,
                 uint64_t *total_bytes, int32_t *reply_status,
                 uint64_t *snapshot_generation, bool *more,
+                bool patch_generated_reply,
                 enum helios_session_refusal_site render_site,
                 enum helios_session_refusal_site wait_site,
                 enum helios_session_refusal_site reply_site)
@@ -260,6 +265,42 @@ helios_transact(struct helios_translation_session *s, const void *payload,
    if (!helios_slot_acquire(s, &slot_index, &slot_generation))
       return VK_ERROR_DEVICE_LOST; /* poisoned: the carrier is gone */
 
+   if (patch_generated_reply) {
+      /* Generated layout, fixed by the pinned Venus package:
+       * opcode, flags, pointer, resourceId, offset, size.  Never patch the
+       * resource operand in user-mode; only the KMD-owned execution copy may
+       * replace that zero. */
+      enum {
+         SET_REPLY_BYTES = 36,
+         SET_REPLY_OFFSET_OFFSET = 20,
+         SET_REPLY_SIZE_OFFSET = 28,
+      };
+      uint8_t *bytes = (uint8_t *)payload;
+      uint32_t opcode = 0;
+      uint32_t flags = 0;
+      uint64_t present = 0;
+      uint32_t resource_id = 0;
+      if (payload_bytes < SET_REPLY_BYTES) {
+         helios_slot_release(s, slot_index);
+         return VK_ERROR_INITIALIZATION_FAILED;
+      }
+      memcpy(&opcode, bytes, sizeof(opcode));
+      memcpy(&flags, bytes + 4, sizeof(flags));
+      memcpy(&present, bytes + 8, sizeof(present));
+      memcpy(&resource_id, bytes + 16, sizeof(resource_id));
+      if (opcode != 178 || flags != 0 || present != 1 || resource_id != 0 ||
+          reply_capacity == 0) {
+         helios_slot_release(s, slot_index);
+         return VK_ERROR_INITIALIZATION_FAILED;
+      }
+      const uint64_t raw_offset =
+         s->slots[slot_index].offset + HELIOS_HVR1_HEADER_SIZE;
+      memcpy(bytes + SET_REPLY_OFFSET_OFFSET, &raw_offset,
+             sizeof(raw_offset));
+      memcpy(bytes + SET_REPLY_SIZE_OFFSET, &reply_capacity,
+             sizeof(reply_capacity));
+   }
+
    VkResult result = VK_ERROR_INITIALIZATION_FAILED;
 
    /* The only allocation this carrier ever lists: its own checked-out slot,
@@ -270,12 +311,19 @@ helios_transact(struct helios_translation_session *s, const void *payload,
       .access = HELIOS_HNR2_ACCESS_WRITE,
       .expected_generation = s->pool_generation,
    };
+   const struct helios_hnr2_patch_input slot_patch = {
+      .payload_offset = 16,
+      .allocation_index = 0,
+      .operand_kind = HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32,
+   };
    struct helios_hnr2_batch batch;
    memset(&batch, 0, sizeof(batch));
    batch.payload = payload;
    batch.payload_bytes = payload_bytes;
    batch.allocations = &slot_use;
    batch.allocation_count = 1;
+   batch.patches = patch_generated_reply ? &slot_patch : NULL;
+   batch.patch_count = patch_generated_reply ? 1 : 0;
    batch.has_reply = true;
    batch.reply_allocation_index = 0;
    batch.reply_offset = s->slots[slot_index].offset;
@@ -608,12 +656,73 @@ helios_session_control(struct helios_translation_session *s, const void *payload
     * offset: the head of a result starts at zero, and a header that says
     * otherwise is not this result's head. */
    const struct helios_reply_expect expect = { .chunk_offset = 0 };
-   return helios_transact(s, payload, payload_bytes, &expect, reply,
-                          reply_capacity, reply_bytes, total_bytes, reply_status,
-                          snapshot_generation, more,
-                          HELIOS_SESSION_REFUSE_CONTROL_RENDER,
-                          HELIOS_SESSION_REFUSE_CONTROL_WAIT,
-                          HELIOS_SESSION_REFUSE_CONTROL_REPLY);
+   EnterCriticalSection(&s->control_lock);
+   VkResult result = helios_transact(
+      s, payload, payload_bytes, &expect, reply, reply_capacity, reply_bytes,
+      total_bytes, reply_status, snapshot_generation, more, false,
+      HELIOS_SESSION_REFUSE_CONTROL_RENDER,
+      HELIOS_SESSION_REFUSE_CONTROL_WAIT,
+      HELIOS_SESSION_REFUSE_CONTROL_REPLY);
+   LeaveCriticalSection(&s->control_lock);
+   return result;
+}
+
+VkResult
+helios_session_control_generated(struct helios_translation_session *s,
+                                 void *payload, uint64_t payload_bytes,
+                                 void *reply, uint64_t reply_capacity,
+                                 uint64_t *reply_bytes,
+                                 int32_t *reply_status)
+{
+   if (reply_bytes)
+      *reply_bytes = 0;
+   uint64_t total_bytes = 0;
+   uint64_t snapshot_generation = 0;
+   bool more = false;
+   const struct helios_reply_expect expect = { .chunk_offset = 0 };
+   EnterCriticalSection(&s->control_lock);
+   VkResult result = helios_transact(
+      s, payload, payload_bytes, &expect, reply, reply_capacity, reply_bytes,
+      &total_bytes, reply_status, &snapshot_generation, &more, true,
+      HELIOS_SESSION_REFUSE_CONTROL_RENDER,
+      HELIOS_SESSION_REFUSE_CONTROL_WAIT,
+      HELIOS_SESSION_REFUSE_CONTROL_REPLY);
+   LeaveCriticalSection(&s->control_lock);
+   if (result != VK_SUCCESS)
+      return result;
+   /* Ring callers allocate the generated reply decoder at its exact size.
+    * A short, continued, or oversized answer is not that command's reply. */
+   if (more || total_bytes != reply_capacity ||
+       !reply_bytes || *reply_bytes != reply_capacity)
+      return VK_ERROR_DEVICE_LOST;
+   return VK_SUCCESS;
+}
+
+VkResult
+helios_session_control_no_reply(struct helios_translation_session *s,
+                                const void *payload,
+                                uint64_t payload_bytes)
+{
+   if (!s || !payload || !payload_bytes ||
+       payload_bytes > HELIOS_HNR2_MAX_PAYLOAD_BYTES)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   struct helios_hnr2_batch batch;
+   memset(&batch, 0, sizeof(batch));
+   batch.payload = payload;
+   batch.payload_bytes = payload_bytes;
+   uint64_t batch_token = 0;
+   uint64_t progress = 0;
+   EnterCriticalSection(&s->control_lock);
+   VkResult result = helios_native_context_submit(
+      s->control, &batch, true, &batch_token, &progress);
+   if (result != VK_SUCCESS) {
+      LeaveCriticalSection(&s->control_lock);
+      return result;
+   }
+   result = helios_native_context_wait(s->control, progress,
+                                       HELIOS_NATIVE_WAIT_INFINITE);
+   LeaveCriticalSection(&s->control_lock);
+   return result;
 }
 
 VkResult
@@ -651,11 +760,15 @@ helios_session_control_continue(struct helios_translation_session *s,
       .total_bytes = expected_total_bytes,
       .chunk_offset = expected_offset,
    };
-   return helios_transact(s, &cont, sizeof(cont), &expect, reply, reply_capacity,
-                          reply_bytes, NULL, reply_status, NULL, more,
-                          HELIOS_SESSION_REFUSE_CONTROL_RENDER,
-                          HELIOS_SESSION_REFUSE_CONTROL_WAIT,
-                          HELIOS_SESSION_REFUSE_CONTROL_REPLY);
+   EnterCriticalSection(&s->control_lock);
+   VkResult result = helios_transact(
+      s, &cont, sizeof(cont), &expect, reply, reply_capacity, reply_bytes,
+      NULL, reply_status, NULL, more, false,
+      HELIOS_SESSION_REFUSE_CONTROL_RENDER,
+      HELIOS_SESSION_REFUSE_CONTROL_WAIT,
+      HELIOS_SESSION_REFUSE_CONTROL_REPLY);
+   LeaveCriticalSection(&s->control_lock);
+   return result;
 }
 
 /* ── create / destroy ───────────────────────────────────────────────────────*/
@@ -709,6 +822,7 @@ helios_translation_session_destroy(struct helios_translation_session *s)
    if (!s)
       return;
    helios_session_teardown(s);
+   DeleteCriticalSection(&s->control_lock);
    DeleteCriticalSection(&s->lock);
    free(s);
 }
@@ -736,6 +850,7 @@ helios_translation_session_create(LUID adapter_luid,
    if (!s)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    InitializeCriticalSection(&s->lock);
+   InitializeCriticalSection(&s->control_lock);
    InitializeConditionVariable(&s->slot_free);
    s->next_slot_generation = 1;
 
@@ -895,10 +1010,13 @@ helios_translation_session_create(LUID adapter_luid,
    int32_t reply_status = 0;
    bool more = false;
    const struct helios_reply_expect init_expect = { .chunk_offset = 0 };
+   EnterCriticalSection(&s->control_lock);
    VkResult r = helios_transact(
       s, &init, sizeof(init), &init_expect, &reply, sizeof(reply), &reply_bytes,
-      NULL, &reply_status, NULL, &more, HELIOS_SESSION_REFUSE_INIT_RENDER,
+      NULL, &reply_status, NULL, &more, false,
+      HELIOS_SESSION_REFUSE_INIT_RENDER,
       HELIOS_SESSION_REFUSE_INIT_WAIT, HELIOS_SESSION_REFUSE_INIT_REPLY);
+   LeaveCriticalSection(&s->control_lock);
    if (r != VK_SUCCESS)
       goto fail;
 

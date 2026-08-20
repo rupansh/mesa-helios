@@ -341,6 +341,21 @@ vn_renderer_helios_free_memory(struct vn_renderer *renderer,
                                VkDeviceMemory memory,
                                struct vn_renderer_bo *bo);
 
+/* A8 finite control path.  The generated-reply payload is mutable only so the
+ * session can fill its checked-out slot offset/size; its resource operand must
+ * still be zero on entry and remains zero until the KMD-private copy. */
+VkResult
+vn_renderer_helios_control_generated(struct vn_renderer *renderer,
+                                     void *payload,
+                                     size_t payload_size,
+                                     void *reply,
+                                     size_t reply_size,
+                                     int32_t *reply_status);
+VkResult
+vn_renderer_helios_control_no_reply(struct vn_renderer *renderer,
+                                    const void *payload,
+                                    size_t payload_size);
+
 uint64_t
 vn_renderer_helios_session_generation(const struct vn_renderer *renderer);
 uint32_t

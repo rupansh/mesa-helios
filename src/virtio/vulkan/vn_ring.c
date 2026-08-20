@@ -8,7 +8,7 @@
 #if !DETECT_OS_WINDOWS
 #include <sys/resource.h>
 #else
-#include <windows.h>
+#include "helios_native_render.h"
 #endif
 
 #include <stdio.h>
@@ -21,45 +21,7 @@
 
 #define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
 
-/* HELIOS: idle-notify decisions skipped by the rate limiter while the host
- * ring advertised IDLE — the suspected wire-fence slow-mode source (29th
- * session). Read out of a live process via a debugger or a diag line; kept
- * global-simple on purpose. */
-static uint32_t helios_ring_notify_skips;
-
-#if DETECT_OS_WINDOWS
-/* Local Win32 prototype — this mesa-common file deliberately avoids
- * windows.h (helios_win_compat.h keeps the tree upstream-identical). */
-unsigned long __stdcall GetEnvironmentVariableA(const char *name,
-                                                char *buffer,
-                                                unsigned long size);
-#endif
-
-/* HELIOS_RING_NOTIFY_EAGER=0 disables the Windows default of notifying on
- * every submission that observes IDLE. DWM can park after a single frame; if
- * that submit is rate-limited while the host is idle, the tail remains
- * undecoded until another app happens to submit and DWM trips its semaphore
- * forward-progress deadline.
- */
-static bool
-vn_ring_notify_eager(void)
-{
-#if DETECT_OS_WINDOWS
-   static int cached = -1;
-   if (cached < 0) {
-      char v[8];
-      cached = !GetEnvironmentVariableA("HELIOS_RING_NOTIFY_EAGER", v,
-                                        sizeof(v)) ||
-                     v[0] != '0'
-                  ? 1
-                  : 0;
-   }
-   return cached == 1;
-#else
-   return false;
-#endif
-}
-
+#if !DETECT_OS_WINDOWS
 static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(atomic_uint) == 4,
               "vn_ring_shared requires lock-free 32-bit atomic_uint");
 
@@ -71,10 +33,12 @@ struct vn_ring_shared {
    void *buffer;
    void *extra;
 };
+#endif
 
 struct vn_ring {
    uint64_t id;
    struct vn_instance *instance;
+#if !DETECT_OS_WINDOWS
    struct vn_renderer_shmem *shmem;
 
    uint32_t buffer_size;
@@ -82,6 +46,7 @@ struct vn_ring {
 
    struct vn_ring_shared shared;
    uint32_t cur;
+#endif
 
    /* This mutex ensures below:
     * - atomic of ring submission
@@ -89,6 +54,7 @@ struct vn_ring {
     */
    mtx_t mutex;
 
+#if !DETECT_OS_WINDOWS
    /* size limit for cmd submission via ring shmem, derived from
     * (buffer_size >> direct_order) upon vn_ring_create
     */
@@ -106,62 +72,10 @@ struct vn_ring {
 
    int64_t last_notify;
    int64_t next_notify;
+#endif
 };
 
-#if DETECT_OS_WINDOWS
-/* Selected Windows renderer diagnostic sink. */
-void vn_renderer_helios_diag_log(const char *fmt, ...);
-
-/* Log on a power-of-two decay (1st, 2nd, 4th, ... occurrence). A dead ring
- * keeps taking submissions — the flat per-submit diag produced 62k identical
- * lines in 13 s on the 21st-session death boot, burying the one line that
- * mattered. */
-static bool
-helios_diag_should_log(uint32_t n)
-{
-   return (n & (n - 1)) == 0;
-}
-
-static void
-helios_ring_diag(const struct vn_ring *ring, const char *msg)
-{
-   uint32_t head_value = 0;
-   uint32_t tail_value = 0;
-   uint32_t status_value = 0;
-   if (ring) {
-      if (ring->shared.head)
-         head_value =
-            atomic_load_explicit(ring->shared.head, memory_order_seq_cst);
-      if (ring->shared.tail)
-         tail_value =
-            atomic_load_explicit(ring->shared.tail, memory_order_seq_cst);
-      if (ring->shared.status)
-         status_value =
-            atomic_load_explicit(ring->shared.status, memory_order_seq_cst);
-   }
-
-   vn_renderer_helios_diag_log(
-      "tick=%lu ring %s ring=%p id=%llu head=%u tail=%u "
-      "status=0x%08x cur=%u size=%u",
-      GetTickCount(), msg, (const void *)ring,
-      ring ? (unsigned long long)ring->id : 0,
-      head_value, tail_value, status_value,
-      ring ? ring->cur : 0,
-      ring ? ring->buffer_size : 0);
-}
-
-static bool
-helios_ring_shared_valid(const struct vn_ring *ring)
-{
-   if (!ring || !ring->shared.head || !ring->shared.tail ||
-       !ring->shared.status || !ring->shared.buffer) {
-      helios_ring_diag(ring, "invalid null shared pointers");
-      return false;
-   }
-
-   return true;
-}
-#else
+#if !DETECT_OS_WINDOWS
 static bool
 helios_ring_shared_valid(const struct vn_ring *ring)
 {
@@ -177,6 +91,7 @@ helios_ring_diag(const struct vn_ring *ring, const char *msg)
 }
 #endif
 
+#if !DETECT_OS_WINDOWS
 struct vn_ring_submit {
    uint32_t seqno;
 
@@ -221,21 +136,33 @@ vn_ring_store_tail(struct vn_ring *ring)
    return atomic_store_explicit(ring->shared.tail, ring->cur,
                                 memory_order_seq_cst);
 }
+#endif
 
 uint32_t
 vn_ring_load_status(const struct vn_ring *ring)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   return 0;
+#else
    /* must be called and ordered after vn_ring_store_tail for idle status */
    return atomic_load_explicit(ring->shared.status, memory_order_seq_cst);
+#endif
 }
 
 void
 vn_ring_unset_status_bits(struct vn_ring *ring, uint32_t mask)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   (void)mask;
+#else
    atomic_fetch_and_explicit(ring->shared.status, ~mask,
                              memory_order_seq_cst);
+#endif
 }
 
+#if !DETECT_OS_WINDOWS
 static void
 vn_ring_write_buffer(struct vn_ring *ring, const void *data, uint32_t size)
 {
@@ -283,19 +210,29 @@ vn_ring_retire_submits(struct vn_ring *ring, uint32_t seqno)
       list_move_to(&submit->head, &ring->free_submits);
    }
 }
+#endif
 
 bool
 vn_ring_get_seqno_status(struct vn_ring *ring, uint32_t seqno)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   return seqno == 0;
+#else
    if (unlikely(!helios_ring_shared_valid(ring)))
       return true;
 
    return vn_ring_ge_seqno(ring, vn_ring_load_head(ring), seqno);
+#endif
 }
 
 bool
 vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   return seqno == 0;
+#else
    /* A renderer wait incurs several hops and the renderer might poll
     * repeatedly anyway.  Let's just poll here.
     */
@@ -320,16 +257,6 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
                     VK_RING_STATUS_FATAL_BIT_MESA))) {
          vn_log(NULL, "vn_ring_wait_seqno: fatal/torn ring; abandoning wait "
                       "(seqno %u)", seqno);
-#if DETECT_OS_WINDOWS
-         {
-            static atomic_uint abandon_count;
-            const uint32_t n =
-               atomic_fetch_add_explicit(&abandon_count, 1,
-                                         memory_order_relaxed) + 1;
-            if (helios_diag_should_log(n))
-               helios_ring_diag(ring, "fatal in wait_seqno");
-         }
-#endif
          vn_relax_fini(&relax_state);
          return false;
       }
@@ -339,11 +266,18 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
       }
       vn_relax(&relax_state);
    } while (true);
+#endif
 }
 
 void
 vn_ring_wait_all(struct vn_ring *ring)
 {
+#if DETECT_OS_WINDOWS
+   /* Every A8 HVC1 transaction is already host-terminal before it returns.
+    * There is no shared tail and no replacement sequence space to wait on. */
+   (void)ring;
+   return;
+#else
    /* DEFECT-0b INSTRUMENTATION: vn_ring_wait_all is the ONLY cross-ring
     * ordering barrier (vn_get_target_ring waits on the primary ring before a
     * TLS ring submits a pipeline create that references primary-ring objects
@@ -365,11 +299,16 @@ vn_ring_wait_all(struct vn_ring *ring)
    if (unlikely(!vn_ring_wait_seqno(ring, pending_seqno))) {
       helios_ring_diag(ring, "BARRIER ABANDONED in wait_all (fatal ring)");
    }
+#endif
 }
 
 uint32_t
 vn_ring_current_seqno(const struct vn_ring *ring)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   return 0;
+#else
    /* diagnostic helper (defect-0b pipeline trace): the ring's submitted-up-to
     * seqno at call time; 0 on a torn ring. Relaxed — same contract as the
     * wait_all tail load.
@@ -378,8 +317,10 @@ vn_ring_current_seqno(const struct vn_ring *ring)
       return 0;
 
    return atomic_load_explicit(ring->shared.tail, memory_order_relaxed);
+#endif
 }
 
+#if !DETECT_OS_WINDOWS
 static bool
 vn_ring_has_space(const struct vn_ring *ring,
                   uint32_t size,
@@ -418,6 +359,7 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
       } while (true);
    }
 }
+#endif
 
 void
 vn_ring_get_layout(size_t buf_size,
@@ -465,6 +407,16 @@ vn_ring_create(struct vn_instance *instance,
 
    ring->id = (uintptr_t)ring;
    ring->instance = instance;
+#if DETECT_OS_WINDOWS
+   /* A8: a Windows ring is only a small serialization facade over the one
+    * directly owned HVC1 session.  It owns no BO, shared head/tail/status,
+    * upload encoder, notify state, or roundtrip timeline. */
+   mtx_init(&ring->mutex, mtx_plain);
+   (void)layout;
+   (void)direct_order;
+   (void)is_tls_ring;
+   return ring;
+#else
    ring->shmem =
       vn_renderer_shmem_create(instance->renderer, layout->shmem_size);
    if (!ring->shmem) {
@@ -506,13 +458,11 @@ vn_ring_create(struct vn_instance *instance,
     * VK_MESA_VENUS_PROTOCOL_SPEC_VERSION >= 2  */
    int prio = 0;
    bool ring_priority = false;
-#if !DETECT_OS_WINDOWS
    if (instance->renderer->info.vk_mesa_venus_protocol_spec_version >= 2) {
       errno = 0;
       prio = getpriority(PRIO_PROCESS, 0);
       ring_priority = is_tls_ring && !(prio == -1 && errno);
    }
-#endif /* !DETECT_OS_WINDOWS */
    const struct VkRingPriorityInfoMESA priority_info = {
       .sType = VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA,
       .priority = prio,
@@ -525,11 +475,7 @@ vn_ring_create(struct vn_instance *instance,
    const struct VkRingCreateInfoMESA info = {
       .sType = VK_STRUCTURE_TYPE_RING_CREATE_INFO_MESA,
       .pNext = &monitor_info,
-#if DETECT_OS_WINDOWS
-      .resourceId = 0,
-#else
       .resourceId = ring->shmem->res_id,
-#endif
       .size = layout->shmem_size,
       .idleTimeout = VN_RING_IDLE_TIMEOUT_NS,
       .headOffset = layout->head_offset,
@@ -541,20 +487,15 @@ vn_ring_create(struct vn_instance *instance,
       .extraSize = layout->extra_size,
    };
 
-#if !DETECT_OS_WINDOWS
    uint32_t create_ring_data[64];
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       create_ring_data, sizeof(create_ring_data));
    vn_encode_vkCreateRingMESA(&local_enc, 0, ring->id, &info);
    vn_renderer_submit_simple(instance->renderer, create_ring_data,
                              vn_cs_encoder_get_len(&local_enc));
-#else
-   /* K11 already owns the session namespace.  This is local encoder storage
-    * only; no VkRingMESA object or raw-resource ring exists on Windows. */
-   (void)info;
-#endif
 
    return ring;
+#endif
 }
 
 void
@@ -564,7 +505,11 @@ vn_ring_destroy(struct vn_ring *ring)
 
    const VkAllocationCallbacks *alloc = &ring->instance->base.vk.alloc;
 
-#if !DETECT_OS_WINDOWS
+#if DETECT_OS_WINDOWS
+   mtx_destroy(&ring->mutex);
+   vk_free(alloc, ring);
+   return;
+#else
    uint32_t destroy_ring_data[4];
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       destroy_ring_data, sizeof(destroy_ring_data));
@@ -576,7 +521,6 @@ vn_ring_destroy(struct vn_ring *ring)
     */
    vn_renderer_submit_simple_sync(ring->instance->renderer, destroy_ring_data,
                                   vn_cs_encoder_get_len(&local_enc));
-#endif
 
    mtx_destroy(&ring->roundtrip_mutex);
 
@@ -593,6 +537,7 @@ vn_ring_destroy(struct vn_ring *ring)
    mtx_destroy(&ring->mutex);
 
    vk_free(alloc, ring);
+#endif
 }
 
 uint64_t
@@ -601,6 +546,7 @@ vn_ring_get_id(struct vn_ring *ring)
    return ring->id;
 }
 
+#if !DETECT_OS_WINDOWS
 static struct vn_ring_submit *
 vn_ring_get_submit(struct vn_ring *ring, uint32_t shmem_count)
 {
@@ -647,16 +593,6 @@ vn_ring_submit_internal(struct vn_ring *ring,
    const VkRingStatusFlagsMESA status = vn_ring_load_status(ring);
    if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
       vn_log(NULL, "vn_ring_submit fatal status; reporting device lost");
-#if DETECT_OS_WINDOWS
-      {
-         static atomic_uint fatal_submit_count;
-         const uint32_t n =
-            atomic_fetch_add_explicit(&fatal_submit_count, 1,
-                                      memory_order_relaxed) + 1;
-         if (helios_diag_should_log(n))
-            helios_ring_diag(ring, "fatal status");
-      }
-#endif
       return false;
    }
 
@@ -667,35 +603,15 @@ vn_ring_submit_internal(struct vn_ring *ring,
 
    *seqno = submit->seqno;
 
-   /* Notify renderer to wake up idle ring if at least VN_RING_IDLE_TIMEOUT_NS
-    * has passed since the last sent notification to avoid excessive wake up
-    * calls (non-trivial since submitted via virtio-gpu kernel).
-    *
-    * HELIOS A/B (29th session, wire-fence latency): a rate-limited notify
-    * that is SKIPPED while the host ring sits in its wakeable idle wait is
-    * simply dropped — the tail then sits undecoded until the next
-    * submission that passes the limiter. HELIOS_RING_NOTIFY_EAGER=1
-    * notifies on EVERY submission that observes the IDLE status bit (cost:
-    * one extra ~120 µs escape per idle wakeup) to A/B the retire_lat
-    * slow mode against the limiter.
-    */
+   /* Notify renderer to wake an idle generic ring, rate-limited to avoid
+    * excessive virtio-gpu wakeups. */
    if (status & VK_RING_STATUS_IDLE_BIT_MESA) {
-      if (vn_ring_notify_eager())
-         return true;
       const int64_t now = os_time_get_nano();
       if (os_time_timeout(ring->last_notify, ring->next_notify, now)) {
          ring->last_notify = now;
          ring->next_notify = now + VN_RING_IDLE_TIMEOUT_NS;
          return true;
       }
-      helios_ring_notify_skips++;
-#if DETECT_OS_WINDOWS
-      if (helios_diag_should_log(helios_ring_notify_skips))
-         vn_renderer_helios_diag_log(
-            "ring notify SKIPPED while host idle (x%u) — tail undecoded "
-            "until the next passing submission",
-            helios_ring_notify_skips);
-#endif
    }
    return false;
 }
@@ -715,11 +631,7 @@ vn_ring_submission_get_cs(struct vn_ring_submission *submit,
       const struct vn_cs_encoder_buffer *buf = &cs->buffers[i];
       if (buf->committed_size) {
          descs[desc_count++] = (VkCommandStreamDescriptionMESA){
-#if DETECT_OS_WINDOWS
-            .resourceId = 0,
-#else
             .resourceId = buf->shmem->res_id,
-#endif
             .offset = buf->offset,
             .size = buf->committed_size,
          };
@@ -844,15 +756,6 @@ vn_ring_submit_locked(struct vn_ring *ring,
                       struct vn_renderer_shmem *extra_shmem,
                       uint32_t *ring_seqno)
 {
-#if DETECT_OS_WINDOWS
-   (void)ring;
-   (void)cs;
-   (void)extra_shmem;
-   (void)ring_seqno;
-   /* Generic generated-object traffic belongs to A7.  Refuse synchronously;
-    * never manufacture a local completion or fall back to a shared ring. */
-   return VK_ERROR_DEVICE_LOST;
-#else
    if (unlikely(!helios_ring_shared_valid(ring)))
       return VK_ERROR_DEVICE_LOST;
 
@@ -893,20 +796,34 @@ vn_ring_submit_locked(struct vn_ring *ring,
       *ring_seqno = seqno;
 
    return VK_SUCCESS;
-#endif
 }
+#endif
 
 VkResult
 vn_ring_submit_command_simple(struct vn_ring *ring,
                               const struct vn_cs_encoder *cs)
 {
+#if DETECT_OS_WINDOWS
+   if (!ring || !cs || cs->buffer_count != 1 ||
+       !cs->buffers[0].base || !cs->buffers[0].committed_size ||
+       cs->buffers[0].committed_size != vn_cs_encoder_get_len(cs))
+      return VK_ERROR_INITIALIZATION_FAILED;
+   mtx_lock(&ring->mutex);
+   VkResult result = vn_renderer_helios_control_no_reply(
+      ring->instance->renderer, cs->buffers[0].base,
+      cs->buffers[0].committed_size);
+   mtx_unlock(&ring->mutex);
+   return result;
+#else
    mtx_lock(&ring->mutex);
    VkResult result = vn_ring_submit_locked(ring, cs, NULL, NULL);
    mtx_unlock(&ring->mutex);
 
    return result;
+#endif
 }
 
+#if !DETECT_OS_WINDOWS
 static inline void
 vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
                                struct vn_renderer_shmem *shmem,
@@ -918,11 +835,7 @@ vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
    struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
       set_reply_command_stream_data, sizeof(set_reply_command_stream_data));
    const struct VkCommandStreamDescriptionMESA stream = {
-#if DETECT_OS_WINDOWS
-      .resourceId = 0,
-#else
       .resourceId = shmem->res_id,
-#endif
       .offset = offset,
       .size = size,
    };
@@ -930,6 +843,7 @@ vn_ring_set_reply_shmem_locked(struct vn_ring *ring,
    vn_cs_encoder_commit(&local_enc);
    vn_ring_submit_locked(ring, &local_enc, NULL, NULL);
 }
+#endif
 
 void
 vn_ring_submit_command(struct vn_ring *ring,
@@ -939,6 +853,65 @@ vn_ring_submit_command(struct vn_ring *ring,
 
    vn_cs_encoder_commit(&submit->command);
 
+#if DETECT_OS_WINDOWS
+   if (submit->command.buffer_count != 1 ||
+       submit->command.buffers != &submit->buffer ||
+       !submit->buffer.base || !submit->buffer.committed_size ||
+       submit->buffer.committed_size !=
+          vn_cs_encoder_get_len(&submit->command))
+      return;
+
+   const size_t command_size = submit->buffer.committed_size;
+   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+   mtx_lock(&ring->mutex);
+   if (submit->reply_size) {
+      const struct VkCommandStreamDescriptionMESA stream = {
+         .resourceId = 0,
+         .offset = 0,
+         .size = submit->reply_size,
+      };
+      const size_t prefix_size =
+         vn_sizeof_vkSetReplyCommandStreamMESA(&stream);
+      if (prefix_size == 36 &&
+          submit->reply_size <= HELIOS_HVR1_MAX_CHUNK_BYTES &&
+          command_size <= HELIOS_HNR2_MAX_PAYLOAD_BYTES - prefix_size) {
+         const size_t payload_size = prefix_size + command_size;
+         uint8_t *payload = malloc(payload_size);
+         void *reply = malloc(submit->reply_size);
+         if (payload && reply) {
+            struct vn_cs_encoder encoder =
+               VN_CS_ENCODER_INITIALIZER_LOCAL(payload, prefix_size);
+            vn_encode_vkSetReplyCommandStreamMESA(&encoder, 0, &stream);
+            if (!vn_cs_encoder_get_fatal(&encoder) &&
+                vn_cs_encoder_get_len(&encoder) == prefix_size) {
+               memcpy(payload + prefix_size, submit->buffer.base,
+                      command_size);
+               int32_t reply_status = VK_ERROR_DEVICE_LOST;
+               result = vn_renderer_helios_control_generated(
+                  ring->instance->renderer, payload, payload_size, reply,
+                  submit->reply_size, &reply_status);
+               if (result == VK_SUCCESS) {
+                  submit->helios_reply = reply;
+                  submit->reply = VN_CS_DECODER_INITIALIZER(
+                     reply, submit->reply_size);
+                  submit->ring_seqno = 0;
+                  submit->ring_seqno_valid = true;
+                  reply = NULL;
+               }
+            }
+         }
+         free(reply);
+         free(payload);
+      }
+   } else {
+      result = vn_renderer_helios_control_no_reply(
+         ring->instance->renderer, submit->buffer.base, command_size);
+      submit->ring_seqno = 0;
+      submit->ring_seqno_valid = result == VK_SUCCESS;
+   }
+   mtx_unlock(&ring->mutex);
+   return;
+#else
    size_t reply_offset = 0;
    if (submit->reply_size) {
       submit->reply_shmem = vn_instance_reply_shmem_alloc(
@@ -984,19 +957,34 @@ vn_ring_submit_command(struct vn_ring *ring,
          submit->reply_shmem = NULL;
       }
    }
+#endif
 }
 
 void
 vn_ring_free_command_reply(struct vn_ring *ring,
                            struct vn_ring_submit_command *submit)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   assert(submit->helios_reply && !submit->reply_shmem);
+   free(submit->helios_reply);
+   submit->helios_reply = NULL;
+#else
    assert(submit->reply_shmem);
    vn_renderer_shmem_unref(ring->instance->renderer, submit->reply_shmem);
+#endif
 }
 
 VkResult
 vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
 {
+#if DETECT_OS_WINDOWS
+   /* Finite HVC1 calls are synchronous; zero denotes that no independent
+    * roundtrip sequence exists on this platform. */
+   (void)ring;
+   *roundtrip_seqno = 0;
+   return VK_SUCCESS;
+#else
    uint32_t local_data[8];
    struct vn_cs_encoder local_enc =
       VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
@@ -1011,10 +999,16 @@ vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
 
    *roundtrip_seqno = seqno;
    return result;
+#endif
 }
 
 void
 vn_ring_wait_roundtrip(struct vn_ring *ring, uint64_t roundtrip_seqno)
 {
+#if DETECT_OS_WINDOWS
+   (void)ring;
+   assert(roundtrip_seqno == 0);
+#else
    vn_async_vkWaitVirtqueueSeqnoMESA(ring, roundtrip_seqno);
+#endif
 }

@@ -89,9 +89,17 @@ vn_deps = [
   idep_mesautil,
   idep_vulkan_util,
   idep_vulkan_lite_runtime,
-  idep_vulkan_wsi,
   idep_xmlconfig,
 ]
+
+# A9: Windows keeps only the WSI declarations used by the common Venus object
+# layouts.  The lower ICD neither compiles vn_wsi.c nor links the full WSI
+# archive; the future present layer is a separate, deliberately unwired lane.
+if with_platform_windows
+  vn_deps += idep_vulkan_wsi_headers
+else
+  vn_deps += idep_vulkan_wsi
+endif
 
 vn_c_args = [
   no_override_init_args,
@@ -200,8 +208,7 @@ if with_platform_windows
 endif
 
 if with_platform_wayland or with_platform_x11 or \
-   (system_has_kms_drm and not with_platform_android) or \
-   with_platform_windows
+   (system_has_kms_drm and not with_platform_android)
   libvn_files += files('vn_wsi.c')
   vn_c_args += '-DVN_USE_WSI_PLATFORM'
 endif

@@ -91,6 +91,9 @@ struct vn_ring_submit_command {
 
    /* when reply_size is non-zero, NULL can be returned on errors */
    struct vn_renderer_shmem *reply_shmem;
+   /* Windows A8: exact heap-owned bytes copied from one HVR1 transaction.
+    * It is mutually exclusive with reply_shmem. */
+   void *helios_reply;
    struct vn_cs_decoder reply;
 
    /* valid when ring submission succeeds */
@@ -110,6 +113,7 @@ vn_ring_submit_command_init(struct vn_ring *ring,
 
    submit->reply_size = reply_size;
    submit->reply_shmem = NULL;
+   submit->helios_reply = NULL;
 
    submit->ring_seqno_valid = false;
 
@@ -120,7 +124,7 @@ static inline struct vn_cs_decoder *
 vn_ring_get_command_reply(struct vn_ring *ring,
                           struct vn_ring_submit_command *submit)
 {
-   return submit->reply_shmem ? &submit->reply : NULL;
+   return submit->reply_shmem || submit->helios_reply ? &submit->reply : NULL;
 }
 
 void

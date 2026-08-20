@@ -136,6 +136,22 @@ VkResult helios_session_control(struct helios_translation_session *s,
                                 int32_t *reply_status,
                                 uint64_t *snapshot_generation, bool *more);
 
+/* A8 generated control: payload begins with the one fixed 36-byte
+ * SetReplyCommandStreamMESA record.  The session patches only its slot-relative
+ * offset and exact reply size after checkout; the resource operand remains
+ * zero for the KMD-private patch. */
+VkResult helios_session_control_generated(
+   struct helios_translation_session *s,
+   void *payload, uint64_t payload_bytes,
+   void *reply, uint64_t reply_capacity,
+   uint64_t *reply_bytes, int32_t *reply_status);
+
+/* One reply-less generated control batch.  It still performs the exact C51
+ * event wait and therefore returns only after the real host operation. */
+VkResult helios_session_control_no_reply(
+   struct helios_translation_session *s,
+   const void *payload, uint64_t payload_bytes);
+
 /*
  * Fetch the next chunk of an already-computed result. Never re-executes the
  * original operation and only ever asks for the exact next offset (§C66).
