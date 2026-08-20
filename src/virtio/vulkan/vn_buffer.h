@@ -12,6 +12,9 @@
 #define VN_BUFFER_H
 
 #include "vn_common.h"
+#if DETECT_OS_WINDOWS
+#include "vn_device_memory.h"
+#endif
 
 struct vn_buffer_memory_requirements {
    VkMemoryRequirements2 memory;
@@ -49,6 +52,14 @@ struct vn_buffer {
       /* buffer is prime blit dst */
       struct vn_device_memory *mem;
    } wsi;
+
+#if DETECT_OS_WINDOWS
+   struct vn_helios_memory_binding helios_binding;
+   VkDeviceAddress helios_device_address;
+   struct list_head helios_address_link;
+   bool helios_address_registered;
+   bool helios_capture_replay;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_buffer,
                                base.vk,
@@ -57,6 +68,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(vn_buffer,
 
 struct vn_buffer_view {
    struct vn_object_base base;
+#if DETECT_OS_WINDOWS
+   struct vn_buffer *helios_buffer;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_buffer_view,
                                base.vk,

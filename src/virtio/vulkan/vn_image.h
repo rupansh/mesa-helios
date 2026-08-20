@@ -12,6 +12,9 @@
 #define VN_IMAGE_H
 
 #include "vn_common.h"
+#if DETECT_OS_WINDOWS
+#include "vn_device_memory.h"
+#endif
 
 #if DETECT_OS_WINDOWS
 #include "vulkan/helios_private_wsi.h"
@@ -65,6 +68,8 @@ struct vn_image {
    } wsi;
 
 #if DETECT_OS_WINDOWS
+   struct vn_helios_memory_binding helios_bindings[4];
+
    /* The presentable-image tag set by VK_LAYER_HELIOS_present through
     * vkSetHeliosPresentableImageHELIOS (src/vulkan/helios_private_wsi.h).
     * `tagged` is what makes VK_IMAGE_LAYOUT_PRESENT_SRC_KHR meaningful for an

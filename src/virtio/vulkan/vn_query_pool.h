@@ -27,6 +27,13 @@ struct vn_query_pool {
    struct vn_feedback_buffer *fb_buf;
    uint32_t result_array_size;
    bool saturate_on_overflow;
+#if DETECT_OS_WINDOWS
+   /* The exact outer milestone of the most recent submitted command that
+    * touched this pool.  `mutex` already serializes lazy feedback setup and
+    * also protects this pair; it is object-local state, never a lookup key. */
+   uint64_t helios_context_generation;
+   uint64_t helios_progress_value;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_query_pool,
                                base.vk,

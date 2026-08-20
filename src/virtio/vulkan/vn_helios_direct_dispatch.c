@@ -24,6 +24,12 @@ enum helios_direct_context_state {
    HELIOS_DIRECT_CONTEXT_ATTACHING,
    HELIOS_DIRECT_CONTEXT_ATTACHED,
    HELIOS_DIRECT_CONTEXT_DETACHING,
+   /* The outer context is gone, but its final, actually-joined HQC1 result is
+    * retained until instance teardown.  Frontend objects can therefore finish
+    * an exact producer join without turning a dead generation into a lookup or
+    * a synthetic completion.  One context is admitted per non-reused endpoint,
+    * so this tombstone set remains bounded by the fixed endpoint table. */
+   HELIOS_DIRECT_CONTEXT_RETIRED,
 };
 
 struct helios_direct_endpoint {
@@ -40,8 +46,10 @@ struct helios_direct_context {
    void *host_context_cookie;
    uint64_t generation;
    uint64_t last_progress;
+   HeliosSyncProgressResultV1 retired_result;
    uint32_t endpoint_id;
    uint32_t context_flags;
+   uint32_t active_host_calls;
    enum helios_direct_context_state state;
 };
 
@@ -57,6 +65,8 @@ struct HeliosTranslatorInstance_T {
    uint32_t endpoint_count;
    mtx_t lock;
    bool lock_live;
+   cnd_t context_idle;
+   bool context_idle_live;
    tss_t join_key;
    bool join_key_live;
    bool poisoned;
@@ -190,7 +200,8 @@ vn_helios_direct_unregister_queue(struct vn_instance *instance,
       if (endpoint->live && endpoint->queue == queue) {
          for (struct helios_direct_context *context = direct->contexts;
               context; context = context->next) {
-            if (context->endpoint_id == endpoint_id) {
+            if (context->endpoint_id == endpoint_id &&
+                context->state != HELIOS_DIRECT_CONTEXT_RETIRED) {
                direct->poisoned = true;
                break;
             }
@@ -326,6 +337,15 @@ helios_direct_build_queue_attach(HeliosTranslatorHandle handle,
       checked = HELIOS_TRANSLATOR_STATUS_ENGINE_CLASS;
       goto unlock;
    }
+   for (struct helios_direct_context *known = direct->contexts; known;
+        known = known->next) {
+      if (known->endpoint_id == request->endpoint_id) {
+         /* Endpoints 2..64 are monotonic and non-reused.  A second context on
+          * one endpoint would make later object progress ambiguous. */
+         checked = HELIOS_TRANSLATOR_STATUS_UNKNOWN_ENDPOINT;
+         goto unlock;
+      }
+   }
 
    if (vn_renderer_helios_build_queue_attach(
           direct->instance->renderer, &endpoint->desc, request,
@@ -411,10 +431,9 @@ helios_direct_attach_outer_context(HeliosTranslatorHandle handle,
 static HeliosTranslatorStatusCode
 helios_direct_join(struct HeliosTranslatorInstance_T *direct,
                    struct helios_direct_context *context,
-                   uint64_t required_progress)
+                   uint64_t required_progress,
+                   HeliosSyncProgressResultV1 *out_result)
 {
-   if (!required_progress)
-      return HELIOS_TRANSLATOR_STATUS_OK;
    if (tss_get(direct->join_key)) {
       vn_helios_record_note_reentrant_join(direct->instance);
       return HELIOS_TRANSLATOR_STATUS_REENTRANT_JOIN;
@@ -438,7 +457,168 @@ helios_direct_join(struct HeliosTranslatorInstance_T *direct,
       return HELIOS_TRANSLATOR_STATUS_HOST_CALLBACK_FAILED;
    if (status != HELIOS_TRANSLATOR_STATUS_OK)
       return status;
-   return helios_translator_check_join_result(&result, required_progress);
+   status = helios_translator_check_join_result(&result, required_progress);
+   if (status == HELIOS_TRANSLATOR_STATUS_OK && out_result)
+      *out_result = result;
+   return status;
+}
+
+static struct helios_direct_context *
+helios_direct_acquire_context(struct HeliosTranslatorInstance_T *direct,
+                              uint64_t context_generation)
+{
+   struct helios_direct_context *context = NULL;
+   mtx_lock(&direct->lock);
+   context = helios_direct_find_context(direct, context_generation);
+   if (!context || context->state != HELIOS_DIRECT_CONTEXT_ATTACHED ||
+       context->active_host_calls == UINT32_MAX || direct->poisoned ||
+       direct->destroying) {
+      context = NULL;
+   } else {
+      context->active_host_calls++;
+   }
+   mtx_unlock(&direct->lock);
+   return context;
+}
+
+static void
+helios_direct_release_context(struct HeliosTranslatorInstance_T *direct,
+                              struct helios_direct_context *context)
+{
+   mtx_lock(&direct->lock);
+   if (context->active_host_calls)
+      context->active_host_calls--;
+   if (!context->active_host_calls && direct->context_idle_live)
+      cnd_broadcast(&direct->context_idle);
+   mtx_unlock(&direct->lock);
+}
+
+HeliosTranslatorStatusCode
+vn_helios_direct_join_context(struct vn_instance *instance,
+                              uint64_t context_generation,
+                              uint64_t required_progress,
+                              HeliosSyncProgressResultV1 *out_result)
+{
+   if (!instance || !context_generation)
+      return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
+   struct HeliosTranslatorInstance_T *direct = instance->helios_direct;
+   if (!direct || direct->instance != instance)
+      return HELIOS_TRANSLATOR_STATUS_FOREIGN_VULKAN_HANDLE;
+   mtx_lock(&direct->lock);
+   struct helios_direct_context *known =
+      helios_direct_find_context(direct, context_generation);
+   if (known && known->state == HELIOS_DIRECT_CONTEXT_RETIRED &&
+       !direct->poisoned && !direct->destroying) {
+      const HeliosSyncProgressResultV1 result = known->retired_result;
+      mtx_unlock(&direct->lock);
+      const HeliosTranslatorStatusCode status =
+         helios_translator_check_join_result(&result, required_progress);
+      if (status == HELIOS_TRANSLATOR_STATUS_OK && out_result)
+         *out_result = result;
+      return status;
+   }
+   mtx_unlock(&direct->lock);
+   struct helios_direct_context *context =
+      helios_direct_acquire_context(direct, context_generation);
+   if (!context)
+      return HELIOS_TRANSLATOR_STATUS_UNKNOWN_CONTEXT;
+   const HeliosTranslatorStatusCode status =
+      helios_direct_join(direct, context, required_progress, out_result);
+   helios_direct_release_context(direct, context);
+   return status;
+}
+
+HeliosTranslatorStatusCode
+vn_helios_direct_join_current(struct vn_instance *instance,
+                              uint64_t required_progress,
+                              HeliosSyncProgressResultV1 *out_result)
+{
+   uint64_t context_generation = 0;
+   if (!vn_helios_record_current_context(instance, &context_generation))
+      return HELIOS_TRANSLATOR_STATUS_NO_OUTER_SCOPE;
+   return vn_helios_direct_join_context(instance, context_generation,
+                                        required_progress, out_result);
+}
+
+HeliosTranslatorStatusCode
+vn_helios_direct_join_all(struct vn_instance *instance)
+{
+   if (!instance)
+      return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
+   struct HeliosTranslatorInstance_T *direct = instance->helios_direct;
+   if (!direct || direct->instance != instance)
+      return HELIOS_TRANSLATOR_STATUS_FOREIGN_VULKAN_HANDLE;
+
+   uint64_t generations[HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION];
+   uint64_t progress[HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION];
+   uint32_t count = 0;
+   mtx_lock(&direct->lock);
+   if (direct->poisoned || direct->destroying) {
+      mtx_unlock(&direct->lock);
+      return HELIOS_TRANSLATOR_STATUS_SESSION_POISONED;
+   }
+   for (struct helios_direct_context *context = direct->contexts; context;
+        context = context->next) {
+      if (context->state != HELIOS_DIRECT_CONTEXT_ATTACHED)
+         continue;
+      if (count == ARRAY_SIZE(generations)) {
+         mtx_unlock(&direct->lock);
+         return HELIOS_TRANSLATOR_STATUS_ENDPOINT_CAPACITY;
+      }
+      generations[count] = context->generation;
+      progress[count] = context->last_progress;
+      count++;
+   }
+   mtx_unlock(&direct->lock);
+
+   for (uint32_t i = 0; i < count; i++) {
+      HeliosSyncProgressResultV1 result;
+      memset(&result, 0, sizeof(result));
+      const HeliosTranslatorStatusCode status =
+         vn_helios_direct_join_context(instance, generations[i], progress[i],
+                                       &result);
+      if (status != HELIOS_TRANSLATOR_STATUS_OK)
+         return status;
+      if (result.flags & HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST)
+         return HELIOS_TRANSLATOR_STATUS_SESSION_POISONED;
+   }
+   return HELIOS_TRANSLATOR_STATUS_OK;
+}
+
+HeliosTranslatorStatusCode
+vn_helios_direct_query_context(struct vn_instance *instance,
+                               uint64_t context_generation,
+                               HeliosSyncProgressResultV1 *out_result)
+{
+   if (!instance || !context_generation || !out_result)
+      return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
+   struct HeliosTranslatorInstance_T *direct = instance->helios_direct;
+   if (!direct || direct->instance != instance)
+      return HELIOS_TRANSLATOR_STATUS_FOREIGN_VULKAN_HANDLE;
+   mtx_lock(&direct->lock);
+   struct helios_direct_context *known =
+      helios_direct_find_context(direct, context_generation);
+   if (known && known->state == HELIOS_DIRECT_CONTEXT_RETIRED &&
+       !direct->poisoned && !direct->destroying) {
+      *out_result = known->retired_result;
+      mtx_unlock(&direct->lock);
+      return helios_translator_check_query_result(out_result);
+   }
+   mtx_unlock(&direct->lock);
+   struct helios_direct_context *context =
+      helios_direct_acquire_context(direct, context_generation);
+   if (!context)
+      return HELIOS_TRANSLATOR_STATUS_UNKNOWN_CONTEXT;
+   memset(out_result, 0, sizeof(*out_result));
+   HeliosTranslatorStatusCode status = direct->host.sync_progress_query(
+      context->host_context_cookie, context->generation, out_result);
+   if (status < HELIOS_TRANSLATOR_STATUS_OK ||
+       status > HELIOS_TRANSLATOR_STATUS_MAX)
+      status = HELIOS_TRANSLATOR_STATUS_HOST_CALLBACK_FAILED;
+   else if (status == HELIOS_TRANSLATOR_STATUS_OK)
+      status = helios_translator_check_query_result(out_result);
+   helios_direct_release_context(direct, context);
+   return status;
 }
 
 static HeliosTranslatorStatusCode HELIOS_TRANSLATOR_CALL
@@ -465,14 +645,19 @@ helios_direct_detach_outer_context(HeliosTranslatorHandle handle,
    const bool attached =
       context->state == HELIOS_DIRECT_CONTEXT_ATTACHED;
    context->state = HELIOS_DIRECT_CONTEXT_DETACHING;
+   while (context->active_host_calls)
+      cnd_wait(&direct->context_idle, &direct->lock);
    mtx_unlock(&direct->lock);
 
    HeliosTranslatorStatusCode checked = HELIOS_TRANSLATOR_STATUS_OK;
+   HeliosSyncProgressResultV1 retired_result;
+   memset(&retired_result, 0, sizeof(retired_result));
    if (attached) {
       checked = vn_helios_record_context_can_destroy(context->record);
       if (checked == HELIOS_TRANSLATOR_STATUS_OK)
          checked = helios_direct_join(direct, context,
-                                      context->last_progress);
+                                      context->last_progress,
+                                      &retired_result);
       if (checked == HELIOS_TRANSLATOR_STATUS_OK)
          checked = vn_helios_record_context_destroy(context->record);
    }
@@ -485,16 +670,14 @@ helios_direct_detach_outer_context(HeliosTranslatorHandle handle,
    }
 
    mtx_lock(&direct->lock);
-   struct helios_direct_context **link = &direct->contexts;
-   while (*link && *link != context)
-      link = &(*link)->next;
-   if (*link == context) {
-      *link = context->next;
-      if (direct->context_count)
-         direct->context_count--;
-   }
+   context->record = NULL;
+   context->queue = NULL;
+   context->host_context_cookie = NULL;
+   context->retired_result = retired_result;
+   context->state = HELIOS_DIRECT_CONTEXT_RETIRED;
+   if (direct->context_count)
+      direct->context_count--;
    mtx_unlock(&direct->lock);
-   free(context);
    return HELIOS_TRANSLATOR_STATUS_OK;
 }
 
@@ -623,7 +806,7 @@ helios_direct_destroy_instance(HeliosTranslatorHandle handle)
       return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
 
    mtx_lock(&direct->lock);
-   if (direct->contexts || direct->context_count || direct->endpoint_count) {
+   if (direct->context_count || direct->endpoint_count) {
       mtx_unlock(&direct->lock);
       return HELIOS_TRANSLATOR_STATUS_CONTEXT_STILL_ATTACHED;
    }
@@ -633,13 +816,22 @@ helios_direct_destroy_instance(HeliosTranslatorHandle handle)
    }
    direct->destroying = true;
    struct vn_instance *instance = direct->instance;
+   struct helios_direct_context *contexts = direct->contexts;
+   direct->contexts = NULL;
    instance->helios_direct = NULL;
    direct->instance = NULL;
    mtx_unlock(&direct->lock);
 
    vn_DestroyInstance(vn_instance_to_handle(instance), NULL);
+   while (contexts) {
+      struct helios_direct_context *next = contexts->next;
+      free(contexts);
+      contexts = next;
+   }
    if (direct->join_key_live)
       tss_delete(direct->join_key);
+   if (direct->context_idle_live)
+      cnd_destroy(&direct->context_idle);
    if (direct->lock_live)
       mtx_destroy(&direct->lock);
    free(direct);
@@ -708,7 +900,15 @@ helios_icd_create_translator_v1(
       return HELIOS_TRANSLATOR_STATUS_SESSION_CAPACITY;
    }
    direct->lock_live = true;
+   if (cnd_init(&direct->context_idle) != thrd_success) {
+      mtx_destroy(&direct->lock);
+      free(direct);
+      vn_DestroyInstance(vk_instance, NULL);
+      return HELIOS_TRANSLATOR_STATUS_SESSION_CAPACITY;
+   }
+   direct->context_idle_live = true;
    if (tss_create(&direct->join_key, NULL) != thrd_success) {
+      cnd_destroy(&direct->context_idle);
       mtx_destroy(&direct->lock);
       free(direct);
       vn_DestroyInstance(vk_instance, NULL);
@@ -720,6 +920,7 @@ helios_icd_create_translator_v1(
       helios_module_from_address((const void *)helios_icd_create_translator_v1);
    if (!module) {
       tss_delete(direct->join_key);
+      cnd_destroy(&direct->context_idle);
       mtx_destroy(&direct->lock);
       free(direct);
       vn_DestroyInstance(vk_instance, NULL);

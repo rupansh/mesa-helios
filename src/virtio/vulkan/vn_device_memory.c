@@ -16,7 +16,12 @@
 
 #include "vn_android.h"
 #include "vn_buffer.h"
+#include "vn_cs.h"
 #include "vn_device.h"
+#ifdef _WIN32
+#include "vn_helios_direct_dispatch.h"
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_image.h"
 #include "vn_physical_device.h"
 #include "vn_renderer.h"
@@ -458,8 +463,10 @@ vn_device_memory_fix_alloc_info(
    const VkMemoryAllocateInfo *alloc_info,
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
    bool has_guest_vram,
+   bool force_capture_replay,
    struct vn_device_memory_alloc_info *local_info)
 {
+   bool has_flags = false;
    local_info->alloc = *alloc_info;
    VkBaseOutStructure *cur = (void *)&local_info->alloc;
 
@@ -476,6 +483,10 @@ vn_device_memory_fix_alloc_info(
          break;
       case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
          memcpy(&local_info->flags, src, sizeof(local_info->flags));
+         if (force_capture_replay)
+            local_info->flags.flags |=
+               VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+         has_flags = true;
          next = &local_info->flags;
          break;
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
@@ -496,10 +507,106 @@ vn_device_memory_fix_alloc_info(
       }
    }
 
+   if (force_capture_replay && !has_flags) {
+      local_info->flags = (VkMemoryAllocateFlagsInfo){
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+         .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
+                  VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT,
+      };
+      cur->pNext = (void *)&local_info->flags;
+      cur = (void *)&local_info->flags;
+   }
+
    cur->pNext = NULL;
 
    return &local_info->alloc;
 }
+
+#ifdef _WIN32
+static VkResult
+vn_device_memory_defer_outer_allocate(
+   struct vn_device *dev,
+   struct vn_device_memory *mem,
+   const VkMemoryAllocateInfo *alloc_info)
+{
+   if (!mem->helios_outer_registered || mem->base.vk.export_handle_types)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   const VkMemoryAllocateFlagsInfo *flags_info =
+      vk_find_struct_const(alloc_info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+   const bool force_capture_replay =
+      dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
+      dev->base.vk.enabled_features.bufferDeviceAddress &&
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      flags_info &&
+      (flags_info->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT);
+   struct vn_device_memory_alloc_info clean_info;
+   const VkMemoryAllocateInfo *clean = vn_device_memory_fix_alloc_info(
+      alloc_info, 0, false, force_capture_replay, &clean_info);
+   clean_info.alloc.memoryTypeIndex =
+      vn_physical_device_renderer_memory_type_index(
+         dev->physical_device, mem->base.vk.memory_type_index);
+
+   const VkImportMemoryResourceInfoMESA import = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+      .pNext = clean->pNext,
+      .resourceId = 0,
+   };
+   const VkMemoryAllocateInfo local = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &import,
+      .allocationSize = mem->helios_outer.outer_allocation_bytes,
+      .memoryTypeIndex = clean_info.alloc.memoryTypeIndex,
+   };
+   VkDeviceMemory memory = vn_device_memory_to_handle(mem);
+   const size_t payload_bytes = vn_sizeof_vkAllocateMemory(
+      vn_device_to_handle(dev), &local, NULL, &memory);
+   if (!payload_bytes || payload_bytes > HELIOS_HOB1_MAX_BYTES)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   uint8_t *payload = malloc(payload_bytes);
+   if (!payload)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct vn_cs_encoder encoder =
+      VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+   vn_encode_vkAllocateMemory(&encoder, 0, vn_device_to_handle(dev),
+                              &local, NULL, &memory);
+   if (vn_cs_encoder_get_fatal(&encoder) ||
+       vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+      free(payload);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   const size_t chain_bytes =
+      vn_sizeof_VkMemoryAllocateInfo_pnext(clean->pNext);
+   if (chain_bytes > UINT32_MAX - 40u) {
+      free(payload);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   const uint32_t operand_offset = 40u + (uint32_t)chain_bytes;
+   uint32_t placeholder = UINT32_MAX;
+   if (payload_bytes >= sizeof(placeholder) &&
+       operand_offset <= payload_bytes - sizeof(placeholder))
+      memcpy(&placeholder, payload + operand_offset, sizeof(placeholder));
+   if (payload_bytes < sizeof(uint32_t) ||
+       operand_offset > payload_bytes - sizeof(uint32_t) ||
+       placeholder != 0) {
+      free(payload);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   struct vn_helios_deferred_record *record =
+      vn_device_memory_helios_record_create(
+         mem, payload, payload_bytes, operand_offset, true, false);
+   if (!record)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   VkResult result =
+      vn_device_memory_helios_record_install(dev, mem, record);
+   if (result != VK_SUCCESS)
+      vn_device_memory_helios_record_destroy(record);
+   return result;
+}
+#endif
 
 static VkResult
 vn_device_memory_alloc(struct vn_device *dev,
@@ -507,13 +614,17 @@ vn_device_memory_alloc(struct vn_device *dev,
                        const VkMemoryAllocateInfo *alloc_info)
 {
 #ifdef _WIN32
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return vn_device_memory_defer_outer_allocate(dev, mem, alloc_info);
+
    /* A3 owns every ordinary allocation as one HVM1 object before the host
     * import.  Export handle types are A6 and are not advertised or emulated. */
    if (mem->base.vk.export_handle_types)
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct vn_device_memory_alloc_info local_info;
    alloc_info = vn_device_memory_fix_alloc_info(
-      alloc_info, 0, false, &local_info);
+      alloc_info, 0, false, false, &local_info);
    local_info.alloc.memoryTypeIndex =
       vn_physical_device_renderer_memory_type_index(
          dev->physical_device, mem->base.vk.memory_type_index);
@@ -559,7 +670,8 @@ vn_device_memory_alloc(struct vn_device *dev,
        mem_vk->export_handle_types &&
        mem_vk->export_handle_types != renderer_handle_type) {
       alloc_info = vn_device_memory_fix_alloc_info(
-         alloc_info, renderer_handle_type, has_guest_vram, &local_info);
+         alloc_info, renderer_handle_type, has_guest_vram, false,
+         &local_info);
    }
 
    if (has_guest_vram && (host_visible || export_alloc)) {
@@ -619,7 +731,7 @@ vn_device_memory_import_win32(
 
    struct vn_device_memory_alloc_info clean_info;
    VkMemoryAllocateInfo local = *vn_device_memory_fix_alloc_info(
-      alloc_info, 0, false, &clean_info);
+      alloc_info, 0, false, false, &clean_info);
    local.allocationSize = payload_size;
    local.memoryTypeIndex = vn_physical_device_renderer_memory_type_index(
       dev->physical_device, VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL);
@@ -685,6 +797,363 @@ vn_device_memory_emit_report(struct vn_device *dev,
                                 mem_type->heapIndex);
 }
 
+#ifdef _WIN32
+#define VN_HELIOS_MAX_OUTER_ALLOCATIONS HELIOS_HOB1_MAX_USE_RECORDS
+
+static VkResult
+vn_device_memory_reserve_outer_association(
+   struct vn_device *dev,
+   struct vn_device_memory *mem,
+   const VkMemoryAllocateInfo *alloc_info)
+{
+   const HeliosResourceAssociationV1 *association = NULL;
+   uint32_t association_count = 0;
+
+   for (const VkBaseInStructure *node = alloc_info->pNext; node;
+        node = node->pNext) {
+      if ((uint32_t)node->sType ==
+          HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE) {
+         association = (const HeliosResourceAssociationV1 *)node;
+         association_count++;
+      }
+   }
+
+   list_inithead(&mem->helios_outer_link);
+   list_inithead(&mem->helios_deferred_records);
+   memset(&mem->helios_outer, 0, sizeof(mem->helios_outer));
+   mem->helios_deferred_record_count = 0;
+   mem->helios_outer_registered = false;
+   mem->helios_host_materialized = false;
+   mem->helios_free_pending = false;
+   memset(&mem->helios_free_allocator, 0,
+          sizeof(mem->helios_free_allocator));
+   if (!association_count) {
+      if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+         vn_helios_record_note_deferred_use(dev->instance);
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+      return VK_SUCCESS;
+   }
+
+   const uint64_t expected_generation =
+      vn_renderer_helios_session_generation(dev->renderer);
+   const VkMemoryType *memory_type =
+      &dev->physical_device->memory_properties.memoryTypes
+         [mem->base.vk.memory_type_index];
+   const bool host_visible =
+      memory_type->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+   const bool has_cpu_mapping =
+      association->association_flags &
+      HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING;
+   const uintptr_t cpu_mapping = (uintptr_t)association->cpu_mapping;
+   if (association_count != 1 ||
+       vn_helios_submit_instance_mode(dev->instance) !=
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY ||
+       association->s_type != HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE ||
+       association->struct_bytes != HELIOS_RESOURCE_ASSOCIATION_BYTES ||
+       association->abi_version != HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION ||
+       association->reserved != 0 ||
+       association->package_generation != HELIOS_PACKAGE_GENERATION ||
+       !expected_generation ||
+       association->device_generation != expected_generation ||
+       !association->outer_allocation_token ||
+       !association->outer_allocation_bytes ||
+       alloc_info->allocationSize > association->outer_allocation_bytes ||
+       (association->association_flags &
+        ~HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK) ||
+       association->reserved1 ||
+       (!!association->cpu_mapping != has_cpu_mapping) ||
+       (host_visible && !has_cpu_mapping) ||
+       (has_cpu_mapping &&
+        ((cpu_mapping & 4095u) ||
+         association->outer_allocation_bytes > UINTPTR_MAX - cpu_mapping)))
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   /* Keep only the immutable record.  Its optional CPU pointer is a data view,
+    * never identity; the caller's pNext pointer is stack-owned and is never
+    * retained as identity or as a later traversal edge. */
+   mem->helios_outer = *association;
+   mem->helios_outer.p_next = NULL;
+
+   simple_mtx_lock(&dev->mutex);
+   if (dev->helios_outer_allocation_count >=
+       VN_HELIOS_MAX_OUTER_ALLOCATIONS) {
+      simple_mtx_unlock(&dev->mutex);
+      memset(&mem->helios_outer, 0, sizeof(mem->helios_outer));
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   list_for_each_entry(struct vn_device_memory, live,
+                       &dev->helios_outer_allocations,
+                       helios_outer_link) {
+      if (live->helios_outer.outer_allocation_token ==
+          association->outer_allocation_token) {
+         simple_mtx_unlock(&dev->mutex);
+         memset(&mem->helios_outer, 0, sizeof(mem->helios_outer));
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+   }
+   list_addtail(&mem->helios_outer_link, &dev->helios_outer_allocations);
+   dev->helios_outer_allocation_count++;
+   mem->helios_outer_registered = true;
+   simple_mtx_unlock(&dev->mutex);
+   return VK_SUCCESS;
+}
+
+struct vn_helios_deferred_record *
+vn_device_memory_helios_record_create(struct vn_device_memory *mem,
+                                      void *payload,
+                                      size_t payload_bytes,
+                                      uint32_t resource_operand_offset,
+                                      bool allocation_record,
+                                      bool final_free_record)
+{
+   if (!mem || !payload || !payload_bytes || payload_bytes > UINT32_MAX ||
+       (resource_operand_offset != VN_HELIOS_NO_RESOURCE_OPERAND &&
+        (payload_bytes < sizeof(uint32_t) ||
+         (resource_operand_offset & (HELIOS_HOB1_OPERAND_ALIGN - 1u)) ||
+         resource_operand_offset > payload_bytes - sizeof(uint32_t)))) {
+      free(payload);
+      return NULL;
+   }
+   struct vn_helios_deferred_record *record = calloc(1, sizeof(*record));
+   if (!record) {
+      free(payload);
+      return NULL;
+   }
+   list_inithead(&record->link);
+   record->owner = mem;
+   record->payload = payload;
+   record->payload_bytes = (uint32_t)payload_bytes;
+   record->resource_operand_offset = resource_operand_offset;
+   record->allocation_record = allocation_record;
+   record->final_free_record = final_free_record;
+   return record;
+}
+
+VkResult
+vn_device_memory_helios_records_install(
+   struct vn_device *dev,
+   struct vn_helios_deferred_record *const *records,
+   uint32_t record_count)
+{
+   if (!dev || (record_count && !records) ||
+       record_count > HELIOS_HOB1_MAX_USE_RECORDS)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   VkResult result = VK_SUCCESS;
+   simple_mtx_lock(&dev->mutex);
+   for (uint32_t i = 0; i < record_count; i++) {
+      struct vn_helios_deferred_record *record = records[i];
+      struct vn_device_memory *mem = record ? record->owner : NULL;
+      uint32_t same_owner_before = 0;
+      for (uint32_t j = 0; j < i; j++)
+         same_owner_before += records[j]->owner == mem;
+      if (!record || !mem || !list_is_empty(&record->link) ||
+          !mem->helios_outer_registered ||
+          mem->base.vk.base.device != &dev->base.vk ||
+          (mem->helios_free_pending != record->final_free_record) ||
+          same_owner_before >= HELIOS_HOB1_MAX_USE_RECORDS -
+                                  mem->helios_deferred_record_count ||
+          (record->allocation_record &&
+           (mem->helios_host_materialized ||
+            mem->helios_deferred_record_count != 0 ||
+            same_owner_before != 0))) {
+         result = VK_ERROR_VALIDATION_FAILED_EXT;
+         break;
+      }
+   }
+   if (result == VK_SUCCESS) {
+      for (uint32_t i = 0; i < record_count; i++) {
+         struct vn_helios_deferred_record *record = records[i];
+         struct vn_device_memory *mem = record->owner;
+         list_addtail(&record->link, &mem->helios_deferred_records);
+         mem->helios_deferred_record_count++;
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+   return result;
+}
+
+VkResult
+vn_device_memory_helios_record_install(
+   struct vn_device *dev,
+   struct vn_device_memory *mem,
+   struct vn_helios_deferred_record *record)
+{
+   if (!record || record->owner != mem)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   return vn_device_memory_helios_records_install(dev, &record, 1);
+}
+
+void
+vn_device_memory_helios_record_destroy(
+   struct vn_helios_deferred_record *record)
+{
+   if (!record)
+      return;
+   assert(list_is_empty(&record->link));
+   free(record->payload);
+   free(record);
+}
+
+struct vn_device_memory *
+vn_device_memory_helios_binding_memory(
+   struct vn_device *dev,
+   const struct vn_helios_memory_binding *binding)
+{
+   if (!dev || !binding || !binding->valid)
+      return NULL;
+   struct vn_device_memory *match = NULL;
+   simple_mtx_lock(&dev->mutex);
+   list_for_each_entry(struct vn_device_memory, mem,
+                       &dev->helios_outer_allocations,
+                       helios_outer_link) {
+      if (mem->helios_outer_registered &&
+          mem->helios_outer.device_generation ==
+             binding->device_generation &&
+          mem->helios_outer.outer_allocation_token ==
+             binding->outer_allocation_token &&
+          mem->helios_outer.outer_allocation_bytes ==
+             binding->outer_allocation_bytes) {
+         if (match) {
+            match = NULL;
+            break;
+         }
+         match = mem;
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+   return match;
+}
+
+static bool
+vn_device_memory_release_outer_association(struct vn_device *dev,
+                                           struct vn_device_memory *mem)
+{
+   if (!mem->helios_outer_registered)
+      return true;
+   struct list_head retired;
+   list_inithead(&retired);
+   simple_mtx_lock(&dev->mutex);
+   if (mem->helios_outer_registered) {
+      list_for_each_entry(struct vn_helios_deferred_record, record,
+                          &mem->helios_deferred_records, link) {
+         if (record->reserved_context_generation ||
+             record->reserved_batch_id) {
+            simple_mtx_unlock(&dev->mutex);
+            return false;
+         }
+      }
+      list_splicetail(&mem->helios_deferred_records, &retired);
+      list_inithead(&mem->helios_deferred_records);
+      mem->helios_deferred_record_count = 0;
+      list_delinit(&mem->helios_outer_link);
+      assert(dev->helios_outer_allocation_count > 0);
+      dev->helios_outer_allocation_count--;
+      mem->helios_outer_registered = false;
+   }
+   simple_mtx_unlock(&dev->mutex);
+   list_for_each_entry_safe(struct vn_helios_deferred_record, record,
+                            &retired, link) {
+      list_delinit(&record->link);
+      vn_device_memory_helios_record_destroy(record);
+   }
+   memset(&mem->helios_outer, 0, sizeof(mem->helios_outer));
+   mem->helios_host_materialized = false;
+   return true;
+}
+
+bool
+vn_device_memory_helios_finalize_pending_free(
+   struct vn_device *dev,
+   struct vn_device_memory *mem)
+{
+   if (!dev || !mem || !mem->helios_free_pending ||
+       mem->base.vk.base.device != &dev->base.vk)
+      return false;
+   if (!vn_device_memory_release_outer_association(dev, mem))
+      return false;
+
+   mem->helios_free_pending = false;
+   vn_device_memory_bo_fini(dev, mem);
+   if (mem->helios_external_memory) {
+      vn_renderer_helios_external_memory_destroy(
+         dev->renderer, mem->helios_external_memory);
+      mem->helios_external_memory = NULL;
+   }
+   const VkAllocationCallbacks allocator = mem->helios_free_allocator;
+   vk_device_memory_destroy(&dev->base.vk, &allocator, &mem->base.vk);
+   return true;
+}
+
+VkResult
+vn_device_memory_helios_bind(struct vn_device *dev,
+                             struct vn_device_memory *mem,
+                             VkDeviceSize offset,
+                             VkDeviceSize length,
+                             struct vn_helios_memory_binding *out)
+{
+   if (!dev || !mem || !out || !length ||
+       mem->base.vk.base.device != &dev->base.vk ||
+       !mem->helios_outer_registered)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   const uint64_t end = (uint64_t)offset + (uint64_t)length;
+   if (end < (uint64_t)offset || end > mem->base.vk.size ||
+       end > mem->helios_outer.outer_allocation_bytes)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   struct vn_helios_memory_binding binding = {
+      .device_generation = mem->helios_outer.device_generation,
+      .outer_allocation_token =
+         mem->helios_outer.outer_allocation_token,
+      .outer_allocation_bytes =
+         mem->helios_outer.outer_allocation_bytes,
+      .byte_offset = offset,
+      .byte_length = length,
+      .valid = true,
+   };
+   if (!vn_device_memory_helios_binding_live(dev, &binding))
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   *out = binding;
+   return VK_SUCCESS;
+}
+
+bool
+vn_device_memory_helios_binding_live(
+   struct vn_device *dev,
+   const struct vn_helios_memory_binding *binding)
+{
+   if (!dev || !binding || !binding->valid ||
+       !binding->device_generation || !binding->outer_allocation_token ||
+       !binding->byte_length)
+      return false;
+   const uint64_t end = binding->byte_offset + binding->byte_length;
+   if (end < binding->byte_offset ||
+       end > binding->outer_allocation_bytes)
+      return false;
+
+   bool found = false;
+   simple_mtx_lock(&dev->mutex);
+   list_for_each_entry(struct vn_device_memory, live,
+                       &dev->helios_outer_allocations,
+                       helios_outer_link) {
+      if (live->helios_outer.device_generation ==
+             binding->device_generation &&
+          live->helios_outer.outer_allocation_token ==
+             binding->outer_allocation_token &&
+          live->helios_outer.outer_allocation_bytes ==
+             binding->outer_allocation_bytes) {
+         found = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+   return found;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_AllocateMemory(VkDevice device,
                   const VkMemoryAllocateInfo *pAllocateInfo,
@@ -702,6 +1171,13 @@ vn_AllocateMemory(VkDevice device,
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
 #ifdef _WIN32
+   VkResult association_result =
+      vn_device_memory_reserve_outer_association(dev, mem, pAllocateInfo);
+   if (association_result != VK_SUCCESS) {
+      vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
+      return vn_error(dev->instance, association_result);
+   }
+
    const bool preserve_export =
       vn_preserve_explicit_dmabuf_handle_types(
          dev->physical_device, mem->base.vk.export_handle_types);
@@ -753,7 +1229,7 @@ vn_AllocateMemory(VkDevice device,
                  mem->base.vk.export_handle_types);
       const VkMemoryAllocateInfo *renderer_alloc_info =
          vn_device_memory_fix_alloc_info(pAllocateInfo,
-                                         resource_export_type, false,
+                                         resource_export_type, false, false,
                                          &local_info);
       result = vn_device_memory_import_resource_id(
          dev, mem, renderer_alloc_info, import_resource_info->resourceId);
@@ -771,6 +1247,9 @@ vn_AllocateMemory(VkDevice device,
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ true, result);
 
    if (result != VK_SUCCESS) {
+#ifdef _WIN32
+      (void)vn_device_memory_release_outer_association(dev, mem);
+#endif
       vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
       return vn_error(dev->instance, result);
    }
@@ -808,8 +1287,126 @@ vn_FreeMemory(VkDevice device,
    vn_device_memory_unregister_coherent_cached_mapping(dev, mem);
 
 #ifdef _WIN32
-   /* Host FreeMemory is terminal on the bootstrap context before the exact
-    * allocation capability can be revoked. */
+   const bool record_only =
+      vn_helios_submit_instance_mode(dev->instance) ==
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   const bool host_materialized = mem->helios_host_materialized;
+
+   if (record_only) {
+      /* S_FALSE from the package-owned outer begin edge means this exact
+       * allocation never appeared in an accepted batch. There is no host
+       * namespace object to destroy and no context to join: discard its
+       * unconsumed immutable records and retire local ownership directly. An
+       * active scope distinguishes the ordinary first-and-terminal batch,
+       * where allocation and free must still be emitted together. */
+      if (!host_materialized &&
+          !vn_helios_record_has_active_scope(dev->instance)) {
+         const VkAllocationCallbacks *free_alloc =
+            pAllocator ? pAllocator : &dev->base.vk.alloc;
+         mem->helios_free_allocator = *free_alloc;
+         mem->helios_free_pending = true;
+         if (!vn_device_memory_helios_finalize_pending_free(dev, mem)) {
+            vn_helios_record_note_deferred_use(dev->instance);
+            p_atomic_set(&dev->helios_lost, 1);
+            (void)vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+         }
+         return;
+      }
+
+      bool joined = true;
+      /* A materialized allocation can still be referenced by every exact
+       * outer context that consumed it.  Join those HQC1 values before adding
+       * the terminal FreeMemory record to the calling thread's teardown
+       * scope.  Ring zero and a lower Vulkan wait are not substitutes. */
+      struct vn_helios_outer_progress
+         progress_points[HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION];
+      uint32_t progress_count = 0;
+      simple_mtx_lock(&dev->mutex);
+      progress_count = mem->helios_outer_progress_count;
+      memcpy(progress_points, mem->helios_outer_progress,
+             sizeof(progress_points));
+      simple_mtx_unlock(&dev->mutex);
+      if (host_materialized && !progress_count)
+         joined = false;
+      for (uint32_t i = 0; joined && i < progress_count; i++) {
+         HeliosSyncProgressResultV1 progress;
+         memset(&progress, 0, sizeof(progress));
+         const HeliosTranslatorStatusCode status =
+            vn_helios_direct_join_context(
+               dev->instance, progress_points[i].context_generation,
+               progress_points[i].progress_value, &progress);
+         if (status != HELIOS_TRANSLATOR_STATUS_OK ||
+             (progress.flags & HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST)) {
+            joined = false;
+         }
+      }
+
+      const VkAllocationCallbacks *free_alloc =
+         pAllocator ? pAllocator : &dev->base.vk.alloc;
+      mem->helios_free_allocator = *free_alloc;
+      mem->helios_free_pending = true;
+
+      VkResult teardown_result = joined ? VK_SUCCESS
+                                        : VK_ERROR_DEVICE_LOST;
+      const size_t payload_bytes =
+         vn_sizeof_vkFreeMemory(device, memory, NULL);
+      uint8_t *payload = NULL;
+      struct vn_helios_deferred_record *record = NULL;
+      if (teardown_result == VK_SUCCESS) {
+         if (!payload_bytes || payload_bytes > HELIOS_HOB1_MAX_BYTES ||
+             !(payload = malloc(payload_bytes))) {
+            teardown_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+      }
+      if (teardown_result == VK_SUCCESS) {
+         struct vn_cs_encoder encoder =
+            VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+         vn_encode_vkFreeMemory(&encoder, 0, device, memory, NULL);
+         if (vn_cs_encoder_get_fatal(&encoder) ||
+             vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+            free(payload);
+            payload = NULL;
+            teardown_result = VK_ERROR_INITIALIZATION_FAILED;
+         }
+      }
+      if (teardown_result == VK_SUCCESS) {
+         record = vn_device_memory_helios_record_create(
+            mem, payload, payload_bytes, VN_HELIOS_NO_RESOURCE_OPERAND,
+            false, true);
+         payload = NULL;
+         if (!record) {
+            teardown_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         } else {
+            teardown_result =
+               vn_device_memory_helios_record_install(dev, mem, record);
+            if (teardown_result != VK_SUCCESS) {
+               vn_device_memory_helios_record_destroy(record);
+               record = NULL;
+            }
+         }
+      }
+      if (teardown_result == VK_SUCCESS)
+         teardown_result = vn_helios_record_memory_teardown(dev, mem);
+      if (teardown_result == VK_SUCCESS)
+         return;
+
+      free(payload);
+      vn_helios_record_note_deferred_use(dev->instance);
+      p_atomic_set(&dev->helios_lost, 1);
+      (void)vn_error(dev->instance, teardown_result);
+      /* No host command was accepted.  Remove the association before local
+       * storage can be reused; the lost session owns any unexecuted host
+       * objects until its normal namespace teardown. */
+      if (!vn_device_memory_helios_finalize_pending_free(dev, mem))
+         (void)vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+      return;
+   }
+
+   if (!vn_device_memory_release_outer_association(dev, mem)) {
+      p_atomic_set(&dev->helios_lost, 1);
+      (void)vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+      return;
+   }
    if (mem->base_bo) {
       VkResult free_result = vn_renderer_helios_free_memory(
          dev->renderer, device, memory, mem->base_bo);
@@ -914,6 +1511,57 @@ vn_MapMemory2(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_device_memory *mem =
       vn_device_memory_from_handle(pMemoryMapInfo->memory);
+#ifdef _WIN32
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!ppData || !mem ||
+          mem->base.vk.base.device != &dev->base.vk ||
+          !mem->helios_outer_registered || mem->helios_free_pending ||
+          pMemoryMapInfo->flags || pMemoryMapInfo->pNext ||
+          mem->map_end > mem->map_start) {
+         return vn_error(dev->instance,
+                         VK_ERROR_VALIDATION_FAILED_EXT);
+      }
+      const struct vk_device_memory *outer_mem_vk = &mem->base.vk;
+      const VkMemoryType *memory_type =
+         &dev->physical_device->memory_properties.memoryTypes
+            [outer_mem_vk->memory_type_index];
+      if (!(memory_type->propertyFlags &
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
+          !(memory_type->propertyFlags &
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          !(mem->helios_outer.association_flags &
+            HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING) ||
+          !mem->helios_outer.cpu_mapping) {
+         return vn_error(dev->instance, VK_ERROR_MEMORY_MAP_FAILED);
+      }
+
+      const VkDeviceSize outer_offset = pMemoryMapInfo->offset;
+      VkDeviceSize outer_end = 0;
+      if (pMemoryMapInfo->size == VK_WHOLE_SIZE) {
+         outer_end = outer_mem_vk->size;
+      } else if (!pMemoryMapInfo->size ||
+                 __builtin_add_overflow(outer_offset,
+                                        pMemoryMapInfo->size,
+                                        &outer_end)) {
+         return vn_error(dev->instance,
+                         VK_ERROR_VALIDATION_FAILED_EXT);
+      }
+      const uintptr_t mapping =
+         (uintptr_t)mem->helios_outer.cpu_mapping;
+      if (outer_end <= outer_offset || outer_end > outer_mem_vk->size ||
+          outer_end > mem->helios_outer.outer_allocation_bytes ||
+          outer_offset > UINTPTR_MAX - mapping) {
+         return vn_error(dev->instance,
+                         VK_ERROR_VALIDATION_FAILED_EXT);
+      }
+
+      mem->map_start = outer_offset;
+      mem->map_end = outer_end;
+      *ppData = (void *)(mapping + (uintptr_t)outer_offset);
+      return VK_SUCCESS;
+   }
+#endif
    const VkDeviceSize offset = pMemoryMapInfo->offset;
    const VkDeviceSize size = pMemoryMapInfo->size;
    const struct vk_device_memory *mem_vk = &mem->base.vk;
@@ -1007,6 +1655,22 @@ vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
    struct vn_device_memory *mem =
       vn_device_memory_from_handle(pMemoryUnmapInfo->memory);
 
+#ifdef _WIN32
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!mem || mem->base.vk.base.device != &dev->base.vk ||
+          !mem->helios_outer_registered || mem->helios_free_pending ||
+          pMemoryUnmapInfo->flags || pMemoryUnmapInfo->pNext ||
+          mem->map_end <= mem->map_start) {
+         return vn_error(dev->instance,
+                         VK_ERROR_VALIDATION_FAILED_EXT);
+      }
+      mem->map_start = 0;
+      mem->map_end = 0;
+      return VK_SUCCESS;
+   }
+#endif
+
    if (mem) {
       if (mem->coherent_cached_mapped && mem->base_bo &&
           mem->base_bo->mmap_ptr && mem->map_end > mem->map_start &&
@@ -1022,12 +1686,76 @@ vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
    return VK_SUCCESS;
 }
 
+#ifdef _WIN32
+static VkResult
+vn_device_memory_validate_outer_mapped_ranges(
+   struct vn_device *dev,
+   uint32_t memory_range_count,
+   const VkMappedMemoryRange *memory_ranges)
+{
+   if (memory_range_count && !memory_ranges)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   for (uint32_t i = 0; i < memory_range_count; i++) {
+      const VkMappedMemoryRange *range = &memory_ranges[i];
+      struct vn_device_memory *mem =
+         vn_device_memory_from_handle(range->memory);
+      if (!mem || mem->base.vk.base.device != &dev->base.vk ||
+          !mem->helios_outer_registered || mem->helios_free_pending ||
+          range->pNext || mem->map_end <= mem->map_start ||
+          !(mem->helios_outer.association_flags &
+            HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING) ||
+          !mem->helios_outer.cpu_mapping) {
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+      const struct vk_device_memory *mem_vk = &mem->base.vk;
+      const VkMemoryType *memory_type =
+         &dev->physical_device->memory_properties.memoryTypes
+            [mem_vk->memory_type_index];
+      if ((memory_type->propertyFlags &
+           (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) !=
+          (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+
+      VkDeviceSize end = 0;
+      if (range->size == VK_WHOLE_SIZE) {
+         end = mem_vk->size;
+      } else if (!range->size ||
+                 __builtin_add_overflow(range->offset, range->size,
+                                        &end)) {
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+      if (range->offset < mem->map_start || end <= range->offset ||
+          end > mem->map_end || end > mem_vk->size ||
+          end > mem->helios_outer.outer_allocation_bytes) {
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      }
+   }
+   return VK_SUCCESS;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_FlushMappedMemoryRanges(VkDevice device,
                            uint32_t memoryRangeCount,
                            const VkMappedMemoryRange *pMemoryRanges)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+
+#ifdef _WIN32
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      const VkResult result =
+         vn_device_memory_validate_outer_mapped_ranges(
+            dev, memoryRangeCount, pMemoryRanges);
+      return result == VK_SUCCESS
+                ? VK_SUCCESS
+                : vn_error(dev->instance, result);
+   }
+#endif
 
    for (uint32_t i = 0; i < memoryRangeCount; i++) {
       const VkMappedMemoryRange *range = &pMemoryRanges[i];
@@ -1049,6 +1777,18 @@ vn_InvalidateMappedMemoryRanges(VkDevice device,
                                 const VkMappedMemoryRange *pMemoryRanges)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+
+#ifdef _WIN32
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      const VkResult result =
+         vn_device_memory_validate_outer_mapped_ranges(
+            dev, memoryRangeCount, pMemoryRanges);
+      return result == VK_SUCCESS
+                ? VK_SUCCESS
+                : vn_error(dev->instance, result);
+   }
+#endif
 
    for (uint32_t i = 0; i < memoryRangeCount; i++) {
       const VkMappedMemoryRange *range = &pMemoryRanges[i];

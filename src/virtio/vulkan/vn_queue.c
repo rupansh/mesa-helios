@@ -26,6 +26,7 @@
 #include "vn_wsi.h"
 
 #if DETECT_OS_WINDOWS
+#include "vn_helios_direct_dispatch.h"
 #include "vn_helios_record_submit.h"
 #endif
 
@@ -1725,16 +1726,9 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
       .ring_idx = sem->external_payload.ring_idx,
    };
 
-   uint32_t local_data[8];
-   struct vn_cs_encoder local_enc =
-      VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
-   if (sem->external_payload.ring_seqno_valid) {
-      const uint64_t ring_id = vn_ring_get_id(dev->primary_ring);
-      vn_encode_vkWaitRingSeqnoMESA(&local_enc, 0, ring_id,
-                                    sem->external_payload.ring_seqno);
-      batch.cs_data = local_data;
-      batch.cs_size = vn_cs_encoder_get_len(&local_enc);
-   }
+   /* A8 control submission is host-terminal before this point.  The old
+    * ring-seqno prefix ordered decoder consumption, not GPU completion, and
+    * therefore has no Windows replacement. */
 
    const struct vn_renderer_submit submit = {
       .batches = &batch,
@@ -2552,6 +2546,11 @@ vn_fence_feedback_init(struct vn_device *dev,
                        bool signaled,
                        const VkAllocationCallbacks *alloc)
 {
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return VK_SUCCESS;
+#endif
    VkDevice dev_handle = vn_device_to_handle(dev);
    struct vn_feedback_slot *slot;
    VkCommandBuffer *cmd_handles;
@@ -2684,6 +2683,10 @@ vn_CreateFence(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vn_object_base_init(&fence->base, VK_OBJECT_TYPE_FENCE, &dev->base);
+#if DETECT_OS_WINDOWS
+   simple_mtx_init(&fence->helios_progress_mtx, mtx_plain);
+   fence->helios_locally_signaled = signaled;
+#endif
 
    const struct VkExportFenceCreateInfo *export_info =
       vk_find_struct_const(pCreateInfo->pNext, EXPORT_FENCE_CREATE_INFO);
@@ -2710,6 +2713,9 @@ out_payloads_fini:
    vn_sync_payload_release(dev, &fence->temporary);
 
 out_object_base_fini:
+#if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&fence->helios_progress_mtx);
+#endif
    vn_object_base_fini(&fence->base);
    vk_free(alloc, fence);
    return vn_error(dev->instance, result);
@@ -2736,6 +2742,9 @@ vn_DestroyFence(VkDevice device,
    vn_sync_payload_release(dev, &fence->permanent);
    vn_sync_payload_release(dev, &fence->temporary);
 
+#if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&fence->helios_progress_mtx);
+#endif
    vn_object_base_fini(&fence->base);
    vk_free(alloc, fence);
 }
@@ -2761,6 +2770,13 @@ vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
          vn_feedback_reset_status(fence->feedback.slot);
          fence->feedback.pollable = true;
       }
+#if DETECT_OS_WINDOWS
+      simple_mtx_lock(&fence->helios_progress_mtx);
+      fence->helios_context_generation = 0;
+      fence->helios_progress_value = 0;
+      fence->helios_locally_signaled = false;
+      simple_mtx_unlock(&fence->helios_progress_mtx);
+#endif
    }
 
    return VK_SUCCESS;
@@ -2800,6 +2816,36 @@ vn_helios_ring_wait_bound_ns(void)
    return bound_ns;
 }
 
+#if DETECT_OS_WINDOWS
+static bool
+vn_helios_fence_progress(struct vn_fence *fence,
+                         uint64_t *context_generation,
+                         uint64_t *progress_value,
+                         bool *locally_signaled)
+{
+   simple_mtx_lock(&fence->helios_progress_mtx);
+   *context_generation = fence->helios_context_generation;
+   *progress_value = fence->helios_progress_value;
+   *locally_signaled = fence->helios_locally_signaled;
+   simple_mtx_unlock(&fence->helios_progress_mtx);
+   return *context_generation != 0 && *progress_value != 0;
+}
+
+static VkResult
+vn_helios_progress_status_to_vk(HeliosTranslatorStatusCode status,
+                                const HeliosSyncProgressResultV1 *progress)
+{
+   if (status == HELIOS_TRANSLATOR_STATUS_OK)
+      return progress->flags & HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST
+                ? VK_ERROR_DEVICE_LOST
+                : VK_SUCCESS;
+   return status == HELIOS_TRANSLATOR_STATUS_SESSION_POISONED ||
+                status == HELIOS_TRANSLATOR_STATUS_HOST_CALLBACK_FAILED
+             ? VK_ERROR_DEVICE_LOST
+             : VK_ERROR_VALIDATION_FAILED_EXT;
+}
+#endif
+
 static VkResult
 vn_get_fence_status(VkDevice dev_handle,
                     VkFence fence_handle,
@@ -2807,9 +2853,34 @@ vn_get_fence_status(VkDevice dev_handle,
 {
    struct vn_device *dev = vn_device_from_handle(dev_handle);
    struct vn_fence *fence = vn_fence_from_handle(fence_handle);
-   struct vn_sync_payload *payload = fence->payload;
+   struct vn_sync_payload *payload = fence ? fence->payload : NULL;
 
    VkResult result;
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!fence || fence->base.vk.device != &dev->base.vk)
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      uint64_t context_generation = 0;
+      uint64_t progress_value = 0;
+      bool locally_signaled = false;
+      if (!vn_helios_fence_progress(fence, &context_generation,
+                                    &progress_value, &locally_signaled))
+         return locally_signaled ? VK_SUCCESS : VK_NOT_READY;
+      HeliosSyncProgressResultV1 progress;
+      memset(&progress, 0, sizeof(progress));
+      const HeliosTranslatorStatusCode status =
+         vn_helios_direct_query_context(dev->instance, context_generation,
+                                        &progress);
+      result = vn_helios_progress_status_to_vk(status, &progress);
+      if (result != VK_SUCCESS)
+         return result;
+      if (progress.completed_progress_value < progress_value)
+         return VK_NOT_READY;
+      return vn_call_vkGetFenceStatus(dev->primary_ring, dev_handle,
+                                      fence_handle);
+   }
+#endif
    switch (payload->type) {
    case VN_SYNC_TYPE_DEVICE_ONLY:
       if (fence->feedback.pollable) {
@@ -2942,6 +3013,60 @@ vn_WaitForFences(VkDevice device,
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
 
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!fenceCount || !pFences)
+         return vn_error(dev->instance, VK_ERROR_VALIDATION_FAILED_EXT);
+      uint32_t ready = 0;
+      for (uint32_t i = 0; i < fenceCount; i++) {
+         VkResult status = vn_get_fence_status(device, pFences[i], NULL);
+         if (status < 0)
+            return vn_error(dev->instance, status);
+         ready += status == VK_SUCCESS;
+      }
+      if ((waitAll && ready == fenceCount) || (!waitAll && ready))
+         return VK_SUCCESS;
+      if (!timeout)
+         return VK_TIMEOUT;
+
+      for (uint32_t i = 0; i < fenceCount; i++) {
+         struct vn_fence *fence = vn_fence_from_handle(pFences[i]);
+         uint64_t context_generation = 0;
+         uint64_t progress_value = 0;
+         bool locally_signaled = false;
+         if (!fence || fence->base.vk.device != &dev->base.vk)
+            return vn_error(dev->instance,
+                            VK_ERROR_VALIDATION_FAILED_EXT);
+         if (!vn_helios_fence_progress(fence, &context_generation,
+                                       &progress_value,
+                                       &locally_signaled)) {
+            if (locally_signaled)
+               continue;
+            return VK_TIMEOUT;
+         }
+         HeliosSyncProgressResultV1 progress;
+         memset(&progress, 0, sizeof(progress));
+         const HeliosTranslatorStatusCode joined =
+            vn_helios_direct_join_context(dev->instance,
+                                          context_generation,
+                                          progress_value, &progress);
+         VkResult result =
+            vn_helios_progress_status_to_vk(joined, &progress);
+         if (result != VK_SUCCESS)
+            return vn_error(dev->instance, result);
+         if (!waitAll)
+            break;
+      }
+      VkResult result = vn_call_vkWaitForFences(
+         dev->primary_ring, device, fenceCount, pFences, waitAll, 0);
+      if (result == VK_SUCCESS)
+         vn_device_memory_invalidate_coherent_cached_mappings(dev);
+      return vn_result(dev->instance,
+                       result == VK_TIMEOUT ? VK_TIMEOUT : result);
+   }
+#endif
+
    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    VkResult result = VK_NOT_READY;
    if (fenceCount > 1 && waitAll) {
@@ -2995,6 +3120,7 @@ vn_create_sync_file(struct vn_device *dev,
       .ring_idx = external_payload->ring_idx,
    };
 
+#if !DETECT_OS_WINDOWS
    uint32_t local_data[8];
    struct vn_cs_encoder local_enc =
       VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
@@ -3005,6 +3131,7 @@ vn_create_sync_file(struct vn_device *dev,
       batch.cs_data = local_data;
       batch.cs_size = vn_cs_encoder_get_len(&local_enc);
    }
+#endif
 
    const struct vn_renderer_submit submit = {
       .batches = &batch,
@@ -3220,6 +3347,11 @@ vn_semaphore_feedback_init(struct vn_device *dev,
                            uint64_t initial_value,
                            const VkAllocationCallbacks *alloc)
 {
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return VK_SUCCESS;
+#endif
    struct vn_feedback_slot *slot;
 
    assert(sem->type == VK_SEMAPHORE_TYPE_TIMELINE);
@@ -3367,6 +3499,7 @@ vn_CreateSemaphore(VkDevice device,
 
 #if DETECT_OS_WINDOWS
    simple_mtx_init(&sem->helios_host_signal_mtx, mtx_plain);
+   simple_mtx_init(&sem->helios_progress_mtx, mtx_plain);
 #endif
 
    const VkSemaphoreTypeCreateInfo *type_info =
@@ -3445,6 +3578,7 @@ out_payloads_fini:
 
 out_object_base_fini:
 #if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&sem->helios_progress_mtx);
    simple_mtx_destroy(&sem->helios_host_signal_mtx);
 #endif
    vn_object_base_fini(&sem->base);
@@ -3475,6 +3609,7 @@ vn_DestroySemaphore(VkDevice device,
    vn_sync_payload_release(dev, &sem->temporary);
 
 #if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&sem->helios_progress_mtx);
    simple_mtx_destroy(&sem->helios_host_signal_mtx);
 #endif
    vn_object_base_fini(&sem->base);
@@ -3532,7 +3667,7 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
 {
    struct vn_device *dev = vn_device_from_handle(dev_handle);
    struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
-   ASSERTED struct vn_sync_payload *payload = sem->payload;
+   ASSERTED struct vn_sync_payload *payload = sem ? sem->payload : NULL;
    bool check_device_lost = false;
    bool deadline_hit = false;
 
@@ -3540,6 +3675,8 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
       return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
 
 #if DETECT_OS_WINDOWS
+   if (!sem || !payload)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
    /* An imported Win32 semaphore has no renderer-side timeline state to
     * query: its authoritative counter is the imported WDDM monitored fence.
     * vn_WaitSemaphores follows the same rule.  This must precede the
@@ -3550,6 +3687,39 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       return vn_renderer_sync_read(dev->renderer, payload->win32_sync,
                                    out_value);
+   }
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!sem || sem->base.vk.device != &dev->base.vk ||
+          sem->type != VK_SEMAPHORE_TYPE_TIMELINE)
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+      uint64_t context_generation = 0;
+      uint64_t progress_value = 0;
+      uint64_t signal_value = 0;
+      simple_mtx_lock(&sem->helios_progress_mtx);
+      context_generation = sem->helios_context_generation;
+      progress_value = sem->helios_progress_value;
+      signal_value = sem->helios_progress_signal_value;
+      simple_mtx_unlock(&sem->helios_progress_mtx);
+      if (context_generation && progress_value) {
+         HeliosSyncProgressResultV1 progress;
+         memset(&progress, 0, sizeof(progress));
+         const HeliosTranslatorStatusCode queried =
+            vn_helios_direct_query_context(dev->instance,
+                                           context_generation, &progress);
+         VkResult result =
+            vn_helios_progress_status_to_vk(queried, &progress);
+         if (result != VK_SUCCESS)
+            return result;
+         if (progress.completed_progress_value < progress_value) {
+            *out_value = MIN2(
+               p_atomic_read(&sem->helios_max_forwarded_host_value),
+               signal_value ? signal_value - 1 : 0);
+            return VK_SUCCESS;
+         }
+      }
+      return vn_call_vkGetSemaphoreCounterValue(
+         dev->primary_ring, dev_handle, sem_handle, out_value);
    }
 #endif
 
@@ -3976,6 +4146,14 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
       if (result != VK_SUCCESS)
          return vn_error(dev->instance, result);
    }
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      simple_mtx_lock(&sem->helios_progress_mtx);
+      sem->helios_context_generation = 0;
+      sem->helios_progress_value = 0;
+      sem->helios_progress_signal_value = 0;
+      simple_mtx_unlock(&sem->helios_progress_mtx);
+   }
 #endif
 
    return VK_SUCCESS;
@@ -4127,6 +4305,74 @@ vn_WaitSemaphores(VkDevice device,
          sem->feedback.pollable = true;
          simple_mtx_unlock(&sem->feedback.counter_mtx);
       }
+   }
+#endif
+
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!pWaitInfo ||
+          pWaitInfo->sType != VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO ||
+          !pWaitInfo->semaphoreCount || !pWaitInfo->pSemaphores ||
+          !pWaitInfo->pValues)
+         return vn_error(dev->instance,
+                         VK_ERROR_VALIDATION_FAILED_EXT);
+      const bool wait_any =
+         pWaitInfo->flags & VK_SEMAPHORE_WAIT_ANY_BIT;
+      uint32_t ready = 0;
+      for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
+         uint64_t value = 0;
+         VkResult queried = vn_get_semaphore_counter_value(
+            device, pWaitInfo->pSemaphores[i], NULL, &value);
+         if (queried != VK_SUCCESS)
+            return vn_result(dev->instance, queried);
+         ready += value >= pWaitInfo->pValues[i];
+      }
+      if ((wait_any && ready) ||
+          (!wait_any && ready == pWaitInfo->semaphoreCount))
+         return VK_SUCCESS;
+      if (!timeout)
+         return VK_TIMEOUT;
+
+      bool joined_candidate = false;
+      for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
+         struct vn_semaphore *sem =
+            vn_semaphore_from_handle(pWaitInfo->pSemaphores[i]);
+         if (!sem || sem->base.vk.device != &dev->base.vk)
+            return vn_error(dev->instance,
+                            VK_ERROR_VALIDATION_FAILED_EXT);
+         if (sem->payload && sem->payload->win32_sync)
+            continue;
+         uint64_t context_generation;
+         uint64_t progress_value;
+         uint64_t signal_value;
+         simple_mtx_lock(&sem->helios_progress_mtx);
+         context_generation = sem->helios_context_generation;
+         progress_value = sem->helios_progress_value;
+         signal_value = sem->helios_progress_signal_value;
+         simple_mtx_unlock(&sem->helios_progress_mtx);
+         if (!context_generation || !progress_value ||
+             signal_value < pWaitInfo->pValues[i])
+            continue;
+         HeliosSyncProgressResultV1 progress;
+         memset(&progress, 0, sizeof(progress));
+         HeliosTranslatorStatusCode joined = vn_helios_direct_join_context(
+            dev->instance, context_generation, progress_value, &progress);
+         VkResult join_result =
+            vn_helios_progress_status_to_vk(joined, &progress);
+         if (join_result != VK_SUCCESS)
+            return vn_error(dev->instance, join_result);
+         joined_candidate = true;
+         if (wait_any)
+            break;
+      }
+      if (!joined_candidate)
+         return VK_TIMEOUT;
+      VkResult result = vn_call_vkWaitSemaphores(
+         dev->primary_ring, device, pWaitInfo, 0);
+      if (result == VK_SUCCESS)
+         vn_device_memory_invalidate_coherent_cached_mappings(dev);
+      return vn_result(dev->instance, result);
    }
 #endif
 
@@ -4313,6 +4559,11 @@ vn_GetSemaphoreWin32HandleKHR(
 static VkResult
 vn_event_feedback_init(struct vn_device *dev, struct vn_event *ev)
 {
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return VK_SUCCESS;
+#endif
    struct vn_feedback_slot *slot;
 
    if (VN_PERF(NO_EVENT_FEEDBACK))
@@ -4337,6 +4588,48 @@ vn_event_feedback_fini(struct vn_device *dev, struct vn_event *ev)
       vn_feedback_pool_free(&dev->feedback_pool, ev->feedback_slot);
 }
 
+#if DETECT_OS_WINDOWS
+static VkResult
+vn_helios_event_join_producer(struct vn_device *dev,
+                              struct vn_event *event)
+{
+   if (vn_helios_submit_instance_mode(dev->instance) !=
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return VK_SUCCESS;
+
+   uint64_t context_generation;
+   uint64_t progress_value;
+   simple_mtx_lock(&event->helios_progress_mtx);
+   context_generation = event->helios_context_generation;
+   progress_value = event->helios_progress_value;
+   simple_mtx_unlock(&event->helios_progress_mtx);
+   if (!context_generation && !progress_value)
+      return VK_SUCCESS;
+   if (!context_generation || !progress_value)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+
+   HeliosSyncProgressResultV1 progress;
+   memset(&progress, 0, sizeof(progress));
+   const HeliosTranslatorStatusCode status =
+      vn_helios_direct_join_context(dev->instance, context_generation,
+                                    progress_value, &progress);
+   VkResult result = vn_helios_progress_status_to_vk(status, &progress);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Vulkan externally synchronizes host access to an event.  Still compare
+    * the exact producer pair so a bad caller cannot erase a newer stamp. */
+   simple_mtx_lock(&event->helios_progress_mtx);
+   if (event->helios_context_generation == context_generation &&
+       event->helios_progress_value == progress_value) {
+      event->helios_context_generation = 0;
+      event->helios_progress_value = 0;
+   }
+   simple_mtx_unlock(&event->helios_progress_mtx);
+   return VK_SUCCESS;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateEvent(VkDevice device,
                const VkEventCreateInfo *pCreateInfo,
@@ -4354,12 +4647,21 @@ vn_CreateEvent(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vn_object_base_init(&ev->base, VK_OBJECT_TYPE_EVENT, &dev->base);
+#if DETECT_OS_WINDOWS
+   simple_mtx_init(&ev->helios_progress_mtx, mtx_plain);
+#endif
 
    /* feedback is only needed to speed up host operations */
    if (!(pCreateInfo->flags & VK_EVENT_CREATE_DEVICE_ONLY_BIT)) {
       VkResult result = vn_event_feedback_init(dev, ev);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+#if DETECT_OS_WINDOWS
+         simple_mtx_destroy(&ev->helios_progress_mtx);
+#endif
+         vn_object_base_fini(&ev->base);
+         vk_free(alloc, ev);
          return vn_error(dev->instance, result);
+      }
    }
 
    VkEvent ev_handle = vn_event_to_handle(ev);
@@ -4385,10 +4687,21 @@ vn_DestroyEvent(VkDevice device,
    if (!ev)
       return;
 
+#if DETECT_OS_WINDOWS
+   const VkResult joined = vn_helios_event_join_producer(dev, ev);
+   if (joined == VK_SUCCESS)
+      vn_async_vkDestroyEvent(dev->primary_ring, device, event, NULL);
+   else
+      (void)vn_error(dev->instance, joined);
+#else
    vn_async_vkDestroyEvent(dev->primary_ring, device, event, NULL);
+#endif
 
    vn_event_feedback_fini(dev, ev);
 
+#if DETECT_OS_WINDOWS
+   simple_mtx_destroy(&ev->helios_progress_mtx);
+#endif
    vn_object_base_fini(&ev->base);
    vk_free(alloc, ev);
 }
@@ -4400,6 +4713,12 @@ vn_GetEventStatus(VkDevice device, VkEvent event)
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_event *ev = vn_event_from_handle(event);
    VkResult result;
+
+#if DETECT_OS_WINDOWS
+   result = vn_helios_event_join_producer(dev, ev);
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, result);
+#endif
 
    if (ev->feedback_slot)
       result = vn_feedback_get_status(ev->feedback_slot);
@@ -4415,6 +4734,12 @@ vn_SetEvent(VkDevice device, VkEvent event)
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_event *ev = vn_event_from_handle(event);
+
+#if DETECT_OS_WINDOWS
+   VkResult joined = vn_helios_event_join_producer(dev, ev);
+   if (joined != VK_SUCCESS)
+      return vn_error(dev->instance, joined);
+#endif
 
    if (ev->feedback_slot) {
       vn_feedback_set_status(ev->feedback_slot, VK_EVENT_SET);
@@ -4434,6 +4759,12 @@ vn_ResetEvent(VkDevice device, VkEvent event)
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_event *ev = vn_event_from_handle(event);
+
+#if DETECT_OS_WINDOWS
+   VkResult joined = vn_helios_event_join_producer(dev, ev);
+   if (joined != VK_SUCCESS)
+      return vn_error(dev->instance, joined);
+#endif
 
    if (ev->feedback_slot) {
       vn_feedback_reset_status(ev->feedback_slot);

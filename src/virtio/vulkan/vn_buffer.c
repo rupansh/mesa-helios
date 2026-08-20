@@ -15,10 +15,23 @@
 
 #include "vn_device.h"
 #include "vn_device_memory.h"
+#if DETECT_OS_WINDOWS
+#include "vn_cs.h"
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_physical_device.h"
 #include "util/stack_array.h"
 
 /* buffer commands */
+
+static VkBufferUsageFlags2
+vn_buffer_effective_usage(const VkBufferCreateInfo *create_info)
+{
+   const VkBufferUsageFlags2CreateInfo *usage2 =
+      vk_find_struct_const(create_info->pNext,
+                           BUFFER_USAGE_FLAGS_2_CREATE_INFO);
+   return usage2 ? usage2->usage : create_info->usage;
+}
 
 static uint64_t
 vn_buffer_get_cache_index(const VkBufferCreateInfo *create_info,
@@ -318,6 +331,9 @@ vn_buffer_create(struct vn_device *dev,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    vn_object_base_init(&buf->base, VK_OBJECT_TYPE_BUFFER, &dev->base);
+#if DETECT_OS_WINDOWS
+   list_inithead(&buf->helios_address_link);
+#endif
 
    result = vn_buffer_init(dev, create_info, buf);
    if (result != VK_SUCCESS) {
@@ -336,16 +352,21 @@ struct vn_buffer_create_info {
    VkExternalMemoryBufferCreateInfo external;
    VkBufferOpaqueCaptureAddressCreateInfo capture;
    VkBufferDeviceAddressCreateInfoEXT address;
+   VkBufferUsageFlags2CreateInfo usage2;
 };
 
 static const VkBufferCreateInfo *
 vn_buffer_fix_create_info(
    const VkBufferCreateInfo *create_info,
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type,
+   bool force_capture_replay,
    struct vn_buffer_create_info *local_info)
 {
    bool has_external = false;
    local_info->create = *create_info;
+   if (force_capture_replay)
+      local_info->create.flags |=
+         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
    VkBaseOutStructure *cur = (void *)&local_info->create;
 
    vk_foreach_struct_const(src, create_info->pNext) {
@@ -365,6 +386,10 @@ vn_buffer_fix_create_info(
          memcpy(&local_info->address, src, sizeof(local_info->address));
          next = &local_info->address;
          break;
+      case VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO:
+         memcpy(&local_info->usage2, src, sizeof(local_info->usage2));
+         next = &local_info->usage2;
+         break;
       default:
          break;
       }
@@ -381,7 +406,7 @@ vn_buffer_fix_create_info(
     * VUID-VkBindBufferMemoryInfo-memory-02726 (UB; observed faulting the
     * GPU on the NVIDIA proprietary driver while ANV tolerates it). Inject
     * the renderer handle type when the app provided no external info. */
-   if (!has_external) {
+   if (renderer_handle_type && !has_external) {
       local_info->external = (VkExternalMemoryBufferCreateInfo){
          .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
          .handleTypes = renderer_handle_type,
@@ -412,17 +437,31 @@ vn_CreateBuffer(VkDevice device,
       vn_renderer_handle_type_for_guest(
          dev->physical_device,
          external_info ? external_info->handleTypes : 0);
-   if (renderer_handle_type &&
-       (!external_info || !external_info->handleTypes ||
-        external_info->handleTypes != renderer_handle_type)) {
+   const bool helios_capture_replay =
+      vn_helios_submit_instance_mode(dev->instance) ==
+         VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+      dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
+      dev->base.vk.enabled_features.bufferDeviceAddress &&
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      (vn_buffer_effective_usage(pCreateInfo) &
+       VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
+   if (helios_capture_replay ||
+       (renderer_handle_type &&
+        (!external_info || !external_info->handleTypes ||
+         external_info->handleTypes != renderer_handle_type))) {
       pCreateInfo = vn_buffer_fix_create_info(
-         pCreateInfo, renderer_handle_type, &local_info);
+         pCreateInfo, renderer_handle_type, helios_capture_replay,
+         &local_info);
    }
 
    struct vn_buffer *buf;
    VkResult result = vn_buffer_create(dev, pCreateInfo, alloc, &buf);
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
+
+#if DETECT_OS_WINDOWS
+   buf->helios_capture_replay = helios_capture_replay;
+#endif
 
    *pBuffer = vn_buffer_to_handle(buf);
 
@@ -442,7 +481,68 @@ vn_DestroyBuffer(VkDevice device,
    if (!buf)
       return;
 
-   vn_async_vkDestroyBuffer(dev->primary_ring, device, buffer, NULL);
+#if DETECT_OS_WINDOWS
+   if (buf->helios_address_registered) {
+      simple_mtx_lock(&dev->mutex);
+      if (buf->helios_address_registered) {
+         list_delinit(&buf->helios_address_link);
+         assert(dev->helios_address_buffer_count > 0);
+         dev->helios_address_buffer_count--;
+         buf->helios_address_registered = false;
+      }
+      simple_mtx_unlock(&dev->mutex);
+   }
+#endif
+
+#if DETECT_OS_WINDOWS
+   const bool record_only =
+      vn_helios_submit_instance_mode(dev->instance) ==
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   if (record_only && buf->helios_binding.valid) {
+      struct vn_device_memory *mem =
+         vn_device_memory_helios_binding_memory(
+            dev, &buf->helios_binding);
+      const size_t payload_bytes =
+         vn_sizeof_vkDestroyBuffer(device, buffer, NULL);
+      uint8_t *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+      VkResult defer_result = VK_SUCCESS;
+      if (!mem || !payload || payload_bytes > HELIOS_HOB1_MAX_BYTES) {
+         free(payload);
+         defer_result = mem ? VK_ERROR_OUT_OF_HOST_MEMORY
+                            : VK_ERROR_VALIDATION_FAILED_EXT;
+      } else {
+         struct vn_cs_encoder encoder =
+            VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+         vn_encode_vkDestroyBuffer(&encoder, 0, device, buffer, NULL);
+         if (vn_cs_encoder_get_fatal(&encoder) ||
+             vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+            free(payload);
+            defer_result = VK_ERROR_INITIALIZATION_FAILED;
+         } else {
+            struct vn_helios_deferred_record *record =
+               vn_device_memory_helios_record_create(
+                  mem, payload, payload_bytes,
+                  VN_HELIOS_NO_RESOURCE_OPERAND, false, false);
+            if (!record) {
+               defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            } else {
+               defer_result = vn_device_memory_helios_record_install(
+                  dev, mem, record);
+               if (defer_result != VK_SUCCESS)
+                  vn_device_memory_helios_record_destroy(record);
+            }
+         }
+      }
+      if (defer_result != VK_SUCCESS) {
+         vn_helios_record_note_deferred_use(dev->instance);
+         p_atomic_set(&dev->helios_lost, 1);
+         (void)vn_error(dev->instance, defer_result);
+      }
+   } else
+#endif
+   {
+      vn_async_vkDestroyBuffer(dev->primary_ring, device, buffer, NULL);
+   }
 
    vn_object_base_fini(&buf->base);
    vk_free(alloc, buf);
@@ -453,8 +553,39 @@ vn_GetBufferDeviceAddress(VkDevice device,
                           const VkBufferDeviceAddressInfo *pInfo)
 {
    struct vn_device *dev = vn_device_from_handle(device);
-
-   return vn_call_vkGetBufferDeviceAddress(dev->primary_ring, device, pInfo);
+#if DETECT_OS_WINDOWS
+   struct vn_buffer *buf = vn_buffer_from_handle(pInfo->buffer);
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+       (!buf || buf->base.vk.device != &dev->base.vk ||
+        !buf->helios_capture_replay))
+      return 0;
+#endif
+   VkDeviceAddress address =
+      vn_call_vkGetBufferDeviceAddress(dev->primary_ring, device, pInfo);
+#if DETECT_OS_WINDOWS
+   if (address && buf && buf->base.vk.device == &dev->base.vk) {
+      simple_mtx_lock(&dev->mutex);
+      if (buf->helios_device_address &&
+          buf->helios_device_address != address) {
+         address = 0;
+      } else {
+         buf->helios_device_address = address;
+         if (!buf->helios_address_registered &&
+             dev->helios_address_buffer_count <
+                HELIOS_HOB1_MAX_USE_RECORDS) {
+            list_addtail(&buf->helios_address_link,
+                         &dev->helios_address_buffers);
+            dev->helios_address_buffer_count++;
+            buf->helios_address_registered = true;
+         } else if (!buf->helios_address_registered) {
+            address = 0;
+         }
+      }
+      simple_mtx_unlock(&dev->mutex);
+   }
+#endif
+   return address;
 }
 
 VKAPI_ATTR uint64_t VKAPI_CALL
@@ -488,12 +619,105 @@ vn_BindBufferMemory2(VkDevice device,
    if (!local_infos)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if DETECT_OS_WINDOWS
+   STACK_ARRAY(struct vn_helios_memory_binding, helios_bindings,
+               bindInfoCount);
+   STACK_ARRAY(struct vn_helios_deferred_record *, helios_records,
+               bindInfoCount);
+   if (!helios_bindings || !helios_records) {
+      STACK_ARRAY_FINISH(helios_records);
+      STACK_ARRAY_FINISH(helios_bindings);
+      STACK_ARRAY_FINISH(local_infos);
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   memset(helios_records, 0, bindInfoCount * sizeof(*helios_records));
+   const bool record_only =
+      vn_helios_submit_instance_mode(dev->instance) ==
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   if (record_only) {
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_buffer *buf =
+            vn_buffer_from_handle(pBindInfos[i].buffer);
+         struct vn_device_memory *mem =
+            vn_device_memory_from_handle(pBindInfos[i].memory);
+         if (!buf || buf->base.vk.device != &dev->base.vk ||
+             buf->helios_binding.valid ||
+             vn_device_memory_helios_bind(
+                dev, mem, pBindInfos[i].memoryOffset,
+                buf->requirements.memory.memoryRequirements.size,
+                &helios_bindings[i]) != VK_SUCCESS) {
+            STACK_ARRAY_FINISH(helios_records);
+            STACK_ARRAY_FINISH(helios_bindings);
+            STACK_ARRAY_FINISH(local_infos);
+            return vn_error(dev->instance,
+                            VK_ERROR_VALIDATION_FAILED_EXT);
+         }
+      }
+   }
+#endif
+
    typed_memcpy(local_infos, pBindInfos, bindInfoCount);
    for (uint32_t i = 0; i < bindInfoCount; i++)
       local_infos[i].pNext = NULL;
 
+#if DETECT_OS_WINDOWS
+   if (record_only) {
+      VkResult defer_result = VK_SUCCESS;
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_device_memory *mem =
+            vn_device_memory_from_handle(local_infos[i].memory);
+         const size_t payload_bytes =
+            vn_sizeof_vkBindBufferMemory2(device, 1, &local_infos[i]);
+         uint8_t *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+         if (!payload || payload_bytes > HELIOS_HOB1_MAX_BYTES) {
+            free(payload);
+            defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+         struct vn_cs_encoder encoder =
+            VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+         vn_encode_vkBindBufferMemory2(&encoder, 0, device, 1,
+                                       &local_infos[i]);
+         if (vn_cs_encoder_get_fatal(&encoder) ||
+             vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+            free(payload);
+            defer_result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+         }
+         helios_records[i] = vn_device_memory_helios_record_create(
+            mem, payload, payload_bytes, VN_HELIOS_NO_RESOURCE_OPERAND,
+            false, false);
+         if (!helios_records[i]) {
+            defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+      }
+      if (defer_result == VK_SUCCESS)
+         defer_result = vn_device_memory_helios_records_install(
+            dev, helios_records, bindInfoCount);
+      if (defer_result != VK_SUCCESS) {
+         for (uint32_t i = 0; i < bindInfoCount; i++)
+            vn_device_memory_helios_record_destroy(helios_records[i]);
+         STACK_ARRAY_FINISH(helios_records);
+         STACK_ARRAY_FINISH(helios_bindings);
+         STACK_ARRAY_FINISH(local_infos);
+         return vn_error(dev->instance, defer_result);
+      }
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_buffer *buf =
+            vn_buffer_from_handle(pBindInfos[i].buffer);
+         buf->helios_binding = helios_bindings[i];
+      }
+   } else {
+      vn_async_vkBindBufferMemory2(dev->primary_ring, device, bindInfoCount,
+                                   local_infos);
+   }
+   STACK_ARRAY_FINISH(helios_records);
+   STACK_ARRAY_FINISH(helios_bindings);
+#else
    vn_async_vkBindBufferMemory2(dev->primary_ring, device, bindInfoCount,
                                 local_infos);
+#endif
 
    STACK_ARRAY_FINISH(local_infos);
 
@@ -526,6 +750,9 @@ vn_CreateBufferView(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vn_object_base_init(&view->base, VK_OBJECT_TYPE_BUFFER_VIEW, &dev->base);
+#if DETECT_OS_WINDOWS
+   view->helios_buffer = vn_buffer_from_handle(pCreateInfo->buffer);
+#endif
 
    VkBufferView view_handle = vn_buffer_view_to_handle(view);
    vn_async_vkCreateBufferView(dev->primary_ring, device, pCreateInfo, NULL,
@@ -582,14 +809,24 @@ vn_GetDeviceBufferMemoryRequirements(
       vn_renderer_handle_type_for_guest(
          dev->physical_device,
          external_info ? external_info->handleTypes : 0);
+   const bool helios_capture_replay =
+      vn_helios_submit_instance_mode(dev->instance) ==
+         VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+      dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
+      dev->base.vk.enabled_features.bufferDeviceAddress &&
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      (vn_buffer_effective_usage(pInfo->pCreateInfo) &
+       VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
    struct vn_buffer_create_info local_info;
    VkDeviceBufferMemoryRequirements fixed_info;
-   if (renderer_handle_type &&
-       (!external_info || !external_info->handleTypes ||
-        external_info->handleTypes != renderer_handle_type)) {
+   if (helios_capture_replay ||
+       (renderer_handle_type &&
+        (!external_info || !external_info->handleTypes ||
+         external_info->handleTypes != renderer_handle_type))) {
       fixed_info = *pInfo;
       fixed_info.pCreateInfo = vn_buffer_fix_create_info(
-         pInfo->pCreateInfo, renderer_handle_type, &local_info);
+         pInfo->pCreateInfo, renderer_handle_type, helios_capture_replay,
+         &local_info);
       pInfo = &fixed_info;
    }
 

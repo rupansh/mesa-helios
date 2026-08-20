@@ -17,8 +17,14 @@
 #include "vk_format.h"
 
 #include "vn_android.h"
+#if DETECT_OS_WINDOWS
+#include "vn_cs.h"
+#endif
 #include "vn_device.h"
 #include "vn_device_memory.h"
+#if DETECT_OS_WINDOWS
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_physical_device.h"
 #include "vn_wsi.h"
 #include "util/stack_array.h"
@@ -631,10 +637,12 @@ vn_CreateImage(VkDevice device,
    } else if (swapchain_info) {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       result = vn_image_create_deferred(dev, pCreateInfo, alloc, &img);
-#else
+#elif defined(VN_USE_WSI_PLATFORM)
       result = wsi_common_create_swapchain_image(
          &dev->physical_device->wsi_device, pCreateInfo,
          (VkImage *)&img);
+#else
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
 #endif
    } else {
       struct vn_image_create_info local_info;
@@ -642,15 +650,10 @@ vn_CreateImage(VkDevice device,
       const VkImageCreateInfo *app_create_info = pCreateInfo;
 #endif
       /* Helios: also inject external info into LINEAR images with no
-       * external info of their own. The Win32 software swapchain creates
-       * its present images without the wsi_image_create_info marker and
-       * binds them to HOST_VISIBLE memory, which vkr force-exports
-       * (VUID-VkBindImageMemoryInfo-memory-02728 otherwise). LINEAR limits
-       * the change to cpu-mappable images; OPTIMAL device-local images are
-       * left untouched. PREINITIALIZED images cannot legally carry external
-       * info (VUID-VkImageCreateInfo-pNext-01443), so those keep the
-       * upstream-venus bind mismatch — apps like vkcube use them for
-       * staging textures; Doom does not. */
+       * external info of their own. LINEAR limits the renderer-side handle
+       * fixup to CPU-mappable images; OPTIMAL device-local images are left
+       * untouched. PREINITIALIZED images cannot legally carry external info
+       * (VUID-VkImageCreateInfo-pNext-01443). */
       /* Helios: preserve an explicit DMA_BUF request exactly. The image and
        * its exported memory must carry the same external handle type. */
       const bool preserve_external =
@@ -701,8 +704,74 @@ vn_DestroyImage(VkDevice device,
       return;
 
    /* must not ask renderer to destroy uninitialized deferred image */
-   if (!img->deferred || img->deferred_initialized)
-      vn_async_vkDestroyImage(dev->primary_ring, device, image, NULL);
+   if (!img->deferred || img->deferred_initialized) {
+#if DETECT_OS_WINDOWS
+      const bool record_only =
+         vn_helios_submit_instance_mode(dev->instance) ==
+         VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+      const struct vn_helios_memory_binding *binding = NULL;
+      uint32_t binding_count = 0;
+      if (record_only) {
+         for (uint32_t i = 0; i < ARRAY_SIZE(img->helios_bindings); i++) {
+            if (img->helios_bindings[i].valid) {
+               binding = &img->helios_bindings[i];
+               binding_count++;
+            }
+         }
+      }
+      if (record_only && binding_count == 1) {
+         struct vn_device_memory *mem =
+            vn_device_memory_helios_binding_memory(dev, binding);
+         const size_t payload_bytes =
+            vn_sizeof_vkDestroyImage(device, image, NULL);
+         uint8_t *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+         VkResult defer_result = VK_SUCCESS;
+         if (!mem || !payload || payload_bytes > HELIOS_HOB1_MAX_BYTES) {
+            free(payload);
+            defer_result = mem ? VK_ERROR_OUT_OF_HOST_MEMORY
+                               : VK_ERROR_VALIDATION_FAILED_EXT;
+         } else {
+            struct vn_cs_encoder encoder =
+               VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+            vn_encode_vkDestroyImage(&encoder, 0, device, image, NULL);
+            if (vn_cs_encoder_get_fatal(&encoder) ||
+                vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+               free(payload);
+               defer_result = VK_ERROR_INITIALIZATION_FAILED;
+            } else {
+               struct vn_helios_deferred_record *record =
+                  vn_device_memory_helios_record_create(
+                     mem, payload, payload_bytes,
+                     VN_HELIOS_NO_RESOURCE_OPERAND, false, false);
+               if (!record) {
+                  defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+               } else {
+                  defer_result = vn_device_memory_helios_record_install(
+                     dev, mem, record);
+                  if (defer_result != VK_SUCCESS)
+                     vn_device_memory_helios_record_destroy(record);
+               }
+            }
+         }
+         if (defer_result != VK_SUCCESS) {
+            vn_helios_record_note_deferred_use(dev->instance);
+            p_atomic_set(&dev->helios_lost, 1);
+            (void)vn_error(dev->instance, defer_result);
+         }
+      } else if (record_only && binding_count > 1) {
+         /* One generated destroy cannot be repeated once per plane.  The
+          * record-only profile therefore refuses a disjoint multi-allocation
+          * image instead of omitting one allocation from its closure. */
+         vn_helios_record_note_deferred_use(dev->instance);
+         p_atomic_set(&dev->helios_lost, 1);
+         (void)vn_error(dev->instance,
+                        VK_ERROR_VALIDATION_FAILED_EXT);
+      } else
+#endif
+      {
+         vn_async_vkDestroyImage(dev->primary_ring, device, image, NULL);
+      }
+   }
 
    vk_image_destroy(&dev->base.vk, alloc, &img->base.vk);
 }
@@ -763,7 +832,7 @@ vn_image_bind_wsi_memory(struct vn_device *dev,
             STACK_ARRAY_FINISH(local_infos);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
          }
-#else
+#elif defined(VN_USE_WSI_PLATFORM)
          const VkBindImageMemorySwapchainInfoKHR *swapchain_info =
             vk_find_struct_const(info->pNext,
                                  BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
@@ -771,6 +840,9 @@ vn_image_bind_wsi_memory(struct vn_device *dev,
 
          info->memory = wsi_common_get_memory(swapchain_info->swapchain,
                                               swapchain_info->imageIndex);
+#else
+         STACK_ARRAY_FINISH(local_infos);
+         return VK_ERROR_FEATURE_NOT_PRESENT;
 #endif
          info->memoryOffset = 0;
       }
@@ -801,12 +873,115 @@ vn_BindImageMemory2(VkDevice device,
    if (!local_infos)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+#if DETECT_OS_WINDOWS
+   STACK_ARRAY(struct vn_helios_memory_binding, helios_bindings,
+               bindInfoCount);
+   STACK_ARRAY(uint32_t, helios_planes, bindInfoCount);
+   STACK_ARRAY(struct vn_helios_deferred_record *, helios_records,
+               bindInfoCount);
+   if (!helios_bindings || !helios_planes || !helios_records) {
+      STACK_ARRAY_FINISH(helios_records);
+      STACK_ARRAY_FINISH(helios_planes);
+      STACK_ARRAY_FINISH(helios_bindings);
+      STACK_ARRAY_FINISH(local_infos);
+      return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   memset(helios_records, 0, bindInfoCount * sizeof(*helios_records));
+   const bool record_only =
+      vn_helios_submit_instance_mode(dev->instance) ==
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   if (record_only) {
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_image *img = vn_image_from_handle(pBindInfos[i].image);
+         struct vn_device_memory *mem =
+            vn_device_memory_from_handle(pBindInfos[i].memory);
+         const VkBindImagePlaneMemoryInfo *plane_info =
+            vk_find_struct_const(pBindInfos[i].pNext,
+                                 BIND_IMAGE_PLANE_MEMORY_INFO);
+         const uint32_t plane =
+            plane_info ? vn_image_get_plane(plane_info->planeAspect) : 0;
+         if (!img || img->base.vk.base.device != &dev->base.vk ||
+             plane >= ARRAY_SIZE(img->helios_bindings) ||
+             img->helios_bindings[plane].valid ||
+             vn_device_memory_helios_bind(
+                dev, mem, pBindInfos[i].memoryOffset,
+                img->requirements[plane].memory.memoryRequirements.size,
+                &helios_bindings[i]) != VK_SUCCESS) {
+            STACK_ARRAY_FINISH(helios_planes);
+            STACK_ARRAY_FINISH(helios_records);
+            STACK_ARRAY_FINISH(helios_bindings);
+            STACK_ARRAY_FINISH(local_infos);
+            return vn_error(dev->instance,
+                            VK_ERROR_VALIDATION_FAILED_EXT);
+         }
+         helios_planes[i] = plane;
+      }
+   }
+#endif
+
    typed_memcpy(local_infos, pBindInfos, bindInfoCount);
    for (uint32_t i = 0; i < bindInfoCount; i++)
       local_infos[i].pNext = NULL;
 
+#if DETECT_OS_WINDOWS
+   if (record_only) {
+      VkResult defer_result = VK_SUCCESS;
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_device_memory *mem =
+            vn_device_memory_from_handle(local_infos[i].memory);
+         const size_t payload_bytes =
+            vn_sizeof_vkBindImageMemory2(device, 1, &local_infos[i]);
+         uint8_t *payload = payload_bytes ? malloc(payload_bytes) : NULL;
+         if (!payload || payload_bytes > HELIOS_HOB1_MAX_BYTES) {
+            free(payload);
+            defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+         struct vn_cs_encoder encoder =
+            VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
+         vn_encode_vkBindImageMemory2(&encoder, 0, device, 1,
+                                      &local_infos[i]);
+         if (vn_cs_encoder_get_fatal(&encoder) ||
+             vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+            free(payload);
+            defer_result = VK_ERROR_INITIALIZATION_FAILED;
+            break;
+         }
+         helios_records[i] = vn_device_memory_helios_record_create(
+            mem, payload, payload_bytes, VN_HELIOS_NO_RESOURCE_OPERAND,
+            false, false);
+         if (!helios_records[i]) {
+            defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            break;
+         }
+      }
+      if (defer_result == VK_SUCCESS)
+         defer_result = vn_device_memory_helios_records_install(
+            dev, helios_records, bindInfoCount);
+      if (defer_result != VK_SUCCESS) {
+         for (uint32_t i = 0; i < bindInfoCount; i++)
+            vn_device_memory_helios_record_destroy(helios_records[i]);
+         STACK_ARRAY_FINISH(helios_records);
+         STACK_ARRAY_FINISH(helios_planes);
+         STACK_ARRAY_FINISH(helios_bindings);
+         STACK_ARRAY_FINISH(local_infos);
+         return vn_error(dev->instance, defer_result);
+      }
+      for (uint32_t i = 0; i < bindInfoCount; i++) {
+         struct vn_image *img = vn_image_from_handle(pBindInfos[i].image);
+         img->helios_bindings[helios_planes[i]] = helios_bindings[i];
+      }
+   } else {
+      vn_async_vkBindImageMemory2(dev->primary_ring, device, bindInfoCount,
+                                  local_infos);
+   }
+   STACK_ARRAY_FINISH(helios_records);
+   STACK_ARRAY_FINISH(helios_planes);
+   STACK_ARRAY_FINISH(helios_bindings);
+#else
    vn_async_vkBindImageMemory2(dev->primary_ring, device, bindInfoCount,
                                local_infos);
+#endif
 
    STACK_ARRAY_FINISH(local_infos);
 
@@ -1229,7 +1404,10 @@ vn_SetHeliosPresentableImageHELIOS(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_image *img = vn_image_from_handle(image);
 
-   if (!img)
+   if (!img || img->base.vk.base.device != &dev->base.vk || !swapchainId ||
+       img->base.vk.sharing_mode != VK_SHARING_MODE_EXCLUSIVE ||
+       vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
       return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
 
    /* §10.3: a presentable image is a D3D12 committed resource imported with

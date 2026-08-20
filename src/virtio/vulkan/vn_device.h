@@ -65,6 +65,16 @@ struct vn_device {
     * instead of wedging. Read/written with p_atomic_*. */
    int helios_lost;
 
+#if DETECT_OS_WINDOWS
+   /* A7's bounded, device-owned outer-allocation token set.  Entries are the
+    * exact live vn_device_memory objects; there is no process-global lookup or
+    * pointer-derived identity.  Access is covered by `mutex`. */
+   struct list_head helios_outer_allocations;
+   uint32_t helios_outer_allocation_count;
+   struct list_head helios_address_buffers;
+   uint32_t helios_address_buffer_count;
+#endif
+
    simple_mtx_t mutex;
    struct list_head chains;
    struct list_head coherent_cached_memory;

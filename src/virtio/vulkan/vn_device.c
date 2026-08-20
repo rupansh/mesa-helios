@@ -483,6 +483,12 @@ vn_device_feedback_pool_init(struct vn_device *dev)
    static const uint32_t pool_size = 4096;
    const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
 
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return VK_SUCCESS;
+#endif
+
    if (VN_PERF(NO_EVENT_FEEDBACK) && VN_PERF(NO_FENCE_FEEDBACK) &&
        VN_PERF(NO_SEMAPHORE_FEEDBACK))
       return VK_SUCCESS;
@@ -493,6 +499,11 @@ vn_device_feedback_pool_init(struct vn_device *dev)
 static inline void
 vn_device_feedback_pool_fini(struct vn_device *dev)
 {
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return;
+#endif
    if (VN_PERF(NO_EVENT_FEEDBACK) && VN_PERF(NO_FENCE_FEEDBACK) &&
        VN_PERF(NO_SEMAPHORE_FEEDBACK))
       return;
@@ -636,7 +647,14 @@ vn_device_init(struct vn_device *dev,
    if (result != VK_SUCCESS)
       goto out_queue_family_fini;
 
-   result = vn_feedback_cmd_pools_init(dev);
+   result =
+#if DETECT_OS_WINDOWS
+      vn_helios_submit_instance_mode(dev->instance) ==
+            VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY
+         ? VK_SUCCESS
+         :
+#endif
+           vn_feedback_cmd_pools_init(dev);
    if (result != VK_SUCCESS)
       goto out_feedback_pool_fini;
 
@@ -658,6 +676,12 @@ vn_device_init(struct vn_device *dev,
    simple_mtx_init(&dev->mutex, mtx_plain);
    list_inithead(&dev->chains);
    list_inithead(&dev->coherent_cached_memory);
+#if DETECT_OS_WINDOWS
+   list_inithead(&dev->helios_outer_allocations);
+   dev->helios_outer_allocation_count = 0;
+   list_inithead(&dev->helios_address_buffers);
+   dev->helios_address_buffer_count = 0;
+#endif
 
    return VK_SUCCESS;
 
@@ -787,6 +811,14 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
 
    vn_device_base_fini(&dev->base);
    vn_device_memory_cleanup_coherent_cached_mappings(dev);
+#if DETECT_OS_WINDOWS
+   /* Every memory object must have removed its association before device
+    * storage and the per-device lock disappear. */
+   assert(list_is_empty(&dev->helios_outer_allocations));
+   assert(dev->helios_outer_allocation_count == 0);
+   assert(list_is_empty(&dev->helios_address_buffers));
+   assert(dev->helios_address_buffer_count == 0);
+#endif
    simple_mtx_destroy(&dev->mutex);
    vk_free(alloc, dev);
 }
@@ -805,7 +837,10 @@ vn_GetDeviceProcAddr(VkDevice device, const char *pName)
     * next-layer vkGetDeviceProcAddr, and an export would offer a second route
     * that bypasses the device it is scoped to. */
    if (pName && !strcmp(pName, HELIOS_SET_PRESENTABLE_IMAGE_NAME))
-      return (PFN_vkVoidFunction)vn_SetHeliosPresentableImageHELIOS;
+      return vn_helios_submit_instance_mode(dev->instance) ==
+                   VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY
+                ? NULL
+                : (PFN_vkVoidFunction)vn_SetHeliosPresentableImageHELIOS;
 #endif
 
    return vk_device_get_proc_addr(&dev->base.vk, pName);

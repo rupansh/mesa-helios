@@ -52,6 +52,43 @@ vn_physical_device_is_helios_normal_loader(
           VN_HELIOS_SUBMISSION_MODE_NORMAL;
 }
 
+static bool
+vn_physical_device_is_helios_record_only(
+   const struct vn_physical_device *physical_dev)
+{
+   return vn_helios_submit_instance_mode(physical_dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+}
+
+static void
+vn_physical_device_apply_helios_record_only_feature_profile(
+   struct vn_physical_device *physical_dev)
+{
+   if (!vn_physical_device_is_helios_record_only(physical_dev))
+      return;
+
+   struct vk_features *feats = &physical_dev->base.vk.supported_features;
+   /* A7 snapshots ordinary descriptor sets while recording.  Update-after-
+    * bind would allow their allocation graph to change after that immutable
+    * snapshot, so those bits stay withheld.  The descriptor-heap path remains
+    * available because its one bound address range is classified directly. */
+   feats->descriptorBindingUniformBufferUpdateAfterBind = false;
+   feats->descriptorBindingSampledImageUpdateAfterBind = false;
+   feats->descriptorBindingStorageImageUpdateAfterBind = false;
+   feats->descriptorBindingStorageBufferUpdateAfterBind = false;
+   feats->descriptorBindingUniformTexelBufferUpdateAfterBind = false;
+   feats->descriptorBindingStorageTexelBufferUpdateAfterBind = false;
+   feats->descriptorBindingUpdateUnusedWhilePending = false;
+   feats->descriptorBindingInlineUniformBlockUpdateAfterBind = false;
+   feats->descriptorBindingAccelerationStructureUpdateAfterBind = false;
+   feats->mutableDescriptorType = false;
+   feats->descriptorBuffer = false;
+   feats->descriptorBufferCaptureReplay = false;
+   feats->descriptorBufferImageLayoutIgnored = false;
+   feats->descriptorBufferPushDescriptors = false;
+   feats->hostImageCopy = false;
+}
+
 static void
 vn_physical_device_apply_helios_normal_feature_profile(
    struct vn_physical_device *physical_dev)
@@ -97,7 +134,8 @@ static void
 vn_physical_device_apply_helios_normal_property_profile(
    struct vn_physical_device *physical_dev)
 {
-   if (!vn_physical_device_is_helios_normal_loader(physical_dev))
+   if (!vn_physical_device_is_helios_normal_loader(physical_dev) &&
+       !vn_physical_device_is_helios_record_only(physical_dev))
       return;
 
    struct vk_properties *props = &physical_dev->base.vk.properties;
@@ -592,6 +630,7 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
    /* HVM1 has no protected-memory arm in this package generation. */
    feats->protectedMemory = false;
    vn_physical_device_apply_helios_normal_feature_profile(physical_dev);
+   vn_physical_device_apply_helios_record_only_feature_profile(physical_dev);
 #endif
 }
 
@@ -675,6 +714,13 @@ vn_physical_device_sanitize_properties(struct vn_physical_device *physical_dev)
 
       props->apiVersion = ver;
    }
+
+#if DETECT_OS_WINDOWS
+   /* Host image copy is core in 1.4, but its host-memory closure is outside
+    * A7.  Withhold both the extension and its promoted API surface. */
+   if (vn_physical_device_is_helios_record_only(physical_dev))
+      props->apiVersion = MIN2(props->apiVersion, VK_API_VERSION_1_3);
+#endif
 
    /* ANGLE relies on ARM proprietary driver version for workarounds */
    const char *engine_name = instance->base.vk.app_info.engine_name;
@@ -1342,13 +1388,20 @@ vn_physical_device_init_external_memory(
    }
 
 #if DETECT_OS_WINDOWS
-   /* A3/A6 implement the exact C57 D3D12_RESOURCE import operation, but the
-    * package checkpoint requires the capability to remain unadvertised until
-    * A7 proves complete allocation/operand closure.  OPAQUE_WIN32 is never a
-    * compatibility alias.  A7 may change this zero only at its verified
-    * activation boundary. */
-   physical_dev->external_memory.win32_renderer_handle_type = 0;
-   physical_dev->external_memory.supported_handle_types = 0;
+   /* A7 is the activation boundary for A6's exact C57 import.  Only an
+    * ordinary loader instance may expose the future present layer's committed
+    * D3D12 image carrier.  The package-owned record-only translator instance
+    * receives WDDM identity exclusively through HeliosResourceAssociationV1
+    * and must never treat a Win32 handle as a substitute.  OPAQUE_WIN32 is not
+    * a compatibility alias in either mode. */
+   physical_dev->external_memory.win32_renderer_handle_type =
+      vn_physical_device_is_helios_normal_loader(physical_dev)
+         ? physical_dev->external_memory.renderer_handle_type
+         : 0;
+   physical_dev->external_memory.supported_handle_types =
+      vn_physical_device_is_helios_normal_loader(physical_dev)
+         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT
+         : 0;
 #endif
 
    if (physical_dev->external_memory.renderer_handle_type) {
@@ -1356,9 +1409,7 @@ vn_physical_device_init_external_memory(
       physical_dev->external_memory.supported_handle_types |=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 #else
-#if DETECT_OS_WINDOWS
-      /* Kept zero at the A7 activation boundary above. */
-#else
+#if !DETECT_OS_WINDOWS
       physical_dev->external_memory.supported_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -1460,10 +1511,13 @@ vn_physical_device_init_external_semaphore_handles(
    physical_dev->external_timeline_semaphore_handles = 0;
 
 #if DETECT_OS_WINDOWS
-   /* The exact HNF1 D3D12_FENCE import is implemented, but is part of the same
-    * A7 activation boundary as D3D12_RESOURCE.  Do not expose a partial lower
-    * profile merely because the renderer supports timeline semaphores. */
-   physical_dev->external_timeline_semaphore_handles = 0;
+   /* Match the memory activation above: the future present layer may import
+    * an exact HNF1 D3D12 fence only through the ordinary loader instance.
+    * Record-only translators order exclusively through their outer HQC1
+    * context and do not gain a second synchronization carrier. */
+   if (vn_physical_device_is_helios_normal_loader(physical_dev))
+      physical_dev->external_timeline_semaphore_handles =
+         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
 #else
    if (physical_dev->instance->renderer->info.has_external_sync) {
       physical_dev->external_binary_semaphore_handles =
@@ -1808,6 +1862,10 @@ vn_physical_device_init_supported_extensions(
    struct vk_device_extension_table passthrough;
 
    physical_dev->ray_tracing = !VN_DEBUG(NO_RAY_TRACING);
+#if DETECT_OS_WINDOWS
+   if (vn_physical_device_is_helios_record_only(physical_dev))
+      physical_dev->ray_tracing = false;
+#endif
 
    vn_physical_device_get_native_extensions(physical_dev, &native);
    vn_physical_device_get_passthrough_extensions(physical_dev, &passthrough);
@@ -1836,6 +1894,9 @@ vn_physical_device_init_supported_extensions(
     * heap.  Keep the dynamic extension absent until it can return that exact
     * heap's WDDM budget rather than mismatched renderer indices. */
    physical_dev->base.vk.supported_extensions.EXT_memory_budget = false;
+
+   if (vn_physical_device_is_helios_record_only(physical_dev))
+      physical_dev->base.vk.supported_extensions.EXT_host_image_copy = false;
 
    if (vn_physical_device_is_helios_normal_loader(physical_dev)) {
       /* Tier-3/unbounded descriptor vehicles remain available only to the
@@ -3458,7 +3519,9 @@ vn_GetPhysicalDeviceExternalSemaphoreProperties(
 #if DETECT_OS_WINDOWS
    if (sem_type == VK_SEMAPHORE_TYPE_TIMELINE &&
        pExternalSemaphoreInfo->handleType ==
-          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT) {
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT &&
+       (physical_dev->external_timeline_semaphore_handles &
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)) {
       pExternalSemaphoreProperties->compatibleHandleTypes =
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
       pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;

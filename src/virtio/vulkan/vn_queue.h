@@ -147,6 +147,10 @@ struct vn_fence {
 
 #if DETECT_OS_WINDOWS
    VkExternalSemaphoreHandleTypeFlags external_handle_types;
+   simple_mtx_t helios_progress_mtx;
+   uint64_t helios_context_generation;
+   uint64_t helios_progress_value;
+   bool helios_locally_signaled;
 #endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_fence,
@@ -178,6 +182,14 @@ struct vn_semaphore {
     * Timeline monotonicity makes skipping it safe: the timeline has already
     * reached at least `value`, so no progress is lost. */
    uint64_t helios_max_forwarded_host_value;
+
+   /* Last outer HQC1 milestone that submitted a signal for this semaphore.
+    * The pair is guarded separately from the host-mirror lock because a
+    * progress query must never inherit that mirror's lock ordering. */
+   simple_mtx_t helios_progress_mtx;
+   uint64_t helios_context_generation;
+   uint64_t helios_progress_value;
+   uint64_t helios_progress_signal_value;
 #endif
 
    struct vn_sync_payload *payload;
@@ -311,6 +323,13 @@ struct vn_event {
     * - VN_PERF_NO_EVENT_FEEDBACK is disabled
     */
    struct vn_feedback_slot *feedback_slot;
+#if DETECT_OS_WINDOWS
+   /* Exact producer of the last device-side set/reset in record-only mode.
+    * This is object-local state, not an identity table or a new timeline. */
+   simple_mtx_t helios_progress_mtx;
+   uint64_t helios_context_generation;
+   uint64_t helios_progress_value;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_event,
                                base.vk,

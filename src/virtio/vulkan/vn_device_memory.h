@@ -13,6 +13,16 @@
 
 #include "vn_common.h"
 
+#if DETECT_OS_WINDOWS
+#include "helios_resource_association.h"
+#include "helios_translation_session.h"
+
+struct vn_helios_outer_progress {
+   uint64_t context_generation;
+   uint64_t progress_value;
+};
+#endif
+
 struct vn_device_memory {
    struct vn_device_memory_base base;
 
@@ -54,6 +64,24 @@ struct vn_device_memory {
    struct list_head coherent_cached_link;
 
 #ifdef _WIN32
+   /* A7: immutable package-owned association with the exact outer WDDM
+    * allocation.  The token is assigned by the owning UMD, never derived from
+    * this object's HVM1 allocation, Vulkan handle, or renderer resource id.
+    * `helios_outer_link` is present only while the object is in its owning
+    * device's bounded live set; FreeMemory removes it before any lower object
+    * storage can be reused. */
+   HeliosResourceAssociationV1 helios_outer;
+   struct list_head helios_outer_link;
+   struct list_head helios_deferred_records;
+   uint32_t helios_deferred_record_count;
+   struct vn_helios_outer_progress
+      helios_outer_progress[HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION];
+   uint32_t helios_outer_progress_count;
+   bool helios_outer_registered;
+   bool helios_host_materialized;
+   bool helios_free_pending;
+   VkAllocationCallbacks helios_free_allocator;
+
    /* Guest-visible export types must remain distinct from the renderer-side
     * fd/dma-buf type used to create the Venus blob. */
    VkExternalMemoryHandleTypeFlags renderer_export_handle_types;
@@ -79,6 +107,81 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(vn_device_memory,
                                base.vk.base,
                                VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
+
+#if DETECT_OS_WINDOWS
+struct vn_helios_memory_binding {
+   uint64_t device_generation;
+   uint64_t outer_allocation_token;
+   uint64_t outer_allocation_bytes;
+   uint64_t byte_offset;
+   uint64_t byte_length;
+   bool valid;
+};
+
+#define VN_HELIOS_NO_RESOURCE_OPERAND UINT32_MAX
+
+/* One immutable generated allocation/bind command waiting for the first
+ * exact outer batch that names `owner`'s token.  The mutable reservation is
+ * lifecycle only: it prevents two concurrent scopes from consuming the same
+ * command and is never used as resource identity. */
+struct vn_helios_deferred_record {
+   struct list_head link;
+   struct vn_device_memory *owner;
+   uint8_t *payload;
+   uint32_t payload_bytes;
+   uint32_t resource_operand_offset;
+   uint64_t reserved_context_generation;
+   uint64_t reserved_batch_id;
+   bool allocation_record;
+   bool final_free_record;
+};
+
+struct vn_helios_deferred_record *
+vn_device_memory_helios_record_create(struct vn_device_memory *mem,
+                                      void *payload,
+                                      size_t payload_bytes,
+                                      uint32_t resource_operand_offset,
+                                      bool allocation_record,
+                                      bool final_free_record);
+
+VkResult
+vn_device_memory_helios_record_install(
+   struct vn_device *dev,
+   struct vn_device_memory *mem,
+   struct vn_helios_deferred_record *record);
+
+VkResult
+vn_device_memory_helios_records_install(
+   struct vn_device *dev,
+   struct vn_helios_deferred_record *const *records,
+   uint32_t record_count);
+
+void
+vn_device_memory_helios_record_destroy(
+   struct vn_helios_deferred_record *record);
+
+struct vn_device_memory *
+vn_device_memory_helios_binding_memory(
+   struct vn_device *dev,
+   const struct vn_helios_memory_binding *binding);
+
+bool
+vn_device_memory_helios_finalize_pending_free(
+   struct vn_device *dev,
+   struct vn_device_memory *mem);
+
+VkResult
+vn_device_memory_helios_bind(struct vn_device *dev,
+                             struct vn_device_memory *mem,
+                             VkDeviceSize offset,
+                             VkDeviceSize length,
+                             struct vn_helios_memory_binding *out);
+
+bool
+vn_device_memory_helios_binding_live(
+   struct vn_device *dev,
+   const struct vn_helios_memory_binding *binding);
+#endif
 
 VkResult
 vn_device_memory_import_dma_buf(struct vn_device *dev,

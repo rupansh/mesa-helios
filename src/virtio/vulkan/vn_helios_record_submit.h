@@ -18,6 +18,8 @@
 #ifdef _WIN32
 
 #include "helios_translator_dispatch.h"
+
+struct vn_device_memory;
 #include <stdbool.h>
 #include <stdint.h>
 #include <vulkan/vulkan.h>
@@ -25,6 +27,12 @@
 struct vn_device;
 struct vn_instance;
 struct vn_queue;
+struct vn_buffer;
+struct vn_image;
+struct vn_image_view;
+struct vn_command_buffer;
+struct vn_query_pool;
+struct vn_helios_memory_binding;
 struct vn_helios_record_context;
 
 enum vn_helios_submission_mode {
@@ -108,6 +116,9 @@ bool
 vn_helios_record_scope_identity(HeliosTranslatorScope scope,
                                 struct vn_instance **out_instance,
                                 uint64_t *out_context_generation);
+bool
+vn_helios_record_current_context(struct vn_instance *instance,
+                                 uint64_t *out_context_generation);
 void
 vn_helios_record_query_refusals(
    const struct vn_instance *instance,
@@ -120,6 +131,77 @@ void
 vn_helios_record_note_withheld_proc(struct vn_instance *instance);
 void
 vn_helios_record_note_reentrant_join(struct vn_instance *instance);
+void
+vn_helios_record_note_deferred_use(struct vn_instance *instance);
+
+bool
+vn_helios_record_has_active_scope(struct vn_instance *instance);
+
+/* Finish one allocation-backed lifetime entirely inside the calling thread's
+ * current outer scope.  The payload consists only of immutable deferred
+ * allocation/bind/destroy/free records already owned by `mem`; the sealed use
+ * names that exact allocation at offset zero. */
+VkResult
+vn_helios_record_memory_teardown(struct vn_device *dev,
+                                 struct vn_device_memory *mem);
+
+/* A7 command/object classifier.  These helpers never submit.  They append to
+ * the exact command buffer's bounded immutable closure, or make that closure
+ * permanently incomplete with the first generated opcode that was refused. */
+void
+vn_helios_cmd_closure_begin(struct vn_command_buffer *cmd);
+void
+vn_helios_cmd_closure_fini(struct vn_command_buffer *cmd);
+void
+vn_helios_cmd_refuse(struct vn_command_buffer *cmd, uint32_t opcode);
+void
+vn_helios_cmd_touch_buffer(struct vn_command_buffer *cmd,
+                           VkBuffer buffer,
+                           VkDeviceSize offset,
+                           VkDeviceSize size,
+                           uint32_t access_flags,
+                           uint32_t opcode);
+void
+vn_helios_cmd_touch_image(struct vn_command_buffer *cmd,
+                          VkImage image,
+                          uint32_t access_flags,
+                          uint32_t opcode);
+void
+vn_helios_cmd_touch_image_view(struct vn_command_buffer *cmd,
+                               VkImageView image_view,
+                               uint32_t access_flags,
+                               uint32_t opcode);
+void
+vn_helios_cmd_touch_device_address(struct vn_command_buffer *cmd,
+                                   VkDeviceAddress address,
+                                   VkDeviceSize size,
+                                   uint32_t access_flags,
+                                   uint32_t opcode);
+void
+vn_helios_cmd_merge_secondary(struct vn_command_buffer *primary,
+                              const struct vn_command_buffer *secondary,
+                              uint32_t opcode);
+void
+vn_helios_cmd_touch_descriptor_set(struct vn_command_buffer *cmd,
+                                   VkDescriptorSet descriptor_set,
+                                   uint32_t opcode);
+void
+vn_helios_cmd_touch_descriptor_writes(
+   struct vn_command_buffer *cmd,
+   uint32_t write_count,
+   const VkWriteDescriptorSet *writes,
+   uint32_t opcode);
+void
+vn_helios_cmd_touch_event(struct vn_command_buffer *cmd,
+                          VkEvent event,
+                          uint32_t opcode);
+
+/* Object-local outer progress.  Query/fence/semaphore synchronous entry
+ * points consume these facts through the direct A5 join/query callbacks. */
+bool
+vn_helios_query_pool_progress(struct vn_query_pool *pool,
+                              uint64_t *context_generation,
+                              uint64_t *progress_value);
 
 #endif /* _WIN32 */
 #endif /* VN_HELIOS_RECORD_SUBMIT_H */

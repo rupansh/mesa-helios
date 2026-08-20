@@ -16,6 +16,26 @@
 struct vn_instance;
 struct vn_queue;
 
+/* Internal C60 progress edges.  These are not ICD exports and do not change
+ * HeliosTranslatorDispatchV1: a translated synchronous Vulkan entry point
+ * names either the live scope on its calling thread or an exact context
+ * generation retained on the frontend object that produced the result. */
+HeliosTranslatorStatusCode
+vn_helios_direct_join_current(struct vn_instance *instance,
+                              uint64_t required_progress,
+                              HeliosSyncProgressResultV1 *out_result);
+HeliosTranslatorStatusCode
+vn_helios_direct_join_context(struct vn_instance *instance,
+                              uint64_t context_generation,
+                              uint64_t required_progress,
+                              HeliosSyncProgressResultV1 *out_result);
+HeliosTranslatorStatusCode
+vn_helios_direct_join_all(struct vn_instance *instance);
+HeliosTranslatorStatusCode
+vn_helios_direct_query_context(struct vn_instance *instance,
+                               uint64_t context_generation,
+                               HeliosSyncProgressResultV1 *out_result);
+
 /* Queue endpoints are registered by the existing A4 per-instance owner.  The
  * direct object stores them at their non-recycled endpoint index; there is no
  * registry, name lookup, PID key, or second session. */

@@ -15,6 +15,10 @@
 
 #include "vn_cs.h"
 
+#if DETECT_OS_WINDOWS
+#include "vn_device_memory.h"
+#endif
+
 struct vn_command_pool {
    struct vn_command_pool_base base;
 
@@ -65,7 +69,36 @@ struct vn_command_buffer_builder {
    bool is_simultaneous;
    /* track the recorded queries and resets */
    struct list_head query_records;
+
+#if DETECT_OS_WINDOWS
+   /* A7's immutable allocation closure.  Commands add exact, device-owned
+    * memory bindings here while recording; queue submit revalidates every
+    * token against the live vn_device set before it can enter a sealed batch.
+    * A false closure bit is terminal for this recording and remembers the
+    * first generated opcode that could not be classified. */
+   struct vn_helios_command_use *helios_uses;
+   uint32_t helios_use_count;
+   uint32_t helios_use_capacity;
+   struct vn_command_buffer **helios_secondaries;
+   uint32_t helios_secondary_count;
+   uint32_t helios_secondary_capacity;
+   /* Events whose device state is modified by this recording.  Scope close
+    * stamps their exact outer context/progress only after the runtime accepted
+    * the batch; host status/destroy operations join that producer first. */
+   struct vn_event **helios_events;
+   uint32_t helios_event_count;
+   uint32_t helios_event_capacity;
+   uint32_t helios_refusal_opcode;
+   bool helios_closure_complete;
+#endif
 };
+
+#if DETECT_OS_WINDOWS
+struct vn_helios_command_use {
+   struct vn_helios_memory_binding binding;
+   uint32_t access_flags;
+};
+#endif
 
 struct vn_query_feedback_cmd;
 

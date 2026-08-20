@@ -16,6 +16,11 @@
 #include "venus-protocol/vn_protocol_driver_descriptor_update_template.h"
 
 #include "vn_device.h"
+#if DETECT_OS_WINDOWS
+#include "vn_buffer.h"
+#include "vn_image.h"
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_pipeline.h"
 
 void
@@ -40,6 +45,12 @@ vn_descriptor_set_destroy(struct vn_device *dev,
                           const VkAllocationCallbacks *alloc)
 {
    list_del(&set->head);
+
+#if DETECT_OS_WINDOWS
+   vk_free(alloc, set->helios_slots);
+   set->helios_slots = NULL;
+   set->helios_slot_count = 0;
+#endif
 
    vn_descriptor_set_layout_unref(dev, set->layout);
 
@@ -96,6 +107,10 @@ vn_descriptor_set_layout_init(
    layout->refcount = VN_REFCOUNT_INIT(1);
    layout->last_binding = last_binding;
 
+#if DETECT_OS_WINDOWS
+   uint32_t helios_slot_count = 0;
+#endif
+
    for (uint32_t i = 0; i < create_info->bindingCount; i++) {
       const VkDescriptorSetLayoutBinding *binding_info =
          &create_info->pBindings[i];
@@ -103,6 +118,14 @@ vn_descriptor_set_layout_init(
          vn_descriptor_type(binding_info->descriptorType);
       struct vn_descriptor_set_layout_binding *binding =
          &layout->bindings[binding_info->binding];
+
+#if DETECT_OS_WINDOWS
+      binding->helios_slot_base = helios_slot_count;
+      if (binding_info->descriptorCount > UINT32_MAX - helios_slot_count)
+         helios_slot_count = UINT32_MAX;
+      else
+         helios_slot_count += binding_info->descriptorCount;
+#endif
 
       if (binding_info->binding == last_binding) {
          /* 14.2.1. Descriptor Set Layout
@@ -148,6 +171,25 @@ vn_descriptor_set_layout_init(
          break;
       }
    }
+
+#if DETECT_OS_WINDOWS
+   /* Descriptor updates roll from one binding into the next binding number,
+    * so the local slot map is canonical binding order even when pBindings was
+    * supplied out of order. */
+   helios_slot_count = 0;
+   for (uint32_t binding_index = 0; binding_index <= last_binding;
+        binding_index++) {
+      struct vn_descriptor_set_layout_binding *binding =
+         &layout->bindings[binding_index];
+      binding->helios_slot_base = helios_slot_count;
+      if (binding->count > UINT32_MAX - helios_slot_count) {
+         helios_slot_count = UINT32_MAX;
+         break;
+      }
+      helios_slot_count += binding->count;
+   }
+   layout->helios_slot_count = helios_slot_count;
+#endif
 
    vn_async_vkCreateDescriptorSetLayout(dev->primary_ring, dev_handle,
                                         create_info, NULL, &layout_handle);
@@ -676,6 +718,36 @@ vn_AllocateDescriptorSets(VkDevice device,
        */
       set->layout = vn_descriptor_set_layout_ref(dev, layout);
       set->last_binding_descriptor_count = last_binding_descriptor_count;
+#if DETECT_OS_WINDOWS
+      const uint32_t declared_last =
+         layout->bindings[layout->last_binding].count;
+      const uint32_t fixed_slots =
+         layout->helios_slot_count >= declared_last
+            ? layout->helios_slot_count - declared_last
+            : UINT32_MAX;
+      const uint64_t helios_slot_count =
+         (uint64_t)fixed_slots + last_binding_descriptor_count;
+      set->helios_closure_complete =
+         fixed_slots != UINT32_MAX &&
+         helios_slot_count <= HELIOS_HOB1_MAX_OPERAND_RECORDS;
+      if (set->helios_closure_complete && helios_slot_count) {
+         set->helios_slots = vk_zalloc(
+            alloc,
+            (size_t)helios_slot_count * sizeof(*set->helios_slots),
+            VN_DEFAULT_ALIGN, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+         if (!set->helios_slots) {
+            vn_descriptor_set_layout_unref(dev, set->layout);
+            vn_object_base_fini(&set->base);
+            vk_free(alloc, set);
+            if (pool->current_state != VN_ASYNC_SET_ALLOC_NONE)
+               vn_descriptor_pool_free_descriptors(
+                  pool, layout, last_binding_descriptor_count);
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+         }
+         set->helios_slot_count = (uint32_t)helios_slot_count;
+      }
+#endif
       list_addtail(&set->head, &pool->descriptor_sets);
 
       pDescriptorSets[i] = vn_descriptor_set_to_handle(set);
@@ -845,6 +917,212 @@ vn_descriptor_set_get_writes(uint32_t write_count,
    return local->writes;
 }
 
+#if DETECT_OS_WINDOWS
+static struct vn_helios_descriptor_slot *
+helios_descriptor_slot(struct vn_descriptor_set *set,
+                       uint32_t binding_index,
+                       uint32_t array_index)
+{
+   if (!set || !set->helios_closure_complete)
+      return NULL;
+   while (binding_index <= set->layout->last_binding) {
+      const struct vn_descriptor_set_layout_binding *binding =
+         &set->layout->bindings[binding_index];
+      const uint32_t count =
+         binding_index == set->layout->last_binding
+            ? set->last_binding_descriptor_count
+            : binding->count;
+      if (array_index < count) {
+         const uint64_t slot =
+            (uint64_t)binding->helios_slot_base + array_index;
+         return slot < set->helios_slot_count
+                   ? &set->helios_slots[slot]
+                   : NULL;
+      }
+      array_index -= count;
+      binding_index++;
+   }
+   return NULL;
+}
+
+static bool
+helios_descriptor_add_image(struct vn_device *dev,
+                            VkImageView handle,
+                            uint32_t access,
+                            struct vn_helios_descriptor_slot *slot)
+{
+   if (!handle)
+      return true;
+   struct vn_image_view *view = vn_image_view_from_handle(handle);
+   if (!view || view->base.vk.device != &dev->base.vk || !view->image)
+      return false;
+   struct vn_image *img = (struct vn_image *)view->image;
+   for (uint32_t plane = 0; plane < ARRAY_SIZE(img->helios_bindings);
+        plane++) {
+      if (!img->helios_bindings[plane].valid)
+         continue;
+      if (slot->binding_count == ARRAY_SIZE(slot->bindings))
+         return false;
+      slot->bindings[slot->binding_count++] = img->helios_bindings[plane];
+   }
+   if (!slot->binding_count)
+      return false;
+   if (img->helios_presentable.tagged &&
+       (access & HELIOS_HOB1_ACCESS_WRITE))
+      access |= HELIOS_HOB1_ACCESS_PRIMARY_WRITE;
+   slot->access_flags = access;
+   return true;
+}
+
+static bool
+helios_descriptor_add_buffer(struct vn_device *dev,
+                             VkBuffer handle,
+                             VkDeviceSize offset,
+                             VkDeviceSize range,
+                             uint32_t access,
+                             struct vn_helios_descriptor_slot *slot)
+{
+   if (!handle)
+      return true;
+   struct vn_buffer *buf = vn_buffer_from_handle(handle);
+   if (!buf || buf->base.vk.device != &dev->base.vk ||
+       !buf->helios_binding.valid ||
+       offset > buf->helios_binding.byte_length)
+      return false;
+   const uint64_t available = buf->helios_binding.byte_length - offset;
+   const uint64_t length = range == VK_WHOLE_SIZE ? available : range;
+   if (!length || length > available)
+      return false;
+   slot->bindings[0] = buf->helios_binding;
+   slot->binding_count = 1;
+   slot->access_flags = access;
+   return true;
+}
+
+static bool
+helios_descriptor_from_write(struct vn_device *dev,
+                             const VkWriteDescriptorSet *write,
+                             uint32_t index,
+                             struct vn_helios_descriptor_slot *slot)
+{
+   memset(slot, 0, sizeof(*slot));
+   switch (write->descriptorType) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+      return true;
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      return write->pImageInfo &&
+             helios_descriptor_add_image(
+                dev, write->pImageInfo[index].imageView,
+                HELIOS_HOB1_ACCESS_READ, slot);
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      return write->pImageInfo &&
+             helios_descriptor_add_image(
+                dev, write->pImageInfo[index].imageView,
+                HELIOS_HOB1_ACCESS_READ | HELIOS_HOB1_ACCESS_WRITE, slot);
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      return write->pBufferInfo &&
+             helios_descriptor_add_buffer(
+                dev, write->pBufferInfo[index].buffer,
+                write->pBufferInfo[index].offset,
+                write->pBufferInfo[index].range,
+                HELIOS_HOB1_ACCESS_READ, slot);
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      return write->pBufferInfo &&
+             helios_descriptor_add_buffer(
+                dev, write->pBufferInfo[index].buffer,
+                write->pBufferInfo[index].offset,
+                write->pBufferInfo[index].range,
+                HELIOS_HOB1_ACCESS_READ | HELIOS_HOB1_ACCESS_WRITE, slot);
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: {
+      if (!write->pTexelBufferView)
+         return false;
+      const VkBufferView handle = write->pTexelBufferView[index];
+      if (!handle)
+         return true;
+      struct vn_buffer_view *view = vn_buffer_view_from_handle(handle);
+      if (!view || view->base.vk.device != &dev->base.vk ||
+          !view->helios_buffer)
+         return false;
+      return helios_descriptor_add_buffer(
+         dev, vn_buffer_to_handle(view->helios_buffer), 0, VK_WHOLE_SIZE,
+         write->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+            ? HELIOS_HOB1_ACCESS_READ | HELIOS_HOB1_ACCESS_WRITE
+            : HELIOS_HOB1_ACCESS_READ,
+         slot);
+   }
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+   case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+   default:
+      /* Acceleration-structure and undefined mutable shapes are withheld from
+       * the record-only profile until their exact backing-buffer graph is
+       * represented.  A bound set will be a named incomplete closure. */
+      return false;
+   }
+}
+
+static void
+helios_descriptor_track_updates(struct vn_device *dev,
+                                uint32_t write_count,
+                                const VkWriteDescriptorSet *writes,
+                                uint32_t copy_count,
+                                const VkCopyDescriptorSet *copies)
+{
+   for (uint32_t w = 0; w < write_count; w++) {
+      const VkWriteDescriptorSet *write = &writes[w];
+      struct vn_descriptor_set *set =
+         vn_descriptor_set_from_handle(write->dstSet);
+      if (!set || set->base.vk.device != &dev->base.vk ||
+          !set->helios_closure_complete)
+         continue;
+      for (uint32_t i = 0; i < write->descriptorCount; i++) {
+         struct vn_helios_descriptor_slot *slot =
+            helios_descriptor_slot(set, write->dstBinding,
+                                   write->dstArrayElement + i);
+         if (!slot ||
+             !helios_descriptor_from_write(dev, write, i, slot)) {
+            set->helios_closure_complete = false;
+            break;
+         }
+      }
+   }
+
+   for (uint32_t c = 0; c < copy_count; c++) {
+      const VkCopyDescriptorSet *copy = &copies[c];
+      struct vn_descriptor_set *src =
+         vn_descriptor_set_from_handle(copy->srcSet);
+      struct vn_descriptor_set *dst =
+         vn_descriptor_set_from_handle(copy->dstSet);
+      if (!src || !dst || src->base.vk.device != &dev->base.vk ||
+          dst->base.vk.device != &dev->base.vk ||
+          !src->helios_closure_complete ||
+          !dst->helios_closure_complete) {
+         if (dst)
+            dst->helios_closure_complete = false;
+         continue;
+      }
+      for (uint32_t i = 0; i < copy->descriptorCount; i++) {
+         const struct vn_helios_descriptor_slot *src_slot =
+            helios_descriptor_slot(src, copy->srcBinding,
+                                   copy->srcArrayElement + i);
+         struct vn_helios_descriptor_slot *dst_slot =
+            helios_descriptor_slot(dst, copy->dstBinding,
+                                   copy->dstArrayElement + i);
+         if (!src_slot || !dst_slot) {
+            dst->helios_closure_complete = false;
+            break;
+         }
+         *dst_slot = *src_slot;
+      }
+   }
+}
+#endif
+
 VKAPI_ATTR void VKAPI_CALL
 vn_UpdateDescriptorSets(VkDevice device,
                         uint32_t descriptorWriteCount,
@@ -864,6 +1142,12 @@ vn_UpdateDescriptorSets(VkDevice device,
    };
    pDescriptorWrites = vn_descriptor_set_get_writes(
       descriptorWriteCount, pDescriptorWrites, VK_NULL_HANDLE, &local);
+
+#if DETECT_OS_WINDOWS
+   helios_descriptor_track_updates(dev, descriptorWriteCount,
+                                   pDescriptorWrites, descriptorCopyCount,
+                                   pDescriptorCopies);
+#endif
 
    vn_async_vkUpdateDescriptorSets(dev->primary_ring, device,
                                    descriptorWriteCount, pDescriptorWrites,
@@ -1126,6 +1410,11 @@ vn_UpdateDescriptorSetWithTemplate(
    };
    vn_descriptor_set_fill_update_with_template(templ, descriptorSet, pData,
                                                &update);
+
+#if DETECT_OS_WINDOWS
+   helios_descriptor_track_updates(dev, update.write_count, update.writes,
+                                   0, NULL);
+#endif
 
    vn_async_vkUpdateDescriptorSets(
       dev->primary_ring, device, update.write_count, update.writes, 0, NULL);

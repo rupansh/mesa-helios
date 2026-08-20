@@ -17,6 +17,9 @@
 #include "vn_descriptor_set.h"
 #include "vn_device.h"
 #include "vn_feedback.h"
+#if DETECT_OS_WINDOWS
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_image.h"
 #include "vn_physical_device.h"
 #include "vn_query_pool.h"
@@ -24,6 +27,26 @@
 
 static void
 vn_cmd_submit(struct vn_command_buffer *cmd);
+
+#if DETECT_OS_WINDOWS
+#define HELIOS_READ HELIOS_HOB1_ACCESS_READ
+#define HELIOS_WRITE HELIOS_HOB1_ACCESS_WRITE
+#define HELIOS_READ_WRITE (HELIOS_READ | HELIOS_WRITE)
+#define HELIOS_CMD(cmd_handle) vn_command_buffer_from_handle(cmd_handle)
+#define HELIOS_TOUCH_BUFFER(cmd_handle, buffer, offset, size, access, name)   \
+   vn_helios_cmd_touch_buffer(HELIOS_CMD(cmd_handle), buffer, offset, size,   \
+                              access, VK_COMMAND_TYPE_##name##_EXT)
+#define HELIOS_TOUCH_IMAGE(cmd_handle, image, access, name)                  \
+   vn_helios_cmd_touch_image(HELIOS_CMD(cmd_handle), image, access,           \
+                             VK_COMMAND_TYPE_##name##_EXT)
+#define HELIOS_REFUSE(cmd_handle, name)                                      \
+   vn_helios_cmd_refuse(HELIOS_CMD(cmd_handle),                              \
+                        VK_COMMAND_TYPE_##name##_EXT)
+#else
+#define HELIOS_TOUCH_BUFFER(...) ((void)0)
+#define HELIOS_TOUCH_IMAGE(...) ((void)0)
+#define HELIOS_REFUSE(...) ((void)0)
+#endif
 
 #define VN_CMD_ENQUEUE(cmd_name, commandBuffer, ...)                         \
    do {                                                                      \
@@ -80,6 +103,7 @@ struct vn_cmd_fix_image_memory_barrier_result {
    bool availability_op_needed; // set src access/stage (flush)
    bool visibility_op_needed;   // set dst access/stage (invalidate)
    bool external_acquire_unmodified;
+   bool valid;
 };
 
 struct vn_cmd_cached_storage {
@@ -212,12 +236,63 @@ vn_cmd_fix_image_memory_barrier_common(const struct vn_image *img,
    struct vn_cmd_fix_image_memory_barrier_result result = {
       .availability_op_needed = true,
       .visibility_op_needed = true,
+      .valid = true,
    };
 
    /* no fix needed */
    if (*old_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
        *new_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
       return result;
+
+#if DETECT_OS_WINDOWS
+   const struct vn_device *dev = img
+      ? vn_device_from_vk(img->base.vk.base.device)
+      : NULL;
+   const bool record_only =
+      dev && vn_helios_submit_instance_mode(dev->instance) ==
+                VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   if (img && img->helios_presentable.tagged) {
+      /* A future present layer tags its imported image through the normal
+       * next-layer GDPA path.  PRESENT is meaningful for that exact tag only
+       * as the reciprocal GENERAL <-> EXTERNAL ownership pair.  FOREIGN_EXT
+       * is never accepted as an approximation. */
+      if (img->base.vk.sharing_mode != VK_SHARING_MODE_EXCLUSIVE) {
+         result.valid = false;
+         return result;
+      }
+      if (*old_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+         /* Present releases the exact tagged image from the canonical Vulkan
+          * family to the external D3D12 owner.  Keep the wire-visible layout
+          * GENERAL while retaining the release's availability operation. */
+         if (*new_layout != VK_IMAGE_LAYOUT_GENERAL ||
+             *src_qfi != cmd_pool_qfi ||
+             *dst_qfi != VK_QUEUE_FAMILY_EXTERNAL) {
+            result.valid = false;
+            return result;
+         }
+         *old_layout = VN_PRESENT_SRC_INTERNAL_LAYOUT;
+         result.visibility_op_needed = false;
+      } else {
+         /* Acquire is the reciprocal external-to-canonical ownership transfer
+          * and restores the app-visible PRESENT layout. */
+         if (*old_layout != VK_IMAGE_LAYOUT_GENERAL ||
+             *new_layout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR ||
+             *src_qfi != VK_QUEUE_FAMILY_EXTERNAL ||
+             *dst_qfi != cmd_pool_qfi) {
+            result.valid = false;
+            return result;
+         }
+         *new_layout = VN_PRESENT_SRC_INTERNAL_LAYOUT;
+         result.availability_op_needed = false;
+         result.external_acquire_unmodified = true;
+      }
+      return result;
+   }
+   if (record_only) {
+      result.valid = false;
+      return result;
+   }
+#endif
 
    /* prime blit src or no layout transition */
    if (img->wsi.is_prime_blit_src || *old_layout == *new_layout) {
@@ -295,7 +370,7 @@ vn_cmd_set_external_acquire_unmodified(VkBaseOutStructure *chain,
 }
 
 static void
-vn_cmd_fix_image_memory_barrier(const struct vn_command_buffer *cmd,
+vn_cmd_fix_image_memory_barrier(struct vn_command_buffer *cmd,
                                 VkImageMemoryBarrier *barrier,
                                 struct vn_cmd_cached_storage *storage)
 {
@@ -307,6 +382,13 @@ vn_cmd_fix_image_memory_barrier(const struct vn_command_buffer *cmd,
          img, cmd->base.vk.pool->queue_family_index, &barrier->oldLayout,
          &barrier->newLayout, &barrier->srcQueueFamilyIndex,
          &barrier->dstQueueFamilyIndex);
+   if (!result.valid) {
+#if DETECT_OS_WINDOWS
+      vn_helios_cmd_refuse(cmd,
+                           VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT);
+#endif
+      return;
+   }
    if (!result.availability_op_needed)
       barrier->srcAccessMask = 0;
    if (!result.visibility_op_needed)
@@ -320,7 +402,7 @@ vn_cmd_fix_image_memory_barrier(const struct vn_command_buffer *cmd,
 }
 
 static void
-vn_cmd_fix_image_memory_barrier2(const struct vn_command_buffer *cmd,
+vn_cmd_fix_image_memory_barrier2(struct vn_command_buffer *cmd,
                                  VkImageMemoryBarrier2 *barrier,
                                  struct vn_cmd_cached_storage *storage)
 {
@@ -332,6 +414,13 @@ vn_cmd_fix_image_memory_barrier2(const struct vn_command_buffer *cmd,
          img, cmd->base.vk.pool->queue_family_index, &barrier->oldLayout,
          &barrier->newLayout, &barrier->srcQueueFamilyIndex,
          &barrier->dstQueueFamilyIndex);
+   if (!result.valid) {
+#if DETECT_OS_WINDOWS
+      vn_helios_cmd_refuse(cmd,
+                           VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT);
+#endif
+      return;
+   }
    if (!result.availability_op_needed) {
       barrier->srcStageMask = 0;
       barrier->srcAccessMask = 0;
@@ -735,6 +824,9 @@ vn_cmd_reset(struct vn_command_buffer *cmd)
 
    /* reset cmd builder */
    vk_free(&cmd->base.vk.pool->alloc, cmd->builder.present_src_images);
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_closure_fini(cmd);
+#endif
    vn_cmd_pool_free_query_records(cmd_pool, &cmd->builder.query_records);
    memset(&cmd->builder, 0, sizeof(cmd->builder));
    list_inithead(&cmd->builder.query_records);
@@ -1054,6 +1146,9 @@ vn_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    }
    cmd->builder.is_simultaneous =
       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_closure_begin(cmd);
+#endif
 
    vn_encode_vkBeginCommandBuffer(&cmd->cs, 0, commandBuffer, pBeginInfo);
 
@@ -1102,6 +1197,16 @@ vn_cmd_submit(struct vn_command_buffer *cmd)
       vn_cs_encoder_reset(&cmd->cs);
       return;
    }
+
+#if DETECT_OS_WINDOWS
+   /* Record-only command bytes stay owned by the exact VkCommandBuffer until
+    * queue submit flattens Begin..End into its live outer scope.  Submitting
+    * them here would create lower queue work before the UMD can name the WDDM
+    * allocations, and resetting would discard the immutable A7 record. */
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+      return;
+#endif
 
    if (vn_cs_encoder_needs_roundtrip(&cmd->cs))
       vn_ring_roundtrip(dev->primary_ring);
@@ -1243,6 +1348,12 @@ vn_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
                          uint32_t dynamicOffsetCount,
                          const uint32_t *pDynamicOffsets)
 {
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < descriptorSetCount; i++)
+      vn_helios_cmd_touch_descriptor_set(
+         HELIOS_CMD(commandBuffer), pDescriptorSets[i],
+         VK_COMMAND_TYPE_vkCmdBindDescriptorSets_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdBindDescriptorSets, commandBuffer, pipelineBindPoint,
                   layout, firstSet, descriptorSetCount, pDescriptorSets,
                   dynamicOffsetCount, pDynamicOffsets);
@@ -1253,6 +1364,13 @@ vn_CmdBindDescriptorSets2(
    VkCommandBuffer commandBuffer,
    const VkBindDescriptorSetsInfo *pBindDescriptorSetsInfo)
 {
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < pBindDescriptorSetsInfo->descriptorSetCount; i++)
+      vn_helios_cmd_touch_descriptor_set(
+         HELIOS_CMD(commandBuffer),
+         pBindDescriptorSetsInfo->pDescriptorSets[i],
+         VK_COMMAND_TYPE_vkCmdBindDescriptorSets2_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdBindDescriptorSets2, commandBuffer,
                   pBindDescriptorSetsInfo);
 }
@@ -1263,6 +1381,8 @@ vn_CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
                       VkDeviceSize offset,
                       VkIndexType indexType)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, VK_WHOLE_SIZE,
+                       HELIOS_READ, vkCmdBindIndexBuffer);
    VN_CMD_ENQUEUE(vkCmdBindIndexBuffer, commandBuffer, buffer, offset,
                   indexType);
 }
@@ -1274,6 +1394,8 @@ vn_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer,
                        VkDeviceSize size,
                        VkIndexType indexType)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, size, HELIOS_READ,
+                       vkCmdBindIndexBuffer2);
    VN_CMD_ENQUEUE(vkCmdBindIndexBuffer2, commandBuffer, buffer, offset, size,
                   indexType);
 }
@@ -1285,6 +1407,10 @@ vn_CmdBindVertexBuffers(VkCommandBuffer commandBuffer,
                         const VkBuffer *pBuffers,
                         const VkDeviceSize *pOffsets)
 {
+   for (uint32_t i = 0; i < bindingCount; i++)
+      HELIOS_TOUCH_BUFFER(commandBuffer, pBuffers[i], pOffsets[i],
+                          VK_WHOLE_SIZE, HELIOS_READ,
+                          vkCmdBindVertexBuffers);
    VN_CMD_ENQUEUE(vkCmdBindVertexBuffers, commandBuffer, firstBinding,
                   bindingCount, pBuffers, pOffsets);
 }
@@ -1304,6 +1430,54 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
 {
+#if DETECT_OS_WINDOWS
+   const uint32_t opcode = VK_COMMAND_TYPE_vkCmdBeginRendering_EXT;
+   for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; i++) {
+      const VkRenderingAttachmentInfo *att =
+         &pRenderingInfo->pColorAttachments[i];
+      if (att->imageView)
+         vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                        att->imageView, HELIOS_READ_WRITE,
+                                        opcode);
+      if (att->resolveImageView)
+         vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                        att->resolveImageView, HELIOS_WRITE,
+                                        opcode);
+   }
+   const VkRenderingAttachmentInfo *depth = pRenderingInfo->pDepthAttachment;
+   const VkRenderingAttachmentInfo *stencil =
+      pRenderingInfo->pStencilAttachment;
+   if (depth && depth->imageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     depth->imageView, HELIOS_READ_WRITE,
+                                     opcode);
+   if (depth && depth->resolveImageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     depth->resolveImageView, HELIOS_WRITE,
+                                     opcode);
+   if (stencil && stencil != depth && stencil->imageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     stencil->imageView, HELIOS_READ_WRITE,
+                                     opcode);
+   if (stencil && stencil != depth && stencil->resolveImageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     stencil->resolveImageView, HELIOS_WRITE,
+                                     opcode);
+   const VkRenderingFragmentShadingRateAttachmentInfoKHR *fsr =
+      vk_find_struct_const(
+         pRenderingInfo->pNext,
+         RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
+   if (fsr && fsr->imageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     fsr->imageView, HELIOS_READ, opcode);
+   const VkRenderingFragmentDensityMapAttachmentInfoEXT *fdm =
+      vk_find_struct_const(
+         pRenderingInfo->pNext,
+         RENDERING_FRAGMENT_DENSITY_MAP_ATTACHMENT_INFO_EXT);
+   if (fdm && fdm->imageView)
+      vn_helios_cmd_touch_image_view(HELIOS_CMD(commandBuffer),
+                                     fdm->imageView, HELIOS_READ, opcode);
+#endif
    vn_cmd_begin_rendering(vn_command_buffer_from_handle(commandBuffer),
                           pRenderingInfo);
 
@@ -1337,6 +1511,12 @@ vn_CmdDrawIndirect(VkCommandBuffer commandBuffer,
                    uint32_t drawCount,
                    uint32_t stride)
 {
+   const VkDeviceSize bytes = drawCount
+                                 ? (VkDeviceSize)(drawCount - 1) * stride +
+                                      sizeof(VkDrawIndirectCommand)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawIndirect);
    VN_CMD_ENQUEUE(vkCmdDrawIndirect, commandBuffer, buffer, offset, drawCount,
                   stride);
 }
@@ -1348,6 +1528,12 @@ vn_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
                           uint32_t drawCount,
                           uint32_t stride)
 {
+   const VkDeviceSize bytes = drawCount
+                                 ? (VkDeviceSize)(drawCount - 1) * stride +
+                                      sizeof(VkDrawIndexedIndirectCommand)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawIndexedIndirect);
    VN_CMD_ENQUEUE(vkCmdDrawIndexedIndirect, commandBuffer, buffer, offset,
                   drawCount, stride);
 }
@@ -1361,6 +1547,15 @@ vn_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
                         uint32_t maxDrawCount,
                         uint32_t stride)
 {
+   const VkDeviceSize bytes = maxDrawCount
+                                 ? (VkDeviceSize)(maxDrawCount - 1) * stride +
+                                      sizeof(VkDrawIndirectCommand)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawIndirectCount);
+   HELIOS_TOUCH_BUFFER(commandBuffer, countBuffer, countBufferOffset,
+                       sizeof(uint32_t), HELIOS_READ,
+                       vkCmdDrawIndirectCount);
    VN_CMD_ENQUEUE(vkCmdDrawIndirectCount, commandBuffer, buffer, offset,
                   countBuffer, countBufferOffset, maxDrawCount, stride);
 }
@@ -1374,6 +1569,15 @@ vn_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
                                uint32_t maxDrawCount,
                                uint32_t stride)
 {
+   const VkDeviceSize bytes = maxDrawCount
+                                 ? (VkDeviceSize)(maxDrawCount - 1) * stride +
+                                      sizeof(VkDrawIndexedIndirectCommand)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawIndexedIndirectCount);
+   HELIOS_TOUCH_BUFFER(commandBuffer, countBuffer, countBufferOffset,
+                       sizeof(uint32_t), HELIOS_READ,
+                       vkCmdDrawIndexedIndirectCount);
    VN_CMD_ENQUEUE(vkCmdDrawIndexedIndirectCount, commandBuffer, buffer,
                   offset, countBuffer, countBufferOffset, maxDrawCount,
                   stride);
@@ -1394,6 +1598,9 @@ vn_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
                        VkBuffer buffer,
                        VkDeviceSize offset)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset,
+                       sizeof(VkDispatchIndirectCommand), HELIOS_READ,
+                       vkCmdDispatchIndirect);
    VN_CMD_ENQUEUE(vkCmdDispatchIndirect, commandBuffer, buffer, offset);
 }
 
@@ -1404,6 +1611,10 @@ vn_CmdCopyBuffer(VkCommandBuffer commandBuffer,
                  uint32_t regionCount,
                  const VkBufferCopy *pRegions)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, srcBuffer, 0, VK_WHOLE_SIZE,
+                       HELIOS_READ, vkCmdCopyBuffer);
+   HELIOS_TOUCH_BUFFER(commandBuffer, dstBuffer, 0, VK_WHOLE_SIZE,
+                       HELIOS_WRITE, vkCmdCopyBuffer);
    VN_CMD_ENQUEUE(vkCmdCopyBuffer, commandBuffer, srcBuffer, dstBuffer,
                   regionCount, pRegions);
 }
@@ -1412,6 +1623,10 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
                   const VkCopyBufferInfo2 *pCopyBufferInfo)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, pCopyBufferInfo->srcBuffer, 0,
+                       VK_WHOLE_SIZE, HELIOS_READ, vkCmdCopyBuffer2);
+   HELIOS_TOUCH_BUFFER(commandBuffer, pCopyBufferInfo->dstBuffer, 0,
+                       VK_WHOLE_SIZE, HELIOS_WRITE, vkCmdCopyBuffer2);
    VN_CMD_ENQUEUE(vkCmdCopyBuffer2, commandBuffer, pCopyBufferInfo);
 }
 
@@ -1424,6 +1639,8 @@ vn_CmdCopyImage(VkCommandBuffer commandBuffer,
                 uint32_t regionCount,
                 const VkImageCopy *pRegions)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, srcImage, HELIOS_READ, vkCmdCopyImage);
+   HELIOS_TOUCH_IMAGE(commandBuffer, dstImage, HELIOS_WRITE, vkCmdCopyImage);
    VN_CMD_ENQUEUE(vkCmdCopyImage, commandBuffer, srcImage, srcImageLayout,
                   dstImage, dstImageLayout, regionCount, pRegions);
 }
@@ -1432,6 +1649,10 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdCopyImage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, pCopyImageInfo->srcImage, HELIOS_READ,
+                      vkCmdCopyImage2);
+   HELIOS_TOUCH_IMAGE(commandBuffer, pCopyImageInfo->dstImage, HELIOS_WRITE,
+                      vkCmdCopyImage2);
    VN_CMD_ENQUEUE(vkCmdCopyImage2, commandBuffer, pCopyImageInfo);
 }
 
@@ -1445,6 +1666,8 @@ vn_CmdBlitImage(VkCommandBuffer commandBuffer,
                 const VkImageBlit *pRegions,
                 VkFilter filter)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, srcImage, HELIOS_READ, vkCmdBlitImage);
+   HELIOS_TOUCH_IMAGE(commandBuffer, dstImage, HELIOS_WRITE, vkCmdBlitImage);
    VN_CMD_ENQUEUE(vkCmdBlitImage, commandBuffer, srcImage, srcImageLayout,
                   dstImage, dstImageLayout, regionCount, pRegions, filter);
 }
@@ -1453,6 +1676,10 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdBlitImage2(VkCommandBuffer commandBuffer,
                  const VkBlitImageInfo2 *pBlitImageInfo)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, pBlitImageInfo->srcImage, HELIOS_READ,
+                      vkCmdBlitImage2);
+   HELIOS_TOUCH_IMAGE(commandBuffer, pBlitImageInfo->dstImage, HELIOS_WRITE,
+                      vkCmdBlitImage2);
    VN_CMD_ENQUEUE(vkCmdBlitImage2, commandBuffer, pBlitImageInfo);
 }
 
@@ -1464,6 +1691,10 @@ vn_CmdCopyBufferToImage(VkCommandBuffer commandBuffer,
                         uint32_t regionCount,
                         const VkBufferImageCopy *pRegions)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, srcBuffer, 0, VK_WHOLE_SIZE,
+                       HELIOS_READ, vkCmdCopyBufferToImage);
+   HELIOS_TOUCH_IMAGE(commandBuffer, dstImage, HELIOS_WRITE,
+                      vkCmdCopyBufferToImage);
    VN_CMD_ENQUEUE(vkCmdCopyBufferToImage, commandBuffer, srcBuffer, dstImage,
                   dstImageLayout, regionCount, pRegions);
 }
@@ -1473,6 +1704,11 @@ vn_CmdCopyBufferToImage2(
    VkCommandBuffer commandBuffer,
    const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, pCopyBufferToImageInfo->srcBuffer, 0,
+                       VK_WHOLE_SIZE, HELIOS_READ,
+                       vkCmdCopyBufferToImage2);
+   HELIOS_TOUCH_IMAGE(commandBuffer, pCopyBufferToImageInfo->dstImage,
+                      HELIOS_WRITE, vkCmdCopyBufferToImage2);
    VN_CMD_ENQUEUE(vkCmdCopyBufferToImage2, commandBuffer,
                   pCopyBufferToImageInfo);
 }
@@ -1497,6 +1733,11 @@ vn_CmdCopyImageToBuffer(VkCommandBuffer commandBuffer,
       img->wsi.blit_mem = buf->wsi.mem;
    }
 
+   HELIOS_TOUCH_IMAGE(commandBuffer, srcImage, HELIOS_READ,
+                      vkCmdCopyImageToBuffer);
+   HELIOS_TOUCH_BUFFER(commandBuffer, dstBuffer, 0, VK_WHOLE_SIZE,
+                       HELIOS_WRITE, vkCmdCopyImageToBuffer);
+
    VN_CMD_ENQUEUE(vkCmdCopyImageToBuffer, commandBuffer, srcImage,
                   srcImageLayout, dstBuffer, regionCount, pRegions);
 }
@@ -1506,6 +1747,11 @@ vn_CmdCopyImageToBuffer2(
    VkCommandBuffer commandBuffer,
    const VkCopyImageToBufferInfo2 *pCopyImageToBufferInfo)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, pCopyImageToBufferInfo->srcImage,
+                      HELIOS_READ, vkCmdCopyImageToBuffer2);
+   HELIOS_TOUCH_BUFFER(commandBuffer, pCopyImageToBufferInfo->dstBuffer, 0,
+                       VK_WHOLE_SIZE, HELIOS_WRITE,
+                       vkCmdCopyImageToBuffer2);
    VN_CMD_ENQUEUE(vkCmdCopyImageToBuffer2, commandBuffer,
                   pCopyImageToBufferInfo);
 }
@@ -1517,6 +1763,8 @@ vn_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
                    VkDeviceSize dataSize,
                    const void *pData)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, dstBuffer, dstOffset, dataSize,
+                       HELIOS_WRITE, vkCmdUpdateBuffer);
    VN_CMD_ENQUEUE(vkCmdUpdateBuffer, commandBuffer, dstBuffer, dstOffset,
                   dataSize, pData);
 }
@@ -1528,6 +1776,8 @@ vn_CmdFillBuffer(VkCommandBuffer commandBuffer,
                  VkDeviceSize size,
                  uint32_t data)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, dstBuffer, dstOffset, size,
+                       HELIOS_WRITE, vkCmdFillBuffer);
    VN_CMD_ENQUEUE(vkCmdFillBuffer, commandBuffer, dstBuffer, dstOffset, size,
                   data);
 }
@@ -1540,6 +1790,8 @@ vn_CmdClearColorImage(VkCommandBuffer commandBuffer,
                       uint32_t rangeCount,
                       const VkImageSubresourceRange *pRanges)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, image, HELIOS_WRITE,
+                      vkCmdClearColorImage);
    VN_CMD_ENQUEUE(vkCmdClearColorImage, commandBuffer, image, imageLayout,
                   pColor, rangeCount, pRanges);
 }
@@ -1552,6 +1804,8 @@ vn_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
                              uint32_t rangeCount,
                              const VkImageSubresourceRange *pRanges)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, image, HELIOS_WRITE,
+                      vkCmdClearDepthStencilImage);
    VN_CMD_ENQUEUE(vkCmdClearDepthStencilImage, commandBuffer, image,
                   imageLayout, pDepthStencil, rangeCount, pRanges);
 }
@@ -1576,6 +1830,10 @@ vn_CmdResolveImage(VkCommandBuffer commandBuffer,
                    uint32_t regionCount,
                    const VkImageResolve *pRegions)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, srcImage, HELIOS_READ,
+                      vkCmdResolveImage);
+   HELIOS_TOUCH_IMAGE(commandBuffer, dstImage, HELIOS_WRITE,
+                      vkCmdResolveImage);
    VN_CMD_ENQUEUE(vkCmdResolveImage, commandBuffer, srcImage, srcImageLayout,
                   dstImage, dstImageLayout, regionCount, pRegions);
 }
@@ -1584,6 +1842,10 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdResolveImage2(VkCommandBuffer commandBuffer,
                     const VkResolveImageInfo2 *pResolveImageInfo)
 {
+   HELIOS_TOUCH_IMAGE(commandBuffer, pResolveImageInfo->srcImage, HELIOS_READ,
+                      vkCmdResolveImage2);
+   HELIOS_TOUCH_IMAGE(commandBuffer, pResolveImageInfo->dstImage,
+                      HELIOS_WRITE, vkCmdResolveImage2);
    VN_CMD_ENQUEUE(vkCmdResolveImage2, commandBuffer, pResolveImageInfo);
 }
 
@@ -1592,6 +1854,10 @@ vn_CmdSetEvent(VkCommandBuffer commandBuffer,
                VkEvent event,
                VkPipelineStageFlags stageMask)
 {
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_event(vn_command_buffer_from_handle(commandBuffer),
+                             event, VK_COMMAND_TYPE_vkCmdSetEvent_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdSetEvent, commandBuffer, event, stageMask);
 
    vn_event_feedback_cmd_record(commandBuffer, event, stageMask, VK_EVENT_SET,
@@ -1606,6 +1872,11 @@ vn_CmdSetEvent2(VkCommandBuffer commandBuffer,
 {
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
+
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_event(cmd, event,
+                             VK_COMMAND_TYPE_vkCmdSetEvent2_EXT);
+#endif
 
    pDependencyInfo = vn_cmd_fix_dependency_infos(cmd, 1, pDependencyInfo);
 
@@ -1622,6 +1893,10 @@ vn_CmdResetEvent(VkCommandBuffer commandBuffer,
                  VkEvent event,
                  VkPipelineStageFlags stageMask)
 {
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_event(vn_command_buffer_from_handle(commandBuffer),
+                             event, VK_COMMAND_TYPE_vkCmdResetEvent_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdResetEvent, commandBuffer, event, stageMask);
 
    vn_event_feedback_cmd_record(commandBuffer, event, stageMask,
@@ -1633,6 +1908,10 @@ vn_CmdResetEvent2(VkCommandBuffer commandBuffer,
                   VkEvent event,
                   VkPipelineStageFlags2 stageMask)
 {
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_event(vn_command_buffer_from_handle(commandBuffer),
+                             event, VK_COMMAND_TYPE_vkCmdResetEvent2_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdResetEvent2, commandBuffer, event, stageMask);
    vn_event_feedback_cmd_record(commandBuffer, event, stageMask,
                                 VK_EVENT_RESET, true);
@@ -1654,6 +1933,19 @@ vn_CmdWaitEvents(VkCommandBuffer commandBuffer,
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
    uint32_t transfer_count;
+
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < bufferMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_buffer(
+         cmd, pBufferMemoryBarriers[i].buffer,
+         pBufferMemoryBarriers[i].offset,
+         pBufferMemoryBarriers[i].size, HELIOS_READ_WRITE,
+         VK_COMMAND_TYPE_vkCmdWaitEvents_EXT);
+   for (uint32_t i = 0; i < imageMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_image(
+         cmd, pImageMemoryBarriers[i].image, HELIOS_READ_WRITE,
+         VK_COMMAND_TYPE_vkCmdWaitEvents_EXT);
+#endif
 
    pImageMemoryBarriers = vn_cmd_wait_events_fix_image_memory_barriers(
       cmd, pImageMemoryBarriers, imageMemoryBarrierCount, &transfer_count);
@@ -1681,6 +1973,23 @@ vn_CmdWaitEvents2(VkCommandBuffer commandBuffer,
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
 
+#if DETECT_OS_WINDOWS
+   for (uint32_t d = 0; d < eventCount; d++) {
+      for (uint32_t i = 0;
+           i < pDependencyInfos[d].bufferMemoryBarrierCount; i++)
+         vn_helios_cmd_touch_buffer(
+            cmd, pDependencyInfos[d].pBufferMemoryBarriers[i].buffer,
+            pDependencyInfos[d].pBufferMemoryBarriers[i].offset,
+            pDependencyInfos[d].pBufferMemoryBarriers[i].size,
+            HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT);
+      for (uint32_t i = 0;
+           i < pDependencyInfos[d].imageMemoryBarrierCount; i++)
+         vn_helios_cmd_touch_image(
+            cmd, pDependencyInfos[d].pImageMemoryBarriers[i].image,
+            HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT);
+   }
+#endif
+
    pDependencyInfos =
       vn_cmd_fix_dependency_infos(cmd, eventCount, pDependencyInfos);
 
@@ -1703,6 +2012,19 @@ vn_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
 
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < bufferMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_buffer(
+         cmd, pBufferMemoryBarriers[i].buffer,
+         pBufferMemoryBarriers[i].offset,
+         pBufferMemoryBarriers[i].size, HELIOS_READ_WRITE,
+         VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT);
+   for (uint32_t i = 0; i < imageMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_image(
+         cmd, pImageMemoryBarriers[i].image, HELIOS_READ_WRITE,
+         VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT);
+#endif
+
    pImageMemoryBarriers = vn_cmd_pipeline_barrier_fix_image_memory_barriers(
       cmd, pImageMemoryBarriers, imageMemoryBarrierCount);
 
@@ -1720,6 +2042,19 @@ vn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
 
+#if DETECT_OS_WINDOWS
+   for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_buffer(
+         cmd, pDependencyInfo->pBufferMemoryBarriers[i].buffer,
+         pDependencyInfo->pBufferMemoryBarriers[i].offset,
+         pDependencyInfo->pBufferMemoryBarriers[i].size,
+         HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT);
+   for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++)
+      vn_helios_cmd_touch_image(
+         cmd, pDependencyInfo->pImageMemoryBarriers[i].image,
+         HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT);
+#endif
+
    pDependencyInfo = vn_cmd_fix_dependency_infos(cmd, 1, pDependencyInfo);
 
    VN_CMD_ENQUEUE(vkCmdPipelineBarrier2, commandBuffer, pDependencyInfo);
@@ -1731,6 +2066,16 @@ vn_CmdBeginQuery(VkCommandBuffer commandBuffer,
                  uint32_t query,
                  VkQueryControlFlags flags)
 {
+#if DETECT_OS_WINDOWS
+   struct vn_command_buffer *cmd = HELIOS_CMD(commandBuffer);
+   struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
+   struct vn_query_pool *pool = vn_query_pool_from_handle(queryPool);
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+       (!pool || pool->base.vk.device != &dev->base.vk ||
+        query >= pool->query_count))
+      vn_helios_cmd_refuse(cmd, VK_COMMAND_TYPE_vkCmdBeginQuery_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdBeginQuery, commandBuffer, queryPool, query, flags);
 }
 
@@ -1760,6 +2105,26 @@ vn_cmd_record_query(VkCommandBuffer cmd_handle,
    struct vn_command_pool *cmd_pool = vn_cmd_pool(cmd);
    struct vn_device *dev = vn_device_from_vk(cmd->base.vk.pool->base.device);
    struct vn_query_pool *query_pool = vn_query_pool_from_handle(pool_handle);
+
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!query_pool || query_pool->base.vk.device != &dev->base.vk ||
+          query > query_pool->query_count ||
+          query_count > query_pool->query_count - query) {
+         vn_helios_cmd_refuse(cmd, VK_COMMAND_TYPE_vkCmdBeginQuery_EXT);
+         return;
+      }
+      struct vn_cmd_query_record *record = vn_cmd_pool_alloc_query_record(
+         cmd_pool, query_pool, query, query_count, copy);
+      if (!record) {
+         cmd->base.vk.state = MESA_VK_COMMAND_BUFFER_STATE_INVALID;
+         return;
+      }
+      list_addtail(&record->head, &cmd->builder.query_records);
+      return;
+   }
+#endif
 
    if (unlikely(VN_PERF(NO_QUERY_FEEDBACK)))
       return;
@@ -1841,9 +2206,39 @@ vn_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
                            VkDeviceSize stride,
                            VkQueryResultFlags flags)
 {
+#if DETECT_OS_WINDOWS
+   if (queryCount) {
+      struct vn_query_pool *pool = vn_query_pool_from_handle(queryPool);
+      const VkDeviceSize width =
+         flags & VK_QUERY_RESULT_64_BIT ? sizeof(uint64_t) : sizeof(uint32_t);
+      VkDeviceSize final_bytes = 0;
+      if (!pool || pool->result_array_size > UINT64_MAX / width) {
+         HELIOS_REFUSE(commandBuffer, vkCmdCopyQueryPoolResults);
+      } else {
+         final_bytes = (VkDeviceSize)pool->result_array_size * width;
+         if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) {
+            if (final_bytes > UINT64_MAX - width)
+               HELIOS_REFUSE(commandBuffer, vkCmdCopyQueryPoolResults);
+            else
+               final_bytes += width;
+         }
+         if (queryCount > 1 &&
+             stride > (UINT64_MAX - final_bytes) / (queryCount - 1)) {
+            HELIOS_REFUSE(commandBuffer, vkCmdCopyQueryPoolResults);
+         } else if (final_bytes) {
+            HELIOS_TOUCH_BUFFER(
+               commandBuffer, dstBuffer, dstOffset,
+               (VkDeviceSize)(queryCount - 1) * stride + final_bytes,
+               HELIOS_WRITE, vkCmdCopyQueryPoolResults);
+         }
+      }
+   }
+#endif
    VN_CMD_ENQUEUE(vkCmdCopyQueryPoolResults, commandBuffer, queryPool,
                   firstQuery, queryCount, dstBuffer, dstOffset, stride,
                   flags);
+   vn_cmd_record_query(commandBuffer, queryPool, firstQuery, queryCount,
+                       false);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1872,6 +2267,25 @@ vn_CmdBeginRenderPass(VkCommandBuffer commandBuffer,
 {
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
+
+#if DETECT_OS_WINDOWS
+   struct vn_device *helios_dev =
+      vn_device_from_vk(cmd->base.vk.pool->base.device);
+   struct vn_render_pass *helios_pass =
+      vn_render_pass_from_handle(pRenderPassBegin->renderPass);
+   struct vn_framebuffer *helios_fb =
+      vn_framebuffer_from_handle(pRenderPassBegin->framebuffer);
+   if (!helios_dev || !helios_pass ||
+       helios_pass->base.vk.device != &helios_dev->base.vk || !helios_fb ||
+       helios_fb->base.vk.device != &helios_dev->base.vk) {
+      vn_helios_cmd_refuse(cmd, VK_COMMAND_TYPE_vkCmdBeginRenderPass_EXT);
+   } else {
+      for (uint32_t i = 0; i < helios_fb->image_view_count; i++)
+         vn_helios_cmd_touch_image_view(
+            cmd, helios_fb->image_views[i], HELIOS_READ_WRITE,
+            VK_COMMAND_TYPE_vkCmdBeginRenderPass_EXT);
+   }
+#endif
 
    vn_cmd_begin_render_pass(
       cmd, vn_render_pass_from_handle(pRenderPassBegin->renderPass),
@@ -1905,6 +2319,25 @@ vn_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
 {
    struct vn_command_buffer *cmd =
       vn_command_buffer_from_handle(commandBuffer);
+
+#if DETECT_OS_WINDOWS
+   struct vn_device *helios_dev =
+      vn_device_from_vk(cmd->base.vk.pool->base.device);
+   struct vn_render_pass *helios_pass =
+      vn_render_pass_from_handle(pRenderPassBegin->renderPass);
+   struct vn_framebuffer *helios_fb =
+      vn_framebuffer_from_handle(pRenderPassBegin->framebuffer);
+   if (!helios_dev || !helios_pass ||
+       helios_pass->base.vk.device != &helios_dev->base.vk || !helios_fb ||
+       helios_fb->base.vk.device != &helios_dev->base.vk) {
+      vn_helios_cmd_refuse(cmd, VK_COMMAND_TYPE_vkCmdBeginRenderPass2_EXT);
+   } else {
+      for (uint32_t i = 0; i < helios_fb->image_view_count; i++)
+         vn_helios_cmd_touch_image_view(
+            cmd, helios_fb->image_views[i], HELIOS_READ_WRITE,
+            VK_COMMAND_TYPE_vkCmdBeginRenderPass2_EXT);
+   }
+#endif
 
    vn_cmd_begin_render_pass(
       cmd, vn_render_pass_from_handle(pRenderPassBegin->renderPass),
@@ -1949,6 +2382,11 @@ vn_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       struct vn_command_buffer *secondary_cmd =
          vn_command_buffer_from_handle(pCommandBuffers[i]);
       vn_cmd_merge_query_records(primary_cmd, secondary_cmd);
+#if DETECT_OS_WINDOWS
+      vn_helios_cmd_merge_secondary(
+         primary_cmd, secondary_cmd,
+         VK_COMMAND_TYPE_vkCmdExecuteCommands_EXT);
+#endif
    }
 }
 
@@ -2012,6 +2450,10 @@ vn_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
                                       const VkDeviceSize *pOffsets,
                                       const VkDeviceSize *pSizes)
 {
+   for (uint32_t i = 0; i < bindingCount; i++)
+      HELIOS_TOUCH_BUFFER(commandBuffer, pBuffers[i], pOffsets[i],
+                          pSizes ? pSizes[i] : VK_WHOLE_SIZE,
+                          HELIOS_WRITE, vkCmdBindTransformFeedbackBuffersEXT);
    VN_CMD_ENQUEUE(vkCmdBindTransformFeedbackBuffersEXT, commandBuffer,
                   firstBinding, bindingCount, pBuffers, pOffsets, pSizes);
 }
@@ -2023,6 +2465,13 @@ vn_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
                                 const VkBuffer *pCounterBuffers,
                                 const VkDeviceSize *pCounterBufferOffsets)
 {
+   for (uint32_t i = 0; i < counterBufferCount; i++) {
+      if (pCounterBuffers && pCounterBuffers[i])
+         HELIOS_TOUCH_BUFFER(commandBuffer, pCounterBuffers[i],
+                             pCounterBufferOffsets[i], sizeof(uint32_t),
+                             HELIOS_READ_WRITE,
+                             vkCmdBeginTransformFeedbackEXT);
+   }
    VN_CMD_ENQUEUE(vkCmdBeginTransformFeedbackEXT, commandBuffer,
                   firstCounterBuffer, counterBufferCount, pCounterBuffers,
                   pCounterBufferOffsets);
@@ -2035,6 +2484,13 @@ vn_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
                               const VkBuffer *pCounterBuffers,
                               const VkDeviceSize *pCounterBufferOffsets)
 {
+   for (uint32_t i = 0; i < counterBufferCount; i++) {
+      if (pCounterBuffers && pCounterBuffers[i])
+         HELIOS_TOUCH_BUFFER(commandBuffer, pCounterBuffers[i],
+                             pCounterBufferOffsets[i], sizeof(uint32_t),
+                             HELIOS_READ_WRITE,
+                             vkCmdEndTransformFeedbackEXT);
+   }
    VN_CMD_ENQUEUE(vkCmdEndTransformFeedbackEXT, commandBuffer,
                   firstCounterBuffer, counterBufferCount, pCounterBuffers,
                   pCounterBufferOffsets);
@@ -2049,6 +2505,9 @@ vn_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
                                uint32_t counterOffset,
                                uint32_t vertexStride)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer, counterBuffer, counterBufferOffset,
+                       sizeof(uint32_t), HELIOS_READ,
+                       vkCmdDrawIndirectByteCountEXT);
    VN_CMD_ENQUEUE(vkCmdDrawIndirectByteCountEXT, commandBuffer, instanceCount,
                   firstInstance, counterBuffer, counterBufferOffset,
                   counterOffset, vertexStride);
@@ -2063,6 +2522,10 @@ vn_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
                          const VkDeviceSize *pSizes,
                          const VkDeviceSize *pStrides)
 {
+   for (uint32_t i = 0; i < bindingCount; i++)
+      HELIOS_TOUCH_BUFFER(commandBuffer, pBuffers[i], pOffsets[i],
+                          pSizes ? pSizes[i] : VK_WHOLE_SIZE,
+                          HELIOS_READ, vkCmdBindVertexBuffers2);
    VN_CMD_ENQUEUE(vkCmdBindVertexBuffers2, commandBuffer, firstBinding,
                   bindingCount, pBuffers, pOffsets, pSizes, pStrides);
 }
@@ -2205,6 +2668,11 @@ vn_CmdBeginConditionalRenderingEXT(
    VkCommandBuffer commandBuffer,
    const VkConditionalRenderingBeginInfoEXT *pConditionalRenderingBegin)
 {
+   HELIOS_TOUCH_BUFFER(commandBuffer,
+                       pConditionalRenderingBegin->buffer,
+                       pConditionalRenderingBegin->offset,
+                       sizeof(uint32_t), HELIOS_READ,
+                       vkCmdBeginConditionalRenderingEXT);
    VN_CMD_ENQUEUE(vkCmdBeginConditionalRenderingEXT, commandBuffer,
                   pConditionalRenderingBegin);
 }
@@ -2261,6 +2729,12 @@ vn_CmdPushDescriptorSet(VkCommandBuffer commandBuffer,
    pDescriptorWrites = vn_descriptor_set_get_writes(
       descriptorWriteCount, pDescriptorWrites, layout, &local);
 
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_descriptor_writes(
+      HELIOS_CMD(commandBuffer), descriptorWriteCount, pDescriptorWrites,
+      VK_COMMAND_TYPE_vkCmdPushDescriptorSet_EXT);
+#endif
+
    VN_CMD_ENQUEUE(vkCmdPushDescriptorSet, commandBuffer, pipelineBindPoint,
                   layout, set, descriptorWriteCount, pDescriptorWrites);
 
@@ -2289,6 +2763,11 @@ vn_CmdPushDescriptorSet2(VkCommandBuffer commandBuffer,
 
    VkPushDescriptorSetInfo info = *pPushDescriptorSetInfo;
    info.pDescriptorWrites = desc_writes;
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_descriptor_writes(
+      HELIOS_CMD(commandBuffer), write_count, desc_writes,
+      VK_COMMAND_TYPE_vkCmdPushDescriptorSet2_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdPushDescriptorSet2, commandBuffer, &info);
 
    STACK_ARRAY_FINISH(writes);
@@ -2324,6 +2803,12 @@ vn_CmdPushDescriptorSetWithTemplate(
    };
    vn_descriptor_set_fill_update_with_template(templ, VK_NULL_HANDLE, pData,
                                                &update);
+
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_descriptor_writes(
+      HELIOS_CMD(commandBuffer), update.write_count, update.writes,
+      VK_COMMAND_TYPE_vkCmdPushDescriptorSet_EXT);
+#endif
 
    VN_CMD_ENQUEUE(vkCmdPushDescriptorSet, commandBuffer,
                   templ->push.pipeline_bind_point, layout, set,
@@ -2400,6 +2885,11 @@ vn_CmdPushDescriptorSetWithTemplate2(VkCommandBuffer commandBuffer,
       .descriptorWriteCount = update.write_count,
       .pDescriptorWrites = update.writes,
    };
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_descriptor_writes(
+      HELIOS_CMD(commandBuffer), update.write_count, update.writes,
+      VK_COMMAND_TYPE_vkCmdPushDescriptorSet2_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdPushDescriptorSet2, commandBuffer, &info);
 
    STACK_ARRAY_FINISH(writes);
@@ -2647,6 +3137,8 @@ vn_CmdBuildAccelerationStructuresIndirectKHR(
    const uint32_t *pIndirectStrides,
    const uint32_t *const *ppMaxPrimitiveCounts)
 {
+   HELIOS_REFUSE(commandBuffer,
+                 vkCmdBuildAccelerationStructuresIndirectKHR);
    VN_CMD_ENQUEUE(vkCmdBuildAccelerationStructuresIndirectKHR, commandBuffer,
                   infoCount, pInfos, pIndirectDeviceAddresses,
                   pIndirectStrides, ppMaxPrimitiveCounts);
@@ -2659,6 +3151,7 @@ vn_CmdBuildAccelerationStructuresKHR(
    const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
    const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdBuildAccelerationStructuresKHR);
    VN_CMD_ENQUEUE(vkCmdBuildAccelerationStructuresKHR, commandBuffer,
                   infoCount, pInfos, ppBuildRangeInfos);
 }
@@ -2668,6 +3161,7 @@ vn_CmdCopyAccelerationStructureKHR(
    VkCommandBuffer commandBuffer,
    const VkCopyAccelerationStructureInfoKHR *pInfo)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdCopyAccelerationStructureKHR);
    VN_CMD_ENQUEUE(vkCmdCopyAccelerationStructureKHR, commandBuffer, pInfo);
 }
 
@@ -2676,6 +3170,8 @@ vn_CmdCopyAccelerationStructureToMemoryKHR(
    VkCommandBuffer commandBuffer,
    const VkCopyAccelerationStructureToMemoryInfoKHR *pInfo)
 {
+   HELIOS_REFUSE(commandBuffer,
+                 vkCmdCopyAccelerationStructureToMemoryKHR);
    VN_CMD_ENQUEUE(vkCmdCopyAccelerationStructureToMemoryKHR, commandBuffer,
                   pInfo);
 }
@@ -2685,6 +3181,8 @@ vn_CmdCopyMemoryToAccelerationStructureKHR(
    VkCommandBuffer commandBuffer,
    const VkCopyMemoryToAccelerationStructureInfoKHR *pInfo)
 {
+   HELIOS_REFUSE(commandBuffer,
+                 vkCmdCopyMemoryToAccelerationStructureKHR);
    VN_CMD_ENQUEUE(vkCmdCopyMemoryToAccelerationStructureKHR, commandBuffer,
                   pInfo);
 }
@@ -2705,6 +3203,8 @@ vn_CmdWriteAccelerationStructuresPropertiesKHR(
     *
     * So no need to consider view mask impact on query count.
     */
+   HELIOS_REFUSE(commandBuffer,
+                 vkCmdWriteAccelerationStructuresPropertiesKHR);
    VN_CMD_ENQUEUE(vkCmdWriteAccelerationStructuresPropertiesKHR,
                   commandBuffer, accelerationStructureCount,
                   pAccelerationStructures, queryType, queryPool, firstQuery);
@@ -2717,6 +3217,7 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdSetRayTracingPipelineStackSizeKHR(VkCommandBuffer commandBuffer,
                                         uint32_t pipelineStackSize)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdSetRayTracingPipelineStackSizeKHR);
    VN_CMD_ENQUEUE(vkCmdSetRayTracingPipelineStackSizeKHR, commandBuffer,
                   pipelineStackSize);
 }
@@ -2730,6 +3231,7 @@ vn_CmdTraceRaysIndirectKHR(
    const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
    VkDeviceAddress indirectDeviceAddress)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdTraceRaysIndirectKHR);
    VN_CMD_ENQUEUE(vkCmdTraceRaysIndirectKHR, commandBuffer,
                   pRaygenShaderBindingTable, pMissShaderBindingTable,
                   pHitShaderBindingTable, pCallableShaderBindingTable,
@@ -2747,6 +3249,7 @@ vn_CmdTraceRaysKHR(
    uint32_t height,
    uint32_t depth)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdTraceRaysKHR);
    VN_CMD_ENQUEUE(vkCmdTraceRaysKHR, commandBuffer, pRaygenShaderBindingTable,
                   pMissShaderBindingTable, pHitShaderBindingTable,
                   pCallableShaderBindingTable, width, height, depth);
@@ -2756,6 +3259,7 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer,
                             VkDeviceAddress indirectDeviceAddress)
 {
+   HELIOS_REFUSE(commandBuffer, vkCmdTraceRaysIndirect2KHR);
    VN_CMD_ENQUEUE(vkCmdTraceRaysIndirect2KHR, commandBuffer,
                   indirectDeviceAddress);
 }
@@ -2801,6 +3305,12 @@ vn_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer,
                                uint32_t drawCount,
                                uint32_t stride)
 {
+   const VkDeviceSize bytes = drawCount
+                                 ? (VkDeviceSize)(drawCount - 1) * stride +
+                                      sizeof(VkDrawMeshTasksIndirectCommandEXT)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawMeshTasksIndirectEXT);
    VN_CMD_ENQUEUE(vkCmdDrawMeshTasksIndirectEXT, commandBuffer, buffer,
                   offset, drawCount, stride);
 }
@@ -2814,6 +3324,15 @@ vn_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer,
                                     uint32_t maxDrawCount,
                                     uint32_t stride)
 {
+   const VkDeviceSize bytes = maxDrawCount
+                                 ? (VkDeviceSize)(maxDrawCount - 1) * stride +
+                                      sizeof(VkDrawMeshTasksIndirectCommandEXT)
+                                 : 1;
+   HELIOS_TOUCH_BUFFER(commandBuffer, buffer, offset, bytes, HELIOS_READ,
+                       vkCmdDrawMeshTasksIndirectCountEXT);
+   HELIOS_TOUCH_BUFFER(commandBuffer, countBuffer, countBufferOffset,
+                       sizeof(uint32_t), HELIOS_READ,
+                       vkCmdDrawMeshTasksIndirectCountEXT);
    VN_CMD_ENQUEUE(vkCmdDrawMeshTasksIndirectCountEXT, commandBuffer, buffer,
                   offset, countBuffer, countBufferOffset, maxDrawCount,
                   stride);
@@ -2823,6 +3342,12 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdBindResourceHeapEXT(VkCommandBuffer commandBuffer,
                           const VkBindHeapInfoEXT *pBindInfo)
 {
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_device_address(
+      HELIOS_CMD(commandBuffer), pBindInfo->heapRange.address,
+      pBindInfo->heapRange.size, HELIOS_READ_WRITE,
+      VK_COMMAND_TYPE_vkCmdBindResourceHeapEXT_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdBindResourceHeapEXT, commandBuffer, pBindInfo);
 }
 
@@ -2830,6 +3355,12 @@ VKAPI_ATTR void VKAPI_CALL
 vn_CmdBindSamplerHeapEXT(VkCommandBuffer commandBuffer,
                          const VkBindHeapInfoEXT *pBindInfo)
 {
+#if DETECT_OS_WINDOWS
+   vn_helios_cmd_touch_device_address(
+      HELIOS_CMD(commandBuffer), pBindInfo->heapRange.address,
+      pBindInfo->heapRange.size, HELIOS_READ,
+      VK_COMMAND_TYPE_vkCmdBindSamplerHeapEXT_EXT);
+#endif
    VN_CMD_ENQUEUE(vkCmdBindSamplerHeapEXT, commandBuffer, pBindInfo);
 }
 

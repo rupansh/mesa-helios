@@ -14,6 +14,10 @@
 
 #include "vn_device.h"
 #include "vn_feedback.h"
+#if DETECT_OS_WINDOWS
+#include "vn_helios_direct_dispatch.h"
+#include "vn_helios_record_submit.h"
+#endif
 #include "vn_physical_device.h"
 
 /* query pool commands */
@@ -432,6 +436,89 @@ vn_GetQueryPoolResults(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_query_pool *pool = vn_query_pool_from_handle(queryPool);
    VkResult result;
+
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      if (!pool || pool->base.vk.device != &dev->base.vk ||
+          firstQuery > pool->query_count ||
+          queryCount > pool->query_count - firstQuery ||
+          (queryCount && (!pData || !stride)))
+         return vn_error(dev->instance, VK_ERROR_VALIDATION_FAILED_EXT);
+      if (!queryCount)
+         return VK_SUCCESS;
+
+      uint64_t context_generation = 0;
+      uint64_t progress_value = 0;
+      bool have_progress = vn_helios_query_pool_progress(
+         pool, &context_generation, &progress_value);
+      HeliosSyncProgressResultV1 progress;
+      memset(&progress, 0, sizeof(progress));
+      HeliosTranslatorStatusCode status;
+      if (flags & VK_QUERY_RESULT_WAIT_BIT) {
+         status = have_progress
+                     ? vn_helios_direct_join_context(
+                          dev->instance, context_generation, progress_value,
+                          &progress)
+                     : vn_helios_direct_join_current(dev->instance, 0,
+                                                     &progress);
+         if (status == HELIOS_TRANSLATOR_STATUS_OK && !have_progress)
+            have_progress = vn_helios_query_pool_progress(
+               pool, &context_generation, &progress_value);
+      } else if (have_progress) {
+         status = vn_helios_direct_query_context(
+            dev->instance, context_generation, &progress);
+      } else {
+         return VK_NOT_READY;
+      }
+      if (status != HELIOS_TRANSLATOR_STATUS_OK)
+         return vn_error(
+            dev->instance,
+            status == HELIOS_TRANSLATOR_STATUS_SESSION_POISONED ||
+                  status == HELIOS_TRANSLATOR_STATUS_HOST_CALLBACK_FAILED
+               ? VK_ERROR_DEVICE_LOST
+               : VK_ERROR_VALIDATION_FAILED_EXT);
+      if (progress.flags & HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST)
+         return vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+      if (!(flags & VK_QUERY_RESULT_WAIT_BIT) &&
+          progress.completed_progress_value < progress_value)
+         return VK_NOT_READY;
+      if ((flags & VK_QUERY_RESULT_WAIT_BIT) && !have_progress)
+         return vn_error(dev->instance, VK_ERROR_VALIDATION_FAILED_EXT);
+
+      const size_t width = flags & VK_QUERY_RESULT_64_BIT ? 8 : 4;
+      if (pool->result_array_size > SIZE_MAX / width)
+         return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+      size_t packed_stride = (size_t)pool->result_array_size * width;
+      if (!(flags & (VK_QUERY_RESULT_WAIT_BIT |
+                     VK_QUERY_RESULT_PARTIAL_BIT)) ||
+          (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)) {
+         if (packed_stride > SIZE_MAX - width)
+            return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+         packed_stride += width;
+      }
+      /* HVR1 snapshots are bounded at 64 MiB.  Leave room for the generated
+       * fixed reply envelope and split only at complete consecutive query
+       * ranges after the single HQC1 join above. */
+      const size_t max_packed = HELIOS_HVR1_MAX_SNAPSHOT_BYTES - 4096u;
+      const uint32_t max_queries =
+         packed_stride ? MAX2((uint32_t)(max_packed / packed_stride), 1u)
+                       : queryCount;
+      result = VK_SUCCESS;
+      for (uint32_t done = 0; done < queryCount;) {
+         const uint32_t count = MIN2(queryCount - done, max_queries);
+         VkResult part = vn_get_query_pool_results(
+            device, queryPool, firstQuery + done, count,
+            (uint8_t *)pData + (size_t)done * stride, stride, flags);
+         if (part < 0)
+            return vn_result(dev->instance, part);
+         if (part == VK_NOT_READY)
+            result = VK_NOT_READY;
+         done += count;
+      }
+      return result;
+   }
+#endif
 
    /* Get results from feedback buffers
     * Not possible for VK_QUERY_RESULT_PARTIAL_BIT

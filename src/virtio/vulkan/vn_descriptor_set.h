@@ -12,12 +12,18 @@
 #define VN_DESCRIPTOR_SET_H
 
 #include "vn_descriptor.h"
+#if DETECT_OS_WINDOWS
+#include "vn_device_memory.h"
+#endif
 
 struct vn_descriptor_set_layout_binding {
    enum vn_descriptor_type type;
    uint32_t count;
    bool has_immutable_samplers;
    BITSET_DECLARE(mutable_descriptor_types, VN_NUM_DESCRIPTOR_TYPES);
+#if DETECT_OS_WINDOWS
+   uint32_t helios_slot_base;
+#endif
 };
 
 struct vn_descriptor_set_layout {
@@ -28,6 +34,10 @@ struct vn_descriptor_set_layout {
    uint32_t last_binding;
    bool has_variable_descriptor_count;
    bool is_push_descriptor;
+
+#if DETECT_OS_WINDOWS
+   uint32_t helios_slot_count;
+#endif
 
    /* bindings must be the last field in the layout */
    struct vn_descriptor_set_layout_binding bindings[];
@@ -98,11 +108,25 @@ struct vn_descriptor_set {
    uint32_t last_binding_descriptor_count;
 
    struct list_head head;
+
+#if DETECT_OS_WINDOWS
+   struct vn_helios_descriptor_slot *helios_slots;
+   uint32_t helios_slot_count;
+   bool helios_closure_complete;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_descriptor_set,
                                base.vk,
                                VkDescriptorSet,
                                VK_OBJECT_TYPE_DESCRIPTOR_SET)
+
+#if DETECT_OS_WINDOWS
+struct vn_helios_descriptor_slot {
+   struct vn_helios_memory_binding bindings[4];
+   uint32_t binding_count;
+   uint32_t access_flags;
+};
+#endif
 
 struct vn_descriptor_update_template {
    struct vn_object_base base;
