@@ -32,12 +32,16 @@ vklayer_helios_present = shared_library(
   name_prefix : '',
   cpp_args : ['-D_CRT_SECURE_NO_WARNINGS'],
   gnu_symbol_visibility : 'hidden',
+  # The loader surface is fixed.  Do not rely on MinGW auto-export, which can
+  # expose implementation helpers and silently widen the layer ABI.
+  vs_module_defs : 'helios_present_layer.def',
   dependencies : [
     idep_vulkan_util,
     idep_mesautil,
     dep_dxheaders,
     cpp.find_library('d3d12'),
     cpp.find_library('dxgi'),
+    cpp.find_library('dxguid'),
   ],
   include_directories : [inc_include, inc_util, inc_src],
   install : true,
