@@ -161,6 +161,7 @@ extern "C" {
    X(swapchain_refused_memory_import)                                         \
    X(swapchain_refused_memory_bind)                                           \
    X(swapchain_refused_semaphore_create)                                      \
+   X(swapchain_refused_state_event)                                          \
    X(swapchain_refused_vk_command_objects)                                    \
    X(swapchain_refused_alloc)                                                 \
    X(acquire_refused_unknown_swapchain)                                       \
@@ -169,6 +170,7 @@ extern "C" {
    X(acquire_refused_surface_lost)                                            \
    X(acquire_refused_device_mask)                                             \
    X(acquire_refused_epoch_overflow)                                          \
+   X(acquire_refused_sync_object)                                            \
    X(acquire_refused_submit_failed)                                           \
    X(acquire_not_ready)                                                       \
    X(acquire_timeout)                                                         \
@@ -181,7 +183,8 @@ extern "C" {
    X(present_refused_device_group_count)                                      \
    X(present_refused_out_of_date)                                             \
    X(present_refused_surface_lost)                                            \
-   X(present_semaphore_kind_unverified)                                       \
+   X(present_refused_semaphore_not_binary)                                    \
+   X(present_refused_duplicate_image)                                         \
    X(present_submit_failed)                                                   \
    X(present_copy_failed)                                                     \
    X(present_device_lost)                                                     \
@@ -190,7 +193,8 @@ extern "C" {
    X(teardown_barrier_failed)                                                 \
    X(alias_image_refused_unimplemented)                                       \
    X(alias_bind_refused_unimplemented)                                        \
-   X(alias_null_form_forwarded)
+   X(alias_null_form_forwarded)                                               \
+   X(sync_object_refused_tracking)
 
 typedef enum helios_layer_counter_id {
 #define HELIOS_COUNTER_ENUM(name) HELIOS_CNT_##name,

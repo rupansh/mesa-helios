@@ -3687,14 +3687,12 @@ vn_get_semaphore_counter_value(VkDevice dev_handle,
 #if DETECT_OS_WINDOWS
    if (!sem || !payload)
       return VK_ERROR_VALIDATION_FAILED_EXT;
-   /* An imported Win32 semaphore has no renderer-side timeline state to
-    * query: its authoritative counter is the imported WDDM monitored fence.
-    * vn_WaitSemaphores follows the same rule.  This must precede the
-    * DEVICE_ONLY assertion below; otherwise vkGetSemaphoreCounterValue on a
-    * valid imported semaphore aborts before the Win32 path can run. */
-   if (payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC) {
-      if (!payload->win32_sync)
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   /* Every Win32-backed semaphore has one authoritative WDDM monitored
+    * fence, whether it was imported or created locally for export.  This must
+    * precede the DEVICE_ONLY path: a locally exported Ready/Release semaphore
+    * deliberately keeps its permanent payload type while A7 classifies the
+    * exact native object for queue submits. */
+   if (payload->win32_sync) {
       return vn_renderer_sync_read(dev->renderer, payload->win32_sync,
                                    out_value);
    }

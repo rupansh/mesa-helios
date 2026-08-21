@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -310,7 +311,11 @@ struct HeliosSlot {
    uint64_t epoch = 0;        /* current/target epoch e[i] */
    uint64_t retired_epoch = 0;/* last epoch whose Release completed */
    uint32_t device_mask = 1;  /* mask recorded by the last Acquire (C45) */
-   bool externally_owned = false; /* last transfer was to QUEUE_FAMILY_EXTERNAL */
+   /* The committed D3D12 resource begins on the EXTERNAL side in COMMON,
+    * which is the external representation of Vulkan GENERAL.  First Acquire
+    * therefore performs the same exact EXTERNAL -> canonical transfer as
+    * every later Acquire, merely without a Release wait. */
+   bool externally_owned = true;
    std::mutex lock;           /* covers this slot's recording objects (A13) */
 };
 
@@ -341,6 +346,12 @@ struct HeliosSwapchain {
    bool destroying = false;
    HANDLE state_event = nullptr; /* wakes a blocked Acquire on loss/destroy */
    uint32_t next_hint = 0;
+   /* Exact enqueue order on this swapchain's one D3D copy queue.  Fence
+    * epochs are per-slot and therefore cannot be numerically compared across
+    * slots to identify the oldest queued Release. */
+   std::vector<uint32_t> release_fifo;
+   uint32_t release_head = 0;
+   uint32_t release_count = 0;
    std::mutex lock;
 };
 
@@ -374,6 +385,8 @@ struct HeliosDevice {
 
    std::mutex lock;
    std::unordered_map<VkQueue, HeliosAppQueue> app_queues;
+   std::unordered_map<VkSemaphore, VkSemaphoreType> app_semaphores;
+   std::unordered_set<VkFence> app_fences;
    std::unordered_set<HeliosSwapchain *> swapchains;
 };
 
@@ -586,6 +599,10 @@ static const char *const kDeviceChainNames[] = {
    "vkGetDeviceGroupSurfacePresentModesKHR",
    "vkGetDeviceQueue",
    "vkGetDeviceQueue2",
+   "vkCreateSemaphore",
+   "vkDestroySemaphore",
+   "vkCreateFence",
+   "vkDestroyFence",
    "vkCreateImage",
    "vkDestroyImage",
    "vkBindImageMemory2",
@@ -2757,6 +2774,12 @@ helios_CreateSwapchainKHR(VkDevice device,
    sc->sharing_mode = pCreateInfo->imageSharingMode;
    sc->queue_families = families;
    sc->state_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+   if (!sc->state_event) {
+      helios_destroy_swapchain_locked(sc);
+      delete sc;
+      return helios_refuse(HELIOS_CNT_swapchain_refused_state_event,
+                           VK_ERROR_OUT_OF_HOST_MEMORY, "CreateEvent");
+   }
 
    /* ---- D3D12 queue + DXGI flip-model swapchain --------------------- */
    D3D12_COMMAND_QUEUE_DESC qdesc = {};
@@ -2837,10 +2860,11 @@ helios_CreateSwapchainKHR(VkDevice device,
    /* ⚠ NOT `slots.resize(n)`. A HeliosSlot owns the `std::mutex` that covers
     * its recording objects (A13), so it is neither copyable nor movable, and
     * `resize` requires MoveInsertable. The sized constructor requires only
-    * DefaultInsertable and value-initialises the elements in place, which is
-    * what a fixed-size slot array wants anyway — the count is decided once,
-    * here, and never changes for the life of the swapchain. */
+   * DefaultInsertable and value-initialises the elements in place, which is
+   * what a fixed-size slot array wants anyway — the count is decided once,
+   * here, and never changes for the life of the swapchain. */
    sc->slots = std::vector<HeliosSlot>(sc->image_count);
+   sc->release_fifo.assign(sc->image_count, UINT32_MAX);
    D3D12_HEAP_PROPERTIES heap = {};
    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
    heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
@@ -2934,6 +2958,124 @@ helios_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
    return helios_write_array(images.data(), (uint32_t)images.size(), pImages, pCount);
 }
 
+/* B6 must validate the exact kind and owner of every application semaphore
+ * before QueuePresent consumes it.  Vulkan has no query for an arbitrary
+ * semaphore's immutable binary/timeline type, so the layer observes the two
+ * core creation/destruction calls and keeps the record on the owning device.
+ * Layer-private Ready/Release semaphores call captured next dispatch directly
+ * and never enter this application-object set. */
+static VKAPI_ATTR VkResult VKAPI_CALL
+helios_CreateSemaphore(VkDevice device,
+                       const VkSemaphoreCreateInfo *pCreateInfo,
+                       const VkAllocationCallbacks *pAllocator,
+                       VkSemaphore *pSemaphore)
+{
+   HeliosDevice *dev = helios_device_of(device);
+   if (!dev || !dev->disp.CreateSemaphore || !pCreateInfo || !pSemaphore)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   VkSemaphoreType type = VK_SEMAPHORE_TYPE_BINARY;
+   const VkSemaphoreTypeCreateInfo *type_info =
+      (const VkSemaphoreTypeCreateInfo *)helios_find_pnext(
+         pCreateInfo->pNext, VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO);
+   if (type_info)
+      type = type_info->semaphoreType;
+
+   VkResult result =
+      dev->disp.CreateSemaphore(device, pCreateInfo, pAllocator, pSemaphore);
+   if (result != VK_SUCCESS)
+      return result;
+
+   bool inserted = false;
+   try {
+      std::lock_guard<std::mutex> g(dev->lock);
+      inserted = dev->app_semaphores.emplace(*pSemaphore, type).second;
+   } catch (const std::bad_alloc &) {
+      dev->disp.DestroySemaphore(device, *pSemaphore, pAllocator);
+      *pSemaphore = VK_NULL_HANDLE;
+      return helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                           VK_ERROR_OUT_OF_HOST_MEMORY, "semaphore record");
+   }
+   if (!inserted) {
+      dev->disp.DestroySemaphore(device, *pSemaphore, pAllocator);
+      *pSemaphore = VK_NULL_HANDLE;
+      return helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "duplicate semaphore handle");
+   }
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+helios_DestroySemaphore(VkDevice device, VkSemaphore semaphore,
+                        const VkAllocationCallbacks *pAllocator)
+{
+   HeliosDevice *dev = helios_device_of(device);
+   if (!dev || !dev->disp.DestroySemaphore || semaphore == VK_NULL_HANDLE)
+      return;
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (dev->app_semaphores.erase(semaphore) != 1) {
+         helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                       VK_ERROR_INITIALIZATION_FAILED,
+                       "foreign or stale semaphore destroy");
+         return;
+      }
+   }
+   dev->disp.DestroySemaphore(device, semaphore, pAllocator);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+helios_CreateFence(VkDevice device, const VkFenceCreateInfo *pCreateInfo,
+                   const VkAllocationCallbacks *pAllocator, VkFence *pFence)
+{
+   HeliosDevice *dev = helios_device_of(device);
+   if (!dev || !dev->disp.CreateFence || !pCreateInfo || !pFence)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   VkResult result = dev->disp.CreateFence(device, pCreateInfo, pAllocator,
+                                            pFence);
+   if (result != VK_SUCCESS)
+      return result;
+
+   bool inserted = false;
+   try {
+      std::lock_guard<std::mutex> g(dev->lock);
+      inserted = dev->app_fences.insert(*pFence).second;
+   } catch (const std::bad_alloc &) {
+      dev->disp.DestroyFence(device, *pFence, pAllocator);
+      *pFence = VK_NULL_HANDLE;
+      return helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                           VK_ERROR_OUT_OF_HOST_MEMORY, "fence record");
+   }
+   if (!inserted) {
+      dev->disp.DestroyFence(device, *pFence, pAllocator);
+      *pFence = VK_NULL_HANDLE;
+      return helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "duplicate fence handle");
+   }
+   return VK_SUCCESS;
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+helios_DestroyFence(VkDevice device, VkFence fence,
+                    const VkAllocationCallbacks *pAllocator)
+{
+   HeliosDevice *dev = helios_device_of(device);
+   if (!dev || !dev->disp.DestroyFence || fence == VK_NULL_HANDLE)
+      return;
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (dev->app_fences.erase(fence) != 1) {
+         helios_refuse(HELIOS_CNT_sync_object_refused_tracking,
+                       VK_ERROR_INITIALIZATION_FAILED,
+                       "foreign or stale fence destroy");
+         return;
+      }
+   }
+   dev->disp.DestroyFence(device, fence, pAllocator);
+}
+
 /* ==================================================================== */
 /* 10. Acquire                                                          */
 /* ==================================================================== */
@@ -2986,13 +3128,42 @@ helios_record_barrier(HeliosDevice *dev, VkCommandBuffer cb, VkImage image,
 static void
 helios_refresh_slots(HeliosSwapchain *sc)
 {
-   for (HeliosSlot &slot : sc->slots) {
-      if (slot.state != HELIOS_SLOT_RELEASE_QUEUED || !slot.release)
+   while (sc->release_count) {
+      const uint32_t index = sc->release_fifo[sc->release_head];
+      if (index >= sc->slots.size()) {
+         sc->lost = true;
+         sc->release_head =
+            (sc->release_head + 1) % (uint32_t)sc->release_fifo.size();
+         sc->release_count--;
          continue;
-      if (slot.release->GetCompletedValue() >= slot.epoch) {
-         slot.retired_epoch = slot.epoch;
-         slot.state = HELIOS_SLOT_AVAILABLE;
       }
+      HeliosSlot &slot = sc->slots[index];
+      if (slot.state == HELIOS_SLOT_LOST) {
+         sc->release_head =
+            (sc->release_head + 1) % (uint32_t)sc->release_fifo.size();
+         sc->release_count--;
+         continue;
+      }
+      if (slot.state != HELIOS_SLOT_RELEASE_QUEUED || !slot.release) {
+         sc->lost = true;
+         break;
+      }
+      const uint64_t completed = slot.release->GetCompletedValue();
+      if (completed == UINT64_MAX) {
+         slot.state = HELIOS_SLOT_LOST;
+         sc->lost = true;
+         if (sc->state_event)
+            SetEvent(sc->state_event);
+         break;
+      }
+      if (completed < slot.epoch)
+         break;
+      slot.retired_epoch = slot.epoch;
+      slot.state = HELIOS_SLOT_AVAILABLE;
+      sc->release_fifo[sc->release_head] = UINT32_MAX;
+      sc->release_head =
+         (sc->release_head + 1) % (uint32_t)sc->release_fifo.size();
+      sc->release_count--;
    }
 }
 
@@ -3023,7 +3194,35 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
                VkSemaphore semaphore, VkFence fence, uint32_t device_mask,
                uint32_t *pImageIndex)
 {
+   if (!pImageIndex || (semaphore == VK_NULL_HANDLE && fence == VK_NULL_HANDLE))
+      return helios_refuse(HELIOS_CNT_acquire_refused_sync_object,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "Acquire requires an output index and a semaphore or fence");
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (semaphore != VK_NULL_HANDLE) {
+         auto it = dev->app_semaphores.find(semaphore);
+         if (it == dev->app_semaphores.end() ||
+             it->second != VK_SEMAPHORE_TYPE_BINARY)
+            return helios_refuse(HELIOS_CNT_acquire_refused_sync_object,
+                                 VK_ERROR_INITIALIZATION_FAILED,
+                                 "foreign or non-binary Acquire semaphore");
+      }
+      if (fence != VK_NULL_HANDLE && !dev->app_fences.count(fence))
+         return helios_refuse(HELIOS_CNT_acquire_refused_sync_object,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "foreign Acquire fence");
+   }
+
    const ULONGLONG start_ms = GetTickCount64();
+   uint64_t deadline_ms = UINT64_MAX;
+   if (timeout != UINT64_MAX) {
+      const uint64_t rounded_ms =
+         timeout / 1000000ull + (timeout % 1000000ull != 0);
+      deadline_ms = rounded_ms > UINT64_MAX - start_ms
+                       ? UINT64_MAX
+                       : start_ms + rounded_ms;
+   }
 
    for (;;) {
       uint32_t chosen = UINT32_MAX;
@@ -3049,6 +3248,10 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
          }
 
          helios_refresh_slots(sc);
+         if (sc->lost)
+            return helios_refuse(HELIOS_CNT_acquire_refused_lost,
+                                 VK_ERROR_DEVICE_LOST,
+                                 "Release fence reported device removal");
 
          const uint32_t n = (uint32_t)sc->slots.size();
          for (uint32_t k = 0; k < n; k++) {
@@ -3066,22 +3269,32 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
                return helios_refuse(HELIOS_CNT_acquire_not_ready, VK_NOT_READY,
                                     nullptr);
             }
-            /* One D3D queue per swapchain, so a later Release cannot complete
-             * first: the oldest enqueued RELEASE_QUEUED slot is the next one
-             * to become selectable (§10.7:2635-2638). */
-            uint64_t oldest = UINT64_MAX;
-            for (uint32_t i = 0; i < n; i++) {
-               HeliosSlot &slot = sc->slots[i];
-               if (slot.state == HELIOS_SLOT_RELEASE_QUEUED && slot.epoch < oldest) {
-                  oldest = slot.epoch;
-                  wait_slot = i;
-                  wait_epoch = slot.epoch;
+            /* Per-slot epochs cannot be compared across slots.  The explicit
+             * FIFO records the exact order in which this swapchain's one D3D
+             * queue accepted Release signals. */
+            if (sc->release_count) {
+               wait_slot = sc->release_fifo[sc->release_head];
+               if (wait_slot >= sc->slots.size()) {
+                  sc->lost = true;
+                  return helios_refuse(HELIOS_CNT_acquire_refused_lost,
+                                       VK_ERROR_DEVICE_LOST,
+                                       "release FIFO contains a foreign slot");
                }
+               wait_epoch = sc->slots[wait_slot].epoch;
             }
          } else {
             HeliosSlot &slot = sc->slots[chosen];
+            if (!slot.externally_owned) {
+               slot.state = HELIOS_SLOT_LOST;
+               sc->lost = true;
+               if (sc->state_event)
+                  SetEvent(sc->state_event);
+               return helios_refuse(HELIOS_CNT_acquire_refused_lost,
+                                    VK_ERROR_DEVICE_LOST,
+                                    "selectable slot is not externally owned");
+            }
             prev_epoch = slot.retired_epoch;
-            if (slot.epoch == UINT64_MAX - 1)
+            if (slot.epoch == UINT64_MAX)
                return helios_refuse(HELIOS_CNT_acquire_refused_epoch_overflow,
                                     VK_ERROR_OUT_OF_DATE_KHR,
                                     "epoch would wrap; recreate the swapchain");
@@ -3112,11 +3325,15 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
             return helios_refuse(HELIOS_CNT_acquire_timeout, VK_TIMEOUT, nullptr);
 
          DWORD ms = INFINITE;
-         if (timeout != UINT64_MAX) {
-            const uint64_t elapsed_ms = GetTickCount64() - start_ms;
-            const uint64_t total_ms = timeout / 1000000ull;
-            ms = (elapsed_ms >= total_ms) ? 0
-                                          : (DWORD)(total_ms - elapsed_ms);
+         if (deadline_ms != UINT64_MAX) {
+            const uint64_t now_ms = GetTickCount64();
+            if (now_ms >= deadline_ms)
+               return helios_refuse(HELIOS_CNT_acquire_timeout, VK_TIMEOUT,
+                                    nullptr);
+            const uint64_t remaining_ms = deadline_ms - now_ms;
+            ms = remaining_ms >= (uint64_t)INFINITE
+                    ? INFINITE - 1
+                    : (DWORD)remaining_ms;
          }
          DWORD w = WaitForMultipleObjects(nwaits, waits, FALSE, ms);
          if (w == WAIT_TIMEOUT)
@@ -3124,6 +3341,10 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
          if (w == WAIT_FAILED)
             return helios_refuse(HELIOS_CNT_acquire_refused_lost,
                                  VK_ERROR_DEVICE_LOST, "WaitForMultipleObjects");
+         if (w >= WAIT_OBJECT_0 + nwaits)
+            return helios_refuse(HELIOS_CNT_acquire_refused_lost,
+                                 VK_ERROR_DEVICE_LOST,
+                                 "unexpected event wait result");
          /* Revalidate state and the exact value once, then retry selection. */
          continue;
       }
@@ -3137,27 +3358,48 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
          /* Reset the slot's recording objects. Legal now, and only now,
           * because the preceding Release completed (§10.7:2617-2619). */
          if (slot.alloc && slot.list) {
-            slot.alloc->Reset();
-            slot.list->Reset(slot.alloc, nullptr);
-            slot.list->Close();
+            HRESULT hr = slot.alloc->Reset();
+            if (SUCCEEDED(hr))
+               hr = slot.list->Reset(slot.alloc, nullptr);
+            if (SUCCEEDED(hr))
+               hr = slot.list->Close();
+            if (FAILED(hr)) {
+               std::lock_guard<std::mutex> g(sc->lock);
+               slot.state = HELIOS_SLOT_LOST;
+               sc->lost = true;
+               if (sc->state_event)
+                  SetEvent(sc->state_event);
+               return helios_refuse(HELIOS_CNT_acquire_refused_submit_failed,
+                                    VK_ERROR_DEVICE_LOST,
+                                    "reset D3D slot recording objects");
+            }
          }
-         if (dev->disp.ResetCommandPool(dev->device, slot.pool, 0) != VK_SUCCESS)
+         if (dev->disp.ResetCommandPool(dev->device, slot.pool, 0) != VK_SUCCESS) {
+            std::lock_guard<std::mutex> g(sc->lock);
+            slot.state = HELIOS_SLOT_LOST;
+            sc->lost = true;
+            if (sc->state_event)
+               SetEvent(sc->state_event);
             return helios_refuse(HELIOS_CNT_acquire_refused_submit_failed,
                                  VK_ERROR_DEVICE_LOST, "vkResetCommandPool");
+         }
 
-         const bool first_use = !slot.externally_owned;
          r = helios_record_barrier(
-            dev, slot.acquire_cb, slot.image,
-            first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            first_use ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL,
-            first_use ? VK_QUEUE_FAMILY_IGNORED : dev->canonical_family,
+            dev, slot.acquire_cb, slot.image, VK_IMAGE_LAYOUT_GENERAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_QUEUE_FAMILY_EXTERNAL,
+            dev->canonical_family,
             VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
       }
-      if (r != VK_SUCCESS)
+      if (r != VK_SUCCESS) {
+         std::lock_guard<std::mutex> g(sc->lock);
+         slot.state = HELIOS_SLOT_LOST;
+         sc->lost = true;
+         if (sc->state_event)
+            SetEvent(sc->state_event);
          return helios_refuse(HELIOS_CNT_acquire_refused_submit_failed,
                               VK_ERROR_DEVICE_LOST, "record acquire barrier");
+      }
 
       VkSemaphoreSubmitInfo wait_sem = {};
       wait_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -3198,6 +3440,20 @@ helios_acquire(HeliosDevice *dev, HeliosSwapchain *sc, uint64_t timeout,
                               VK_ERROR_DEVICE_LOST, "helper queue submit");
       }
 
+      {
+         std::lock_guard<std::mutex> g(sc->lock);
+         if (slot.state != HELIOS_SLOT_ACQUIRED || slot.epoch == 0) {
+            slot.state = HELIOS_SLOT_LOST;
+            sc->lost = true;
+            if (sc->state_event)
+               SetEvent(sc->state_event);
+            return helios_refuse(HELIOS_CNT_acquire_refused_submit_failed,
+                                 VK_ERROR_DEVICE_LOST,
+                                 "Acquire state changed during helper submit");
+         }
+         slot.externally_owned = false;
+      }
+
       *pImageIndex = chosen;
       return VK_SUCCESS;
    }
@@ -3222,8 +3478,11 @@ helios_AcquireNextImage2KHR(VkDevice device,
                             uint32_t *pImageIndex)
 {
    HeliosDevice *dev = helios_device_of(device);
+   if (!dev || !pAcquireInfo)
+      return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
+                           VK_ERROR_INITIALIZATION_FAILED, nullptr);
    HeliosSwapchain *sc = helios_swapchain_of(pAcquireInfo->swapchain);
-   if (!dev || !sc || sc->dev != dev)
+   if (!sc || sc->dev != dev)
       return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
                            VK_ERROR_OUT_OF_DATE_KHR, nullptr);
    /* §10.7:2629-2632 — only deviceMask 1 is accepted, and it is recorded on
@@ -3284,29 +3543,56 @@ struct HeliosPresentItem {
    uint64_t epoch;
 };
 
-/* A present-side D3D/DXGI failure happens AFTER ownership has transferred and the
- * slot is PRESENT_QUEUED, but before the queue has signalled Release[i]=epoch —
- * and nothing else can ever advance that fence. Without this, the slot is
- * unreachable by helios_refresh_slots and helios_wait_release blocks forever, so
- * vkDestroySwapchainKHR hangs. Force the fence from the CPU, restore the state
- * the drain understands, and announce the loss. */
+/* A failure after the lower release must never be papered over by advancing
+ * Release from the CPU.  That would manufacture completion for a copy which
+ * did not execute.  The only honest state is LOST; B8's device-loss teardown
+ * consequently releases CPU references without assuming Release completed. */
 static void
-helios_present_fail_slot(HeliosSwapchain *sc, HeliosSlot &slot, uint64_t epoch)
+helios_present_fail_slot(HeliosSwapchain *sc, HeliosSlot &slot)
 {
-   if (slot.release && slot.release->GetCompletedValue() < epoch)
-      slot.release->Signal(epoch);
    std::lock_guard<std::mutex> g(sc->lock);
-   slot.state = HELIOS_SLOT_RELEASE_QUEUED;
+   slot.state = HELIOS_SLOT_LOST;
    sc->lost = true;
    if (sc->state_event)
       SetEvent(sc->state_event);
+}
+
+static bool
+helios_copy_descriptions_match(const HeliosSwapchain *sc,
+                               ID3D12Resource *source,
+                               ID3D12Resource *backbuffer)
+{
+   if (!sc || !source || !backbuffer)
+      return false;
+   D3D12_RESOURCE_DESC s = {};
+   D3D12_RESOURCE_DESC b = {};
+   source->GetDesc(&s);
+   backbuffer->GetDesc(&b);
+   const auto exact_2d = [sc](const D3D12_RESOURCE_DESC &d) {
+      return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+             d.Width == sc->extent.width && d.Height == sc->extent.height &&
+             d.DepthOrArraySize == 1 && d.MipLevels == 1 &&
+             d.Format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+             d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0 &&
+             d.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN;
+   };
+   return exact_2d(s) && exact_2d(b) &&
+          (s.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+          !(s.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) &&
+          !(b.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
    HeliosDevice *dev = helios_device_of_queue(queue);
-   if (!dev || !dev->wsi_enabled)
+   if (!dev || !dev->wsi_enabled || !pPresentInfo ||
+       (pPresentInfo->waitSemaphoreCount &&
+        !pPresentInfo->pWaitSemaphores) ||
+       (pPresentInfo->swapchainCount &&
+        (!pPresentInfo->pSwapchains || !pPresentInfo->pImageIndices)))
       return helios_refuse(HELIOS_CNT_present_refused_queue_not_app_visible,
                            VK_ERROR_INITIALIZATION_FAILED, "no layer device");
 
@@ -3343,23 +3629,30 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
           dg->swapchainCount != pPresentInfo->swapchainCount)
          return helios_refuse(HELIOS_CNT_present_refused_device_group_count,
                               VK_ERROR_INITIALIZATION_FAILED, nullptr);
+      if (dg->swapchainCount && !dg->pDeviceMasks)
+         return helios_refuse(HELIOS_CNT_present_refused_device_group_mask,
+                              VK_ERROR_INITIALIZATION_FAILED, nullptr);
       for (uint32_t k = 0; k < dg->swapchainCount; k++)
          if (dg->pDeviceMasks[k] != 1u)
             return helios_refuse(HELIOS_CNT_present_refused_device_group_mask,
                                  VK_ERROR_INITIALIZATION_FAILED, nullptr);
    }
 
-   /*
-    * STUB: the layer cannot prove that every pWaitSemaphores entry is binary.
-    * §10.7:2653 requires that validation, but §10.7:2257-2262 fixes the device
-    * dispatch closure byte-for-byte and vkCreateSemaphore is not in it, so the
-    * layer never sees semaphore creation and has no non-invasive way to
-    * classify a VkSemaphore. Vulkan's own VUIDs (vkQueuePresentKHR
-    * pWaitSemaphores-03267/03268) already require binary semaphores here. The
-    * unverified check is counted on every Present rather than being claimed.
-    */
-   if (pPresentInfo->waitSemaphoreCount)
-      helios_count(HELIOS_CNT_present_semaphore_kind_unverified);
+   /* Semaphore type is immutable and was captured by the owning device's
+    * vkCreateSemaphore interception.  Refuse an untracked/foreign handle or a
+    * timeline semaphore before consuming any wait. */
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      for (uint32_t k = 0; k < pPresentInfo->waitSemaphoreCount; k++) {
+         auto it = dev->app_semaphores.find(pPresentInfo->pWaitSemaphores[k]);
+         if (it == dev->app_semaphores.end() ||
+             it->second != VK_SEMAPHORE_TYPE_BINARY)
+            return helios_refuse(
+               HELIOS_CNT_present_refused_semaphore_not_binary,
+               VK_ERROR_INITIALIZATION_FAILED,
+               "foreign or non-binary Present wait semaphore");
+      }
+   }
 
    /* ---- validate every swapchain/image before consuming any wait ---- */
    std::vector<HeliosPresentItem> items;
@@ -3370,6 +3663,12 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          return helios_refuse(HELIOS_CNT_present_refused_unknown_swapchain,
                               VK_ERROR_INITIALIZATION_FAILED, nullptr);
       const uint32_t i = pPresentInfo->pImageIndices[k];
+      for (const HeliosPresentItem &prior : items) {
+         if (prior.sc == sc)
+            return helios_refuse(HELIOS_CNT_present_refused_duplicate_image,
+                                 VK_ERROR_INITIALIZATION_FAILED,
+                                 "swapchain appears twice in one Present");
+      }
       std::lock_guard<std::mutex> g(sc->lock);
       if (i >= sc->slots.size() || sc->slots[i].state != HELIOS_SLOT_ACQUIRED)
          return helios_refuse(HELIOS_CNT_present_refused_image_not_acquired,
@@ -3468,6 +3767,11 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 
    if (dev->disp.QueueSubmit2(queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
       helios_count(HELIOS_CNT_present_submit_failed);
+      for (uint32_t k = 0; k < items.size(); k++) {
+         if (results[k] == VK_SUCCESS)
+            helios_present_fail_slot(items[k].sc,
+                                     items[k].sc->slots[items[k].index]);
+      }
       return VK_ERROR_DEVICE_LOST;
    }
 
@@ -3476,6 +3780,26 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          continue;
       std::lock_guard<std::mutex> g(items[k].sc->lock);
       HeliosSlot &slot = items[k].sc->slots[items[k].index];
+      if (slot.state != HELIOS_SLOT_ACQUIRED ||
+          slot.epoch != items[k].epoch) {
+         slot.state = HELIOS_SLOT_LOST;
+         items[k].sc->lost = true;
+         if (items[k].sc->state_event)
+            SetEvent(items[k].sc->state_event);
+         return helios_refuse(HELIOS_CNT_present_submit_failed,
+                              VK_ERROR_DEVICE_LOST,
+                              "slot changed during common release submit");
+      }
+      if (items[k].sc->release_count >=
+          items[k].sc->release_fifo.size()) {
+         slot.state = HELIOS_SLOT_LOST;
+         items[k].sc->lost = true;
+         if (items[k].sc->state_event)
+            SetEvent(items[k].sc->state_event);
+         return helios_refuse(HELIOS_CNT_present_submit_failed,
+                              VK_ERROR_DEVICE_LOST,
+                              "release FIFO capacity invariant");
+      }
       slot.state = HELIOS_SLOT_PRESENT_QUEUED;
       slot.externally_owned = true;
    }
@@ -3490,19 +3814,47 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
       HeliosSlot &slot = sc->slots[items[k].index];
       const uint64_t epoch = items[k].epoch;
 
-      sc->queue->Wait(slot.ready, epoch);
+      HRESULT hr = sc->queue->Wait(slot.ready, epoch);
+      if (FAILED(hr)) {
+         helios_count(HELIOS_CNT_present_copy_failed);
+         results[k] = VK_ERROR_DEVICE_LOST;
+         device_lost = true;
+         helios_present_fail_slot(sc, slot);
+         continue;
+      }
+      {
+         std::lock_guard<std::mutex> g(sc->lock);
+         if (slot.state != HELIOS_SLOT_PRESENT_QUEUED ||
+             slot.epoch != epoch) {
+            slot.state = HELIOS_SLOT_LOST;
+            sc->lost = true;
+            if (sc->state_event)
+               SetEvent(sc->state_event);
+            results[k] = VK_ERROR_DEVICE_LOST;
+            device_lost = true;
+            continue;
+         }
+         slot.state = HELIOS_SLOT_D3D_COPY;
+      }
 
       const UINT j = sc->dxgi->GetCurrentBackBufferIndex();
       if (j >= sc->backbuffers.size() || !sc->backbuffers[j]) {
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
-         helios_present_fail_slot(sc, slot, epoch);
+         helios_present_fail_slot(sc, slot);
          continue;
       }
       ID3D12Resource *back = sc->backbuffers[j];
+      if (!helios_copy_descriptions_match(sc, slot.s, back)) {
+         helios_count(HELIOS_CNT_present_copy_failed);
+         results[k] = VK_ERROR_DEVICE_LOST;
+         device_lost = true;
+         helios_present_fail_slot(sc, slot);
+         continue;
+      }
 
-      HRESULT hr = S_OK;
+      hr = S_OK;
       {
          std::lock_guard<std::mutex> sg(slot.lock);
          hr = slot.list->Reset(slot.alloc, nullptr);
@@ -3529,18 +3881,52 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
-         helios_present_fail_slot(sc, slot, epoch);
+         helios_present_fail_slot(sc, slot);
          continue;
       }
 
       ID3D12CommandList *lists[1] = { slot.list };
       sc->queue->ExecuteCommandLists(1, lists);
+      {
+         std::lock_guard<std::mutex> g(sc->lock);
+         if (slot.state != HELIOS_SLOT_D3D_COPY || slot.epoch != epoch) {
+            slot.state = HELIOS_SLOT_LOST;
+            sc->lost = true;
+            if (sc->state_event)
+               SetEvent(sc->state_event);
+            results[k] = VK_ERROR_DEVICE_LOST;
+            device_lost = true;
+            continue;
+         }
+         slot.state = HELIOS_SLOT_DXGI_OWNED;
+      }
       if (FAILED(sc->queue->Signal(slot.release, epoch))) {
          helios_count(HELIOS_CNT_present_copy_failed);
          results[k] = VK_ERROR_DEVICE_LOST;
          device_lost = true;
-         helios_present_fail_slot(sc, slot, epoch);
+         helios_present_fail_slot(sc, slot);
          continue;
+      }
+
+      {
+         std::lock_guard<std::mutex> g(sc->lock);
+         if (slot.state != HELIOS_SLOT_DXGI_OWNED || slot.epoch != epoch) {
+            slot.state = HELIOS_SLOT_LOST;
+            sc->lost = true;
+            if (sc->state_event)
+               SetEvent(sc->state_event);
+            results[k] = VK_ERROR_DEVICE_LOST;
+            device_lost = true;
+            continue;
+         }
+         slot.state = HELIOS_SLOT_RELEASE_QUEUED;
+         const uint32_t tail =
+            (sc->release_head + sc->release_count) %
+            (uint32_t)sc->release_fifo.size();
+         sc->release_fifo[tail] = items[k].index;
+         sc->release_count++;
+         if (sc->state_event)
+            SetEvent(sc->state_event);
       }
 
       hr = sc->dxgi->Present(1, 0);
@@ -3553,7 +3939,6 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
       }
 
       std::lock_guard<std::mutex> g(sc->lock);
-      slot.state = HELIOS_SLOT_RELEASE_QUEUED;
       if (results[k] == VK_ERROR_OUT_OF_DATE_KHR)
          sc->retired = true;
       if (results[k] == VK_ERROR_DEVICE_LOST)
@@ -3958,6 +4343,12 @@ static const HeliosEntry kDeviceEntries[] = {
      false },
    { "vkGetDeviceQueue2", HELIOS_FN(helios_GetDeviceQueue2), HELIOS_GATE_CORE_1_1,
      false },
+   { "vkCreateSemaphore", HELIOS_FN(helios_CreateSemaphore), HELIOS_GATE_ALWAYS,
+     false },
+   { "vkDestroySemaphore", HELIOS_FN(helios_DestroySemaphore), HELIOS_GATE_ALWAYS,
+     false },
+   { "vkCreateFence", HELIOS_FN(helios_CreateFence), HELIOS_GATE_ALWAYS, false },
+   { "vkDestroyFence", HELIOS_FN(helios_DestroyFence), HELIOS_GATE_ALWAYS, false },
    { "vkCreateImage", HELIOS_FN(helios_CreateImage), HELIOS_GATE_ALWAYS, false },
    { "vkDestroyImage", HELIOS_FN(helios_DestroyImage), HELIOS_GATE_ALWAYS, false },
    { "vkBindImageMemory2", HELIOS_FN(helios_BindImageMemory2), HELIOS_GATE_CORE_1_1,
