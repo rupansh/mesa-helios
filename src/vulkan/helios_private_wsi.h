@@ -51,6 +51,12 @@ extern "C" {
 
 #define HELIOS_SET_PRESENTABLE_IMAGE_NAME "vkSetHeliosPresentableImageHELIOS"
 
+/* B7 uses the otherwise invalid swapchain image index as a candidate marker.
+ * The fixed function signature does not change: alias creation installs the
+ * generation-only candidate, and alias bind replaces it exactly once with the
+ * concrete slot index. */
+#define HELIOS_PRESENTABLE_IMAGE_ALIAS_CANDIDATE UINT32_MAX
+
 typedef VkResult(VKAPI_PTR *PFN_vkSetHeliosPresentableImageHELIOS)(
    VkDevice device,
    VkImage image,

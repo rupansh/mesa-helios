@@ -21,7 +21,7 @@
  *  10. Acquire
  *  11. Present
  *  12. swapchain destruction / teardown
- *  13. the C45 alias-image surface (deliberately refused this generation)
+ *  13. the C45 alias-image association and independent lifetime
  *  14. vkGetInstanceProcAddr / vkGetDeviceProcAddr / negotiate
  */
 
@@ -246,6 +246,8 @@ struct HeliosPhysDevInfo {
    uint8_t driver_uuid[VK_UUID_SIZE] = {};
 };
 
+struct HeliosSurface;
+
 struct HeliosInstance {
    VkInstance instance = VK_NULL_HANDLE;
    HeliosInstanceDispatch disp = {};
@@ -262,6 +264,7 @@ struct HeliosInstance {
    IDXGIFactory4 *dxgi_factory = nullptr;
    std::mutex lock;
    std::unordered_map<VkPhysicalDevice, HeliosPhysDevInfo> phys;
+   std::unordered_map<VkSurfaceKHR, HeliosSurface *> surfaces;
 
    bool wsi_enabled() const { return surface_enabled && win32_surface_enabled; }
 };
@@ -269,6 +272,7 @@ struct HeliosInstance {
 struct HeliosSurface {
    static const uint64_t kMagic = 0x48454c53554246ull; /* "HELSURF" */
    uint64_t magic = kMagic;
+   uint64_t id = 0;
    HeliosInstance *inst = nullptr;
    HWND hwnd = nullptr;
    HINSTANCE hinstance = nullptr;
@@ -316,15 +320,18 @@ struct HeliosSlot {
     * therefore performs the same exact EXTERNAL -> canonical transfer as
     * every later Acquire, merely without a Release wait. */
    bool externally_owned = true;
+   uint32_t alias_refs = 0;
    std::mutex lock;           /* covers this slot's recording objects (A13) */
 };
 
 struct HeliosDevice;
+struct HeliosAlias;
 
 struct HeliosSwapchain {
    static const uint64_t kMagic = 0x48454c535743ull; /* "HELSWC" */
    uint64_t magic = kMagic;
    uint64_t id = 0;               /* process-unique generation id */
+   VkSwapchainKHR handle = VK_NULL_HANDLE;
    HeliosDevice *dev = nullptr;
    HeliosSurface *surf = nullptr;
    HWND hwnd = nullptr;
@@ -344,6 +351,7 @@ struct HeliosSwapchain {
    bool retired = false;  /* replaced through oldSwapchain */
    bool lost = false;     /* device removed / surface lost */
    bool destroying = false;
+   bool presentation_torn_down = false;
    HANDLE state_event = nullptr; /* wakes a blocked Acquire on loss/destroy */
    uint32_t next_hint = 0;
    /* Exact enqueue order on this swapchain's one D3D copy queue.  Fence
@@ -352,7 +360,29 @@ struct HeliosSwapchain {
    std::vector<uint32_t> release_fifo;
    uint32_t release_head = 0;
    uint32_t release_count = 0;
+   std::unordered_set<HeliosAlias *> aliases;
    std::mutex lock;
+};
+
+enum HeliosAliasState {
+   HELIOS_ALIAS_CANDIDATE = 0,
+   HELIOS_ALIAS_BOUND,
+   HELIOS_ALIAS_INDETERMINATE,
+   HELIOS_ALIAS_ONLY,
+   HELIOS_ALIAS_LOST,
+};
+
+struct HeliosAlias {
+   HeliosDevice *dev = nullptr;
+   HeliosSwapchain *sc = nullptr;
+   uint64_t swapchain_id = 0;
+   VkImage image = VK_NULL_HANDLE;
+   VkDeviceMemory memory = VK_NULL_HANDLE;
+   uint32_t slot_index = UINT32_MAX;
+   HeliosAliasState state = HELIOS_ALIAS_CANDIDATE;
+   bool bind_attempted = false;
+   bool has_allocator = false;
+   VkAllocationCallbacks allocator = {};
 };
 
 struct HeliosAppQueue {
@@ -387,23 +417,36 @@ struct HeliosDevice {
    std::unordered_map<VkQueue, HeliosAppQueue> app_queues;
    std::unordered_map<VkSemaphore, VkSemaphoreType> app_semaphores;
    std::unordered_set<VkFence> app_fences;
-   std::unordered_set<HeliosSwapchain *> swapchains;
+   std::unordered_map<VkImage, HeliosAlias *> aliases;
+   std::unordered_set<VkImage> canonical_images;
+   std::unordered_map<VkSwapchainKHR, HeliosSwapchain *> swapchains;
+   std::unordered_map<uint64_t, HeliosSwapchain *> retained_backings;
 };
 
-/* ---- registries ---------------------------------------------------- */
-/*
- * Dispatchable Vulkan handles begin with a loader dispatch-table pointer; the
- * conventional layer key is that pointer. Non-dispatchable handles the layer
- * itself mints (surfaces, swapchains) are pointers cast to uint64_t and are
- * additionally validated against these registries, so a foreign or stale
- * handle is refused rather than dereferenced (§10.9:2857).
- */
+/* ---- dispatch registries ------------------------------------------ */
+/* Dispatchable Vulkan handles begin with a loader dispatch-table pointer, so
+ * the conventional layer key is that pointer.  Non-dispatchable surface and
+ * swapchain handles are deliberately absent here: their association is rooted
+ * in the exact owning HeliosInstance/HeliosDevice below. */
 static std::mutex helios_registry_lock;
 static std::unordered_map<void *, HeliosInstance *> helios_instances;
 static std::unordered_map<void *, HeliosDevice *> helios_devices;
-static std::unordered_set<HeliosSurface *> helios_surfaces;
-static std::unordered_set<HeliosSwapchain *> helios_swapchains;
+static std::atomic<uint64_t> helios_next_surface_id{1};
 static std::atomic<uint64_t> helios_next_swapchain_id{1};
+
+static uint64_t
+helios_allocate_generation(std::atomic<uint64_t> &next)
+{
+   uint64_t value = next.load(std::memory_order_relaxed);
+   for (;;) {
+      if (value == 0 || value == UINT64_MAX)
+         return 0;
+      if (next.compare_exchange_weak(value, value + 1,
+                                     std::memory_order_relaxed,
+                                     std::memory_order_relaxed))
+         return value;
+   }
+}
 
 static inline void *
 helios_key(const void *dispatchable)
@@ -452,39 +495,47 @@ helios_device_of_queue(VkQueue queue)
 }
 
 static HeliosSurface *
-helios_surface_of(VkSurfaceKHR surface)
+helios_surface_of(HeliosInstance *inst, VkSurfaceKHR surface)
 {
-   if (surface == VK_NULL_HANDLE)
+   if (!inst || surface == VK_NULL_HANDLE)
       return nullptr;
-   HeliosSurface *s = (HeliosSurface *)(uintptr_t)surface;
-   std::lock_guard<std::mutex> g(helios_registry_lock);
-   if (helios_surfaces.find(s) == helios_surfaces.end())
+   std::lock_guard<std::mutex> g(inst->lock);
+   auto it = inst->surfaces.find(surface);
+   if (it == inst->surfaces.end())
       return nullptr;
-   return s->magic == HeliosSurface::kMagic ? s : nullptr;
+   HeliosSurface *s = it->second;
+   return s && s->magic == HeliosSurface::kMagic && s->inst == inst &&
+                 (VkSurfaceKHR)(uintptr_t)s->id == surface
+             ? s
+             : nullptr;
 }
 
 static HeliosSwapchain *
-helios_swapchain_of(VkSwapchainKHR swapchain)
+helios_swapchain_of(HeliosDevice *dev, VkSwapchainKHR swapchain)
 {
-   if (swapchain == VK_NULL_HANDLE)
+   if (!dev || swapchain == VK_NULL_HANDLE)
       return nullptr;
-   HeliosSwapchain *s = (HeliosSwapchain *)(uintptr_t)swapchain;
-   std::lock_guard<std::mutex> g(helios_registry_lock);
-   if (helios_swapchains.find(s) == helios_swapchains.end())
+   std::lock_guard<std::mutex> g(dev->lock);
+   auto it = dev->swapchains.find(swapchain);
+   if (it == dev->swapchains.end())
       return nullptr;
-   return s->magic == HeliosSwapchain::kMagic ? s : nullptr;
+   HeliosSwapchain *s = it->second;
+   return s && s->magic == HeliosSwapchain::kMagic && s->dev == dev &&
+                 s->handle == swapchain
+             ? s
+             : nullptr;
 }
 
 static inline VkSurfaceKHR
 helios_surface_handle(HeliosSurface *s)
 {
-   return (VkSurfaceKHR)(uintptr_t)s;
+   return (VkSurfaceKHR)(uintptr_t)s->id;
 }
 
 static inline VkSwapchainKHR
 helios_swapchain_handle(HeliosSwapchain *s)
 {
-   return (VkSwapchainKHR)(uintptr_t)s;
+   return s->handle;
 }
 
 /* ---- window helpers ------------------------------------------------ */
@@ -860,6 +911,17 @@ helios_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAlloca
    {
       std::lock_guard<std::mutex> g(helios_registry_lock);
       helios_instances.erase(helios_key(instance));
+   }
+   std::vector<HeliosSurface *> leftover_surfaces;
+   {
+      std::lock_guard<std::mutex> g(inst->lock);
+      for (const auto &entry : inst->surfaces)
+         leftover_surfaces.push_back(entry.second);
+      inst->surfaces.clear();
+   }
+   for (HeliosSurface *surface : leftover_surfaces) {
+      surface->magic = 0;
+      delete surface;
    }
    helios_com_release(inst->dxgi_factory);
 
@@ -1390,12 +1452,31 @@ helios_CreateWin32SurfaceKHR(VkInstance instance,
       return helios_refuse(HELIOS_CNT_surface_create_refused_alloc,
                            VK_ERROR_OUT_OF_HOST_MEMORY, nullptr);
    surf->inst = inst;
+   surf->id = helios_allocate_generation(helios_next_surface_id);
+   if (!surf->id) {
+      delete surf;
+      return helios_refuse(HELIOS_CNT_surface_create_refused_alloc,
+                           VK_ERROR_OUT_OF_HOST_MEMORY,
+                           "surface handle generation exhausted");
+   }
    surf->hwnd = pCreateInfo->hwnd;
    surf->hinstance = pCreateInfo->hinstance;
 
    {
-      std::lock_guard<std::mutex> g(helios_registry_lock);
-      helios_surfaces.insert(surf);
+      std::lock_guard<std::mutex> g(inst->lock);
+      try {
+         if (!inst->surfaces.emplace(helios_surface_handle(surf), surf).second) {
+            delete surf;
+            return helios_refuse(HELIOS_CNT_surface_create_refused_alloc,
+                                 VK_ERROR_OUT_OF_HOST_MEMORY,
+                                 "duplicate surface handle generation");
+         }
+      } catch (const std::bad_alloc &) {
+         delete surf;
+         return helios_refuse(HELIOS_CNT_surface_create_refused_alloc,
+                              VK_ERROR_OUT_OF_HOST_MEMORY,
+                              "surface owner association");
+      }
    }
    *pSurface = helios_surface_handle(surf);
    (void)pAllocator;
@@ -1406,14 +1487,14 @@ static VKAPI_ATTR void VKAPI_CALL
 helios_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
                          const VkAllocationCallbacks *pAllocator)
 {
-   (void)instance;
    (void)pAllocator;
-   HeliosSurface *surf = helios_surface_of(surface);
+   HeliosInstance *inst = helios_instance_of(instance);
+   HeliosSurface *surf = helios_surface_of(inst, surface);
    if (!surf)
       return;
    {
-      std::lock_guard<std::mutex> g(helios_registry_lock);
-      helios_surfaces.erase(surf);
+      std::lock_guard<std::mutex> g(inst->lock);
+      inst->surfaces.erase(surface);
    }
    surf->magic = 0;
    delete surf;
@@ -1424,9 +1505,10 @@ helios_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
  *   VK_ERROR_SURFACE_LOST_KHR  the HWND is gone
  *   VK_ERROR_INITIALIZATION_FAILED  not our handle at all */
 static VkResult
-helios_resolve_surface(VkSurfaceKHR surface, HeliosSurface **out)
+helios_resolve_surface(HeliosInstance *inst, VkSurfaceKHR surface,
+                       HeliosSurface **out)
 {
-   HeliosSurface *s = helios_surface_of(surface);
+   HeliosSurface *s = helios_surface_of(inst, surface);
    if (!s)
       return helios_refuse(HELIOS_CNT_surface_query_refused_unknown_surface,
                            VK_ERROR_INITIALIZATION_FAILED, nullptr);
@@ -1444,12 +1526,12 @@ helios_GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice,
                                           VkBool32 *pSupported)
 {
    *pSupported = VK_FALSE;
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(inst, surface, &surf);
    if (r != VK_SUCCESS)
       return r == VK_ERROR_SURFACE_LOST_KHR ? r : VK_ERROR_SURFACE_LOST_KHR;
 
-   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    if (!inst || !inst->wsi_enabled())
       return VK_SUCCESS;
    const HeliosPhysDevInfo &info = helios_admit(inst, physicalDevice);
@@ -1493,9 +1575,9 @@ helios_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice,
                                                VkSurfaceKHR surface,
                                                VkSurfaceCapabilitiesKHR *pCaps)
 {
-   (void)physicalDevice;
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(inst, surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
 
@@ -1531,9 +1613,9 @@ helios_GetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalDevice,
                                           VkSurfaceKHR surface, uint32_t *pCount,
                                           VkSurfaceFormatKHR *pFormats)
 {
-   (void)physicalDevice;
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(inst, surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
 
@@ -1551,11 +1633,11 @@ helios_GetPhysicalDeviceSurfaceFormats2KHR(
       return helios_refuse(HELIOS_CNT_surface_query_refused_unadvertised_pnext,
                            VK_ERROR_SURFACE_LOST_KHR, "formats2 input pNext");
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(pSurfaceInfo->surface, &surf);
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
+   VkResult r =
+      helios_resolve_surface(inst, pSurfaceInfo->surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
-   (void)physicalDevice;
-
    if (!pFormats) {
       *pCount = 1;
       return VK_SUCCESS;
@@ -1575,9 +1657,9 @@ helios_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice,
                                                uint32_t *pCount,
                                                VkPresentModeKHR *pModes)
 {
-   (void)physicalDevice;
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(inst, surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
 
@@ -1592,9 +1674,9 @@ helios_GetPhysicalDevicePresentRectanglesKHR(VkPhysicalDevice physicalDevice,
                                              VkSurfaceKHR surface,
                                              uint32_t *pCount, VkRect2D *pRects)
 {
-   (void)physicalDevice;
+   HeliosInstance *inst = helios_instance_of_phys(physicalDevice);
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(inst, surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
 
@@ -2200,7 +2282,9 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 }
 
-static void helios_destroy_swapchain_locked(HeliosSwapchain *sc);
+static bool helios_destroy_swapchain_locked(HeliosSwapchain *sc);
+static void helios_release_retained_swapchain(HeliosSwapchain *sc);
+static void helios_slot_teardown_backing(HeliosSlot &slot);
 
 static VKAPI_ATTR void VKAPI_CALL
 helios_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
@@ -2209,21 +2293,48 @@ helios_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
-   /* Any swapchain still alive at device destruction is an application error;
-    * the layer still drains and destroys its own objects rather than leaking
-    * D3D/NT state. */
-   std::vector<HeliosSwapchain *> leftovers;
+   /* Live child objects at device destruction violate Vulkan lifetime rules;
+    * nevertheless release the exact device-owned graph in dependency order
+    * rather than leaking layer CPU/D3D state. */
+   std::vector<HeliosSwapchain *> backings;
+   std::vector<HeliosAlias *> aliases;
    {
       std::lock_guard<std::mutex> g(dev->lock);
-      leftovers.assign(dev->swapchains.begin(), dev->swapchains.end());
+      for (const auto &entry : dev->retained_backings)
+         backings.push_back(entry.second);
+      for (const auto &entry : dev->aliases)
+         aliases.push_back(entry.second);
+      dev->aliases.clear();
       dev->swapchains.clear();
+      dev->retained_backings.clear();
+      dev->canonical_images.clear();
    }
-   for (HeliosSwapchain *sc : leftovers) {
-      {
-         std::lock_guard<std::mutex> g(helios_registry_lock);
-         helios_swapchains.erase(sc);
+
+   for (HeliosAlias *alias : aliases) {
+      if (alias->sc) {
+         std::lock_guard<std::mutex> g(alias->sc->lock);
+         alias->sc->aliases.erase(alias);
+         if (alias->slot_index < alias->sc->slots.size() &&
+             alias->sc->slots[alias->slot_index].alias_refs)
+            alias->sc->slots[alias->slot_index].alias_refs--;
       }
-      helios_destroy_swapchain_locked(sc);
+      dev->disp.DestroyImage(
+         device, alias->image,
+         alias->has_allocator ? &alias->allocator : nullptr);
+      if (alias->memory != VK_NULL_HANDLE)
+         dev->disp.FreeMemory(device, alias->memory, nullptr);
+      delete alias;
+   }
+
+   for (HeliosSwapchain *sc : backings) {
+      if (!sc->presentation_torn_down)
+         (void)helios_destroy_swapchain_locked(sc);
+      else {
+         for (HeliosSlot &slot : sc->slots)
+            helios_slot_teardown_backing(slot);
+         sc->slots.clear();
+         sc->magic = 0;
+      }
       delete sc;
    }
 
@@ -2313,7 +2424,7 @@ helios_GetDeviceGroupSurfacePresentModesKHR(
    if (!dev || !dev->wsi_enabled)
       return VK_ERROR_INITIALIZATION_FAILED;
    HeliosSurface *surf = nullptr;
-   VkResult r = helios_resolve_surface(surface, &surf);
+   VkResult r = helios_resolve_surface(dev->inst, surface, &surf);
    if (r != VK_SUCCESS)
       return VK_ERROR_SURFACE_LOST_KHR;
    *pModes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
@@ -2358,9 +2469,10 @@ helios_d3d12_device(HeliosDevice *dev)
    return d3d;
 }
 
-/* Releases every object a slot owns. Safe on a partially built slot. */
+/* Releases the presentation/canonical side of a slot while retaining S/H for
+ * separately created alias images. Safe on a partially built slot. */
 static void
-helios_slot_teardown(HeliosDevice *dev, HeliosSlot &slot)
+helios_slot_teardown_presentation(HeliosDevice *dev, HeliosSlot &slot)
 {
    if (slot.pool != VK_NULL_HANDLE && dev->disp.DestroyCommandPool) {
       dev->disp.DestroyCommandPool(dev->device, slot.pool, nullptr);
@@ -2391,14 +2503,20 @@ helios_slot_teardown(HeliosDevice *dev, HeliosSlot &slot)
    helios_com_release(slot.alloc);
    helios_com_release(slot.ready);
    helios_com_release(slot.release);
+   if (slot.release_event) {
+      CloseHandle(slot.release_event);
+      slot.release_event = nullptr;
+   }
+}
+
+/* Releases only the common committed backing retained for aliases. */
+static void
+helios_slot_teardown_backing(HeliosSlot &slot)
+{
    helios_com_release(slot.s);
    if (slot.h) {
       CloseHandle(slot.h);
       slot.h = nullptr;
-   }
-   if (slot.release_event) {
-      CloseHandle(slot.release_event);
-      slot.release_event = nullptr;
    }
 }
 
@@ -2653,7 +2771,8 @@ helios_CreateSwapchainKHR(VkDevice device,
                            VK_ERROR_INITIALIZATION_FAILED, "device has no layer WSI");
 
    HeliosSurface *surf = nullptr;
-   VkResult sr = helios_resolve_surface(pCreateInfo->surface, &surf);
+   VkResult sr =
+      helios_resolve_surface(dev->inst, pCreateInfo->surface, &surf);
    if (sr != VK_SUCCESS)
       return sr == VK_ERROR_SURFACE_LOST_KHR
                 ? helios_refuse(HELIOS_CNT_swapchain_refused_surface_lost,
@@ -2744,10 +2863,16 @@ helios_CreateSwapchainKHR(VkDevice device,
    /* oldSwapchain must be one of ours on this device and surface. */
    HeliosSwapchain *old_sc = nullptr;
    if (pCreateInfo->oldSwapchain != VK_NULL_HANDLE) {
-      old_sc = helios_swapchain_of(pCreateInfo->oldSwapchain);
+      old_sc = helios_swapchain_of(dev, pCreateInfo->oldSwapchain);
       if (!old_sc || old_sc->dev != dev || old_sc->surf != surf)
          return helios_refuse(HELIOS_CNT_swapchain_refused_old_swapchain,
                               VK_ERROR_INITIALIZATION_FAILED, nullptr);
+      std::lock_guard<std::mutex> g(old_sc->lock);
+      if (old_sc->retired || old_sc->destroying ||
+          old_sc->presentation_torn_down || old_sc->lost)
+         return helios_refuse(HELIOS_CNT_swapchain_refused_old_swapchain,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "oldSwapchain is already retired or lost");
    }
 
    if (!dev->disp.SetHeliosPresentableImage)
@@ -2764,7 +2889,14 @@ helios_CreateSwapchainKHR(VkDevice device,
    if (!sc)
       return helios_refuse(HELIOS_CNT_swapchain_refused_alloc,
                            VK_ERROR_OUT_OF_HOST_MEMORY, nullptr);
-   sc->id = helios_next_swapchain_id.fetch_add(1, std::memory_order_relaxed);
+   sc->id = helios_allocate_generation(helios_next_swapchain_id);
+   if (!sc->id) {
+      delete sc;
+      return helios_refuse(HELIOS_CNT_swapchain_refused_alloc,
+                           VK_ERROR_OUT_OF_HOST_MEMORY,
+                           "swapchain generation exhausted");
+   }
+   sc->handle = (VkSwapchainKHR)(uintptr_t)sc->id;
    sc->dev = dev;
    sc->surf = surf;
    sc->hwnd = surf->hwnd;
@@ -2917,22 +3049,65 @@ helios_CreateSwapchainKHR(VkDevice device,
       slot.state = HELIOS_SLOT_NEVER_USED;
    }
 
-   /* §10.7:2478-2480 — the new set exists before the old acquisition/present
-    * state is atomically retired. */
+   /* Publish the complete new image set before oldSwapchain is retired.  The
+   * canonical-image set is device-owned too, so vkDestroyImage can reject a
+   * canonical WSI handle without searching foreign swapchains. */
+   bool registered = false;
+   bool inserted_swapchain = false;
+   bool inserted_backing = false;
+   VkImage inserted_images[HELIOS_WSI_MAX_IMAGE_COUNT] = {};
+   uint32_t inserted_image_count = 0;
+   try {
+      std::lock_guard<std::mutex> g(dev->lock);
+      inserted_swapchain = dev->swapchains.emplace(sc->handle, sc).second;
+      registered = inserted_swapchain;
+      if (registered) {
+         inserted_backing = dev->retained_backings.emplace(sc->id, sc).second;
+         registered = inserted_backing;
+      }
+      if (registered) {
+         for (const HeliosSlot &slot : sc->slots) {
+            if (!dev->canonical_images.insert(slot.image).second) {
+               registered = false;
+               break;
+            }
+            inserted_images[inserted_image_count++] = slot.image;
+         }
+      }
+      if (!registered) {
+         if (inserted_swapchain)
+            dev->swapchains.erase(sc->handle);
+         if (inserted_backing)
+            dev->retained_backings.erase(sc->id);
+         for (uint32_t i = 0; i < inserted_image_count; i++)
+            dev->canonical_images.erase(inserted_images[i]);
+      }
+   } catch (const std::bad_alloc &) {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (inserted_swapchain)
+         dev->swapchains.erase(sc->handle);
+      if (inserted_backing)
+         dev->retained_backings.erase(sc->id);
+      for (uint32_t i = 0; i < inserted_image_count; i++)
+         dev->canonical_images.erase(inserted_images[i]);
+      registered = false;
+   }
+   if (!registered) {
+      helios_destroy_swapchain_locked(sc);
+      delete sc;
+      return helios_refuse(HELIOS_CNT_swapchain_refused_alloc,
+                           VK_ERROR_OUT_OF_HOST_MEMORY,
+                           "device-owned swapchain association");
+   }
+
+   /* §10.7:2478-2480 — the new set now exists; retirement of the old
+    * Acquire/Present state is one locked transition.  Alias creation remains
+    * valid on the retired object until vkDestroySwapchainKHR. */
    if (old_sc) {
       std::lock_guard<std::mutex> g(old_sc->lock);
       old_sc->retired = true;
       if (old_sc->state_event)
          SetEvent(old_sc->state_event);
-   }
-
-   {
-      std::lock_guard<std::mutex> g(dev->lock);
-      dev->swapchains.insert(sc);
-   }
-   {
-      std::lock_guard<std::mutex> g(helios_registry_lock);
-      helios_swapchains.insert(sc);
    }
    *pSwapchain = helios_swapchain_handle(sc);
    helios_log("[helios-wsi] swapchain %llu created %ux%u N=%u",
@@ -2945,8 +3120,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 helios_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                              uint32_t *pCount, VkImage *pImages)
 {
-   (void)device;
-   HeliosSwapchain *sc = helios_swapchain_of(swapchain);
+   HeliosDevice *dev = helios_device_of(device);
+   HeliosSwapchain *sc = helios_swapchain_of(dev, swapchain);
    if (!sc)
       return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
                            VK_ERROR_INITIALIZATION_FAILED, nullptr);
@@ -3465,7 +3640,7 @@ helios_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                            uint32_t *pImageIndex)
 {
    HeliosDevice *dev = helios_device_of(device);
-   HeliosSwapchain *sc = helios_swapchain_of(swapchain);
+   HeliosSwapchain *sc = helios_swapchain_of(dev, swapchain);
    if (!dev || !sc || sc->dev != dev)
       return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
                            VK_ERROR_OUT_OF_DATE_KHR, nullptr);
@@ -3481,7 +3656,8 @@ helios_AcquireNextImage2KHR(VkDevice device,
    if (!dev || !pAcquireInfo)
       return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
                            VK_ERROR_INITIALIZATION_FAILED, nullptr);
-   HeliosSwapchain *sc = helios_swapchain_of(pAcquireInfo->swapchain);
+   HeliosSwapchain *sc =
+      helios_swapchain_of(dev, pAcquireInfo->swapchain);
    if (!sc || sc->dev != dev)
       return helios_refuse(HELIOS_CNT_acquire_refused_unknown_swapchain,
                            VK_ERROR_OUT_OF_DATE_KHR, nullptr);
@@ -3658,7 +3834,8 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
    std::vector<HeliosPresentItem> items;
    items.reserve(pPresentInfo->swapchainCount);
    for (uint32_t k = 0; k < pPresentInfo->swapchainCount; k++) {
-      HeliosSwapchain *sc = helios_swapchain_of(pPresentInfo->pSwapchains[k]);
+      HeliosSwapchain *sc =
+         helios_swapchain_of(dev, pPresentInfo->pSwapchains[k]);
       if (!sc || sc->dev != dev)
          return helios_refuse(HELIOS_CNT_present_refused_unknown_swapchain,
                               VK_ERROR_INITIALIZATION_FAILED, nullptr);
@@ -3981,7 +4158,12 @@ helios_wait_release(HeliosSlot &slot)
     * no waiter, and a single Wait would report "released" while the GPU is still
     * reading — with teardown as the caller. */
    for (;;) {
-      if (slot.release->GetCompletedValue() >= slot.epoch)
+      const uint64_t completed = slot.release->GetCompletedValue();
+      /* D3D12 reports UINT64_MAX for a removed device.  It is never a valid
+       * Release proof and must not be mistaken for universal completion. */
+      if (completed == UINT64_MAX)
+         return false;
+      if (completed >= slot.epoch)
          return true;
       if (FAILED(slot.release->SetEventOnCompletion(slot.epoch, slot.release_event)))
          return false;
@@ -3990,111 +4172,189 @@ helios_wait_release(HeliosSlot &slot)
    }
 }
 
+/* A queue-local, unshared D3D12 fence drains the copy queue after the last
+ * queued IDXGISwapChain::Present.  It is never exported to or imported by
+ * Vulkan and never changes a Ready/Release epoch. */
+static bool
+helios_drain_d3d_queue(HeliosSwapchain *sc)
+{
+   if (!sc->queue)
+      return true;
+   HeliosDevice *dev = sc->dev;
+   ID3D12Fence *drain = nullptr;
+   HANDLE event = nullptr;
+   if (!dev || !dev->d3d12 ||
+       FAILED(dev->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                      IID_PPV_ARGS(&drain))) ||
+       !drain)
+      goto fail;
+   event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+   if (!event || FAILED(sc->queue->Signal(drain, 1)))
+      goto fail;
+   {
+      const uint64_t completed = drain->GetCompletedValue();
+      if (completed == UINT64_MAX)
+         goto fail;
+      if (completed < 1) {
+         if (FAILED(drain->SetEventOnCompletion(1, event)) ||
+             WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0)
+            goto fail;
+         const uint64_t after = drain->GetCompletedValue();
+         if (after == UINT64_MAX || after < 1)
+            goto fail;
+      }
+   }
+   CloseHandle(event);
+   drain->Release();
+   return true;
+
+fail:
+   if (event)
+      CloseHandle(event);
+   helios_com_release(drain);
+   return false;
+}
+
 /*
  * §12.3:3309-3319. The layer relies on the application's C48 precondition for
  * its own recorded work; it drains only what it owns: in-flight D3D Release
  * and DXGI Present, then the reciprocal EXTERNAL -> canonical-family barrier
  * for every slot left in external ownership.
  */
-static void
+static bool
 helios_drain_swapchain(HeliosSwapchain *sc)
 {
    HeliosDevice *dev = sc->dev;
    if (!dev)
-      return;
+      return false;
+
+   if (sc->lost)
+      return false;
 
    for (HeliosSlot &slot : sc->slots) {
       if (slot.state == HELIOS_SLOT_RELEASE_QUEUED ||
           slot.state == HELIOS_SLOT_PRESENT_QUEUED ||
           slot.state == HELIOS_SLOT_D3D_COPY ||
           slot.state == HELIOS_SLOT_DXGI_OWNED) {
-         if (!helios_wait_release(slot))
+         if (!helios_wait_release(slot)) {
             helios_count(HELIOS_CNT_teardown_release_wait_failed);
-      }
-   }
-
-   /* One D3D queue quiescence point before any resource is released. */
-   if (sc->queue && !sc->slots.empty() && sc->slots[0].release) {
-      ID3D12Fence *f = sc->slots[0].release;
-      const uint64_t target = f->GetCompletedValue() + 1;
-      if (SUCCEEDED(sc->queue->Signal(f, target)) &&
-          f->GetCompletedValue() < target) {
-         if (SUCCEEDED(f->SetEventOnCompletion(target, sc->slots[0].release_event)))
-            WaitForSingleObject(sc->slots[0].release_event, INFINITE);
-      }
-      /* Keep the slot's epoch bookkeeping consistent with the bumped fence. */
-      sc->slots[0].epoch = target;
-      sc->slots[0].retired_epoch = target;
-   }
-
-   /* Reciprocal ownership barrier for every externally owned slot. A never
-    * presented Vulkan-owned slot needs no invented transition
-    * (§12.3:3315-3318). */
-   if (dev->helper_queue && dev->disp.QueueSubmit2) {
-      std::vector<VkCommandBufferSubmitInfo> cbs;
-      for (HeliosSlot &slot : sc->slots) {
-         if (!slot.externally_owned || slot.state == HELIOS_SLOT_LOST)
-            continue;
-         if (dev->disp.ResetCommandPool(dev->device, slot.pool, 0) != VK_SUCCESS ||
-             helios_record_barrier(dev, slot.acquire_cb, slot.image,
-                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                                   VK_QUEUE_FAMILY_EXTERNAL, dev->canonical_family,
-                                   VK_PIPELINE_STAGE_2_NONE, 0,
-                                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                   VK_ACCESS_2_MEMORY_READ_BIT |
-                                      VK_ACCESS_2_MEMORY_WRITE_BIT) != VK_SUCCESS) {
-            helios_count(HELIOS_CNT_teardown_barrier_failed);
-            continue;
-         }
-         VkCommandBufferSubmitInfo cbi = {};
-         cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-         cbi.commandBuffer = slot.acquire_cb;
-         cbs.push_back(cbi);
-      }
-      if (!cbs.empty()) {
-         VkFenceCreateInfo fci = {};
-         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-         VkFence fence = VK_NULL_HANDLE;
-         if (dev->disp.CreateFence(dev->device, &fci, nullptr, &fence) !=
-             VK_SUCCESS) {
-            helios_count(HELIOS_CNT_teardown_barrier_failed);
-         } else {
-            VkSubmitInfo2 si = {};
-            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-            si.commandBufferInfoCount = (uint32_t)cbs.size();
-            si.pCommandBufferInfos = cbs.data();
-            VkResult r;
-            {
-               std::lock_guard<std::mutex> hg(dev->helper_lock);
-               r = dev->disp.QueueSubmit2(dev->helper_queue, 1, &si, fence);
-            }
-            if (r != VK_SUCCESS)
-               helios_count(HELIOS_CNT_teardown_barrier_failed);
-            else
-               dev->disp.WaitForFences(dev->device, 1, &fence, VK_TRUE, UINT64_MAX);
-            dev->disp.DestroyFence(dev->device, fence, nullptr);
+            sc->lost = true;
+            slot.state = HELIOS_SLOT_LOST;
+            return false;
          }
       }
    }
+
+   if (!helios_drain_d3d_queue(sc)) {
+      helios_count(HELIOS_CNT_teardown_release_wait_failed);
+      sc->lost = true;
+      for (HeliosSlot &slot : sc->slots)
+         slot.state = HELIOS_SLOT_LOST;
+      return false;
+   }
+
+   VkSemaphoreSubmitInfo waits[HELIOS_WSI_MAX_IMAGE_COUNT] = {};
+   VkCommandBufferSubmitInfo cbs[HELIOS_WSI_MAX_IMAGE_COUNT] = {};
+   HeliosSlot *restored[HELIOS_WSI_MAX_IMAGE_COUNT] = {};
+   uint32_t count = 0;
+   for (HeliosSlot &slot : sc->slots) {
+      /* Epoch zero means this backing was never released by Vulkan to D3D;
+       * teardown must not invent a Release value or ownership transition. */
+      if (!slot.externally_owned || slot.epoch == 0)
+         continue;
+      if (count == HELIOS_WSI_MAX_IMAGE_COUNT ||
+          dev->disp.ResetCommandPool(dev->device, slot.pool, 0) != VK_SUCCESS ||
+          helios_record_barrier(dev, slot.acquire_cb, slot.image,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                VK_QUEUE_FAMILY_EXTERNAL,
+                                dev->canonical_family,
+                                VK_PIPELINE_STAGE_2_NONE, 0,
+                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                VK_ACCESS_2_MEMORY_READ_BIT |
+                                   VK_ACCESS_2_MEMORY_WRITE_BIT) != VK_SUCCESS) {
+         helios_count(HELIOS_CNT_teardown_barrier_failed);
+         sc->lost = true;
+         slot.state = HELIOS_SLOT_LOST;
+         return false;
+      }
+      waits[count].sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+      waits[count].semaphore = slot.release_sem;
+      waits[count].value = slot.epoch;
+      waits[count].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+      cbs[count].sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+      cbs[count].commandBuffer = slot.acquire_cb;
+      restored[count] = &slot;
+      count++;
+   }
+
+   if (!count)
+      return true;
+
+   VkFenceCreateInfo fci = {};
+   fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+   VkFence fence = VK_NULL_HANDLE;
+   if (dev->disp.CreateFence(dev->device, &fci, nullptr, &fence) != VK_SUCCESS) {
+      helios_count(HELIOS_CNT_teardown_barrier_failed);
+      return false;
+   }
+   VkSubmitInfo2 submit = {};
+   submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+   submit.waitSemaphoreInfoCount = count;
+   submit.pWaitSemaphoreInfos = waits;
+   submit.commandBufferInfoCount = count;
+   submit.pCommandBufferInfos = cbs;
+   VkResult result;
+   {
+      std::lock_guard<std::mutex> hg(dev->helper_lock);
+      result = dev->disp.QueueSubmit2(dev->helper_queue, 1, &submit, fence);
+   }
+   if (result == VK_SUCCESS)
+      result =
+         dev->disp.WaitForFences(dev->device, 1, &fence, VK_TRUE, UINT64_MAX);
+   dev->disp.DestroyFence(dev->device, fence, nullptr);
+   if (result != VK_SUCCESS) {
+      helios_count(HELIOS_CNT_teardown_barrier_failed);
+      sc->lost = result == VK_ERROR_DEVICE_LOST;
+      for (uint32_t i = 0; i < count; i++)
+         restored[i]->state = HELIOS_SLOT_LOST;
+      return false;
+   }
+   for (uint32_t i = 0; i < count; i++)
+      restored[i]->externally_owned = false;
+   return true;
 }
 
-/* Releases everything the swapchain owns. Callable on a partially built
- * swapchain (the create path uses it as its unwind). */
-static void
+/* Tears down the presentation graph.  S/H remain when a separately created
+ * alias still names this generation.  Returns true exactly when that backing
+ * has been retained.  Also safe on a partially built creation unwind. */
+static bool
 helios_destroy_swapchain_locked(HeliosSwapchain *sc)
 {
    HeliosDevice *dev = sc->dev;
-   sc->destroying = true;
-   if (sc->state_event)
-      SetEvent(sc->state_event);
+   {
+      std::lock_guard<std::mutex> g(sc->lock);
+      if (sc->presentation_torn_down)
+         return !sc->aliases.empty();
+      sc->destroying = true;
+      sc->retired = true;
+      if (sc->state_event)
+         SetEvent(sc->state_event);
+   }
 
-   helios_drain_swapchain(sc);
+   const bool drained = helios_drain_swapchain(sc);
 
    if (dev) {
-      for (HeliosSlot &slot : sc->slots)
-         helios_slot_teardown(dev, slot);
+      {
+         std::lock_guard<std::mutex> g(dev->lock);
+         for (const HeliosSlot &slot : sc->slots)
+            dev->canonical_images.erase(slot.image);
+      }
+      for (HeliosSlot &slot : sc->slots) {
+         helios_slot_teardown_presentation(dev, slot);
+         slot.state = drained ? HELIOS_SLOT_ALIAS_ONLY : HELIOS_SLOT_LOST;
+      }
    }
-   sc->slots.clear();
 
    /* Every backbuffer reference is released before DXGI destruction. */
    for (ID3D12Resource *&b : sc->backbuffers)
@@ -4107,7 +4367,46 @@ helios_destroy_swapchain_locked(HeliosSwapchain *sc)
       CloseHandle(sc->state_event);
       sc->state_event = nullptr;
    }
+
+   bool retained = false;
+   {
+      std::lock_guard<std::mutex> g(sc->lock);
+      sc->presentation_torn_down = true;
+      for (HeliosAlias *alias : sc->aliases)
+         alias->state = drained ? HELIOS_ALIAS_ONLY : HELIOS_ALIAS_LOST;
+      retained = !sc->aliases.empty();
+      sc->magic = 0;
+      sc->handle = VK_NULL_HANDLE;
+   }
+   if (!retained) {
+      for (HeliosSlot &slot : sc->slots)
+         helios_slot_teardown_backing(slot);
+      sc->slots.clear();
+   }
+   return retained;
+}
+
+static void
+helios_release_retained_swapchain(HeliosSwapchain *sc)
+{
+   if (!sc || !sc->dev)
+      return;
+   HeliosDevice *dev = sc->dev;
+   {
+      std::lock_guard<std::mutex> g(sc->lock);
+      if (!sc->presentation_torn_down || !sc->aliases.empty())
+         return;
+   }
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (dev->retained_backings.erase(sc->id) == 0)
+         return;
+   }
+   for (HeliosSlot &slot : sc->slots)
+      helios_slot_teardown_backing(slot);
+   sc->slots.clear();
    sc->magic = 0;
+   delete sc;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -4116,48 +4415,121 @@ helios_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 {
    (void)pAllocator;
    HeliosDevice *dev = helios_device_of(device);
-   HeliosSwapchain *sc = helios_swapchain_of(swapchain);
+   HeliosSwapchain *sc = helios_swapchain_of(dev, swapchain);
    if (!dev || !sc || sc->dev != dev)
       return;
 
    {
-      std::lock_guard<std::mutex> g(helios_registry_lock);
-      helios_swapchains.erase(sc);
-   }
-   {
       std::lock_guard<std::mutex> g(dev->lock);
-      dev->swapchains.erase(sc);
+      dev->swapchains.erase(swapchain);
    }
-   helios_destroy_swapchain_locked(sc);
-   delete sc;
+   const bool retained = helios_destroy_swapchain_locked(sc);
+   if (!retained) {
+      {
+         std::lock_guard<std::mutex> g(dev->lock);
+         dev->retained_backings.erase(sc->id);
+      }
+      delete sc;
+   }
 }
 
 /* ==================================================================== */
 /* 13. C45 swapchain-memory alias images                                */
 /* ==================================================================== */
-/*
- * STUB: unit B7 of the Mesa lane brief is not implemented in this changeset.
- *
- * What IS implemented is the null-swapchain form, which §10.7:2356-2365 makes
- * a pure pass-through: the layer consumes and strips only that no-op
- * structure, preserves every other pNext item, and forwards an ordinary lower
- * create/bind. That path is exercised by ordinary applications and must not
- * regress.
- *
- * The non-null alias form (VUIDs 00995/01630/01631/01644, the dedicated
- * D3D12_RESOURCE_BIT re-import of H[i] per alias, ALIAS_ONLY survival past
- * swapchain destruction) is REFUSED, loudly and per call, with the counters
- * alias_image_refused_unimplemented / alias_bind_refused_unimplemented. It is
- * never approximated with ordinary memory or a fake lower swapchain — that is
- * exactly what §10.9:2858 forbids.
- */
+
+static bool
+helios_alias_image_shape_matches(const HeliosSwapchain *sc,
+                                 const VkImageCreateInfo *info)
+{
+   if (!sc || !info || info->flags != 0 ||
+       info->imageType != VK_IMAGE_TYPE_2D ||
+       info->format != HELIOS_WSI_FORMAT ||
+       info->extent.width != sc->extent.width ||
+       info->extent.height != sc->extent.height || info->extent.depth != 1 ||
+       info->mipLevels != 1 || info->arrayLayers != 1 ||
+       info->samples != VK_SAMPLE_COUNT_1_BIT ||
+       info->tiling != VK_IMAGE_TILING_OPTIMAL || info->usage != sc->usage ||
+       info->sharingMode != sc->sharing_mode ||
+       info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+      return false;
+
+   if (sc->sharing_mode == VK_SHARING_MODE_EXCLUSIVE)
+      return info->queueFamilyIndexCount == 0;
+   if (info->queueFamilyIndexCount != sc->queue_families.size() ||
+       (info->queueFamilyIndexCount && !info->pQueueFamilyIndices))
+      return false;
+   for (uint32_t i = 0; i < info->queueFamilyIndexCount; i++)
+      if (info->pQueueFamilyIndices[i] != sc->queue_families[i])
+         return false;
+   return true;
+}
+
+static bool
+helios_alias_create_chain_valid(
+   const VkImageCreateInfo *info,
+   const VkImageSwapchainCreateInfoKHR *swapchain_info,
+   const VkExternalMemoryImageCreateInfo **out_external)
+{
+   *out_external = nullptr;
+   uint32_t swapchain_count = 0;
+   uint32_t external_count = 0;
+   uint32_t format_list_count = 0;
+   uint32_t stencil_count = 0;
+   for (const VkBaseInStructure *s =
+           (const VkBaseInStructure *)info->pNext;
+        s; s = s->pNext) {
+      switch (s->sType) {
+      case VK_STRUCTURE_TYPE_IMAGE_SWAPCHAIN_CREATE_INFO_KHR:
+         swapchain_count++;
+         if (s != (const VkBaseInStructure *)swapchain_info)
+            return false;
+         break;
+      case VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: {
+         external_count++;
+         if (external_count != 1)
+            return false;
+         const auto *external =
+            (const VkExternalMemoryImageCreateInfo *)s;
+         if (external->handleTypes !=
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)
+            return false;
+         *out_external = external;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO: {
+         format_list_count++;
+         if (format_list_count != 1)
+            return false;
+         const auto *formats = (const VkImageFormatListCreateInfo *)s;
+         if (formats->viewFormatCount && !formats->pViewFormats)
+            return false;
+         for (uint32_t i = 0; i < formats->viewFormatCount; i++)
+            if (formats->pViewFormats[i] != HELIOS_WSI_FORMAT)
+               return false;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO:
+         stencil_count++;
+         if (stencil_count != 1)
+            return false;
+         if (((const VkImageStencilUsageCreateInfo *)s)->stencilUsage != 0)
+            return false;
+         break;
+      default:
+         /* Unknown/conflicting create semantics are refused rather than
+          * silently dropped from the real lower image. */
+         return false;
+      }
+   }
+   return swapchain_count == 1;
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 helios_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
    HeliosDevice *dev = helios_device_of(device);
-   if (!dev || !dev->disp.CreateImage)
+   if (!dev || !dev->disp.CreateImage || !pCreateInfo || !pImage)
       return VK_ERROR_INITIALIZATION_FAILED;
 
    const VkImageSwapchainCreateInfoKHR *sci =
@@ -4166,24 +4538,139 @@ helios_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    if (!sci)
       return dev->disp.CreateImage(device, pCreateInfo, pAllocator, pImage);
 
-   if (sci->swapchain != VK_NULL_HANDLE)
-      return helios_refuse(HELIOS_CNT_alias_image_refused_unimplemented,
+   uint32_t swapchain_nodes = 0;
+   for (const VkBaseInStructure *s =
+           (const VkBaseInStructure *)pCreateInfo->pNext;
+        s; s = s->pNext)
+      if (s->sType == VK_STRUCTURE_TYPE_IMAGE_SWAPCHAIN_CREATE_INFO_KHR)
+         swapchain_nodes++;
+   if (swapchain_nodes != 1)
+      return helios_refuse(HELIOS_CNT_alias_image_refused_pnext,
                            VK_ERROR_INITIALIZATION_FAILED,
-                           "swapchain-memory alias images are not implemented "
-                           "in this generation");
+                           "duplicate VkImageSwapchainCreateInfoKHR");
 
    /* Null form: consume and strip only that structure, preserve the rest. */
-   helios_count(HELIOS_CNT_alias_null_form_forwarded);
-   HeliosStrippedChain stripped;
-   if (!helios_strip_pnext(pCreateInfo->pNext, (const VkBaseInStructure *)sci,
-                           &stripped))
-      return helios_refuse(HELIOS_CNT_alias_image_refused_unimplemented,
+   if (sci->swapchain == VK_NULL_HANDLE) {
+      helios_count(HELIOS_CNT_alias_null_form_forwarded);
+      HeliosStrippedChain stripped;
+      if (!helios_strip_pnext(pCreateInfo->pNext,
+                              (const VkBaseInStructure *)sci, &stripped))
+         return helios_refuse(
+            HELIOS_CNT_alias_image_refused_pnext,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "cannot unlink null VkImageSwapchainCreateInfoKHR");
+      VkImageCreateInfo copy = *pCreateInfo;
+      copy.pNext = stripped.head;
+      return dev->disp.CreateImage(device, &copy, pAllocator, pImage);
+   }
+
+   HeliosSwapchain *sc = helios_swapchain_of(dev, sci->swapchain);
+   if (!sc || sc->dev != dev)
+      return helios_refuse(HELIOS_CNT_alias_image_refused_unknown_swapchain,
                            VK_ERROR_INITIALIZATION_FAILED,
-                           "cannot unlink VkImageSwapchainCreateInfoKHR from "
-                           "behind an unknown pNext structure");
-   VkImageCreateInfo copy = *pCreateInfo;
-   copy.pNext = stripped.head;
-   return dev->disp.CreateImage(device, &copy, pAllocator, pImage);
+                           "foreign, stale, or destroyed alias swapchain");
+   {
+      std::lock_guard<std::mutex> g(sc->lock);
+      if (sc->destroying || sc->presentation_torn_down ||
+          sc->id == 0 || sc->magic != HeliosSwapchain::kMagic)
+         return helios_refuse(
+            HELIOS_CNT_alias_image_refused_unknown_swapchain,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "alias swapchain is being destroyed");
+      if (!helios_alias_image_shape_matches(sc, pCreateInfo))
+         return helios_refuse(HELIOS_CNT_alias_image_refused_vuid_00995,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "VUID-VkImageSwapchainCreateInfoKHR-swapchain-00995");
+   }
+
+   const VkExternalMemoryImageCreateInfo *existing_external = nullptr;
+   if (!helios_alias_create_chain_valid(pCreateInfo, sci,
+                                        &existing_external))
+      return helios_refuse(HELIOS_CNT_alias_image_refused_pnext,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "conflicting alias image create pNext");
+
+   HeliosStrippedChain stripped;
+   if (!helios_strip_pnext(pCreateInfo->pNext,
+                           (const VkBaseInStructure *)sci, &stripped))
+      return helios_refuse(HELIOS_CNT_alias_image_refused_pnext,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "cannot unlink VkImageSwapchainCreateInfoKHR");
+
+   VkExternalMemoryImageCreateInfo external = {};
+   external.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+   external.handleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+   external.pNext = stripped.head;
+
+   VkImageCreateInfo lower = *pCreateInfo;
+   lower.pNext = existing_external ? stripped.head : &external;
+   VkImage image = VK_NULL_HANDLE;
+   VkResult result =
+      dev->disp.CreateImage(device, &lower, pAllocator, &image);
+   if (result != VK_SUCCESS)
+      return helios_refuse(HELIOS_CNT_alias_image_refused_create, result,
+                           "lower alias vkCreateImage");
+
+   result = dev->disp.SetHeliosPresentableImage(
+      device, image, sc->id, HELIOS_PRESENTABLE_IMAGE_ALIAS_CANDIDATE);
+   if (result != VK_SUCCESS) {
+      dev->disp.DestroyImage(device, image, pAllocator);
+      return helios_refuse(HELIOS_CNT_alias_image_refused_tag,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "lower alias candidate tag");
+   }
+
+   HeliosAlias *alias = new (std::nothrow) HeliosAlias();
+   if (!alias) {
+      dev->disp.DestroyImage(device, image, pAllocator);
+      return helios_refuse(HELIOS_CNT_alias_image_refused_tracking,
+                           VK_ERROR_OUT_OF_HOST_MEMORY, nullptr);
+   }
+   alias->dev = dev;
+   alias->sc = sc;
+   alias->swapchain_id = sc->id;
+   alias->image = image;
+   if (pAllocator) {
+      alias->has_allocator = true;
+      alias->allocator = *pAllocator;
+   }
+
+   bool inserted_device = false;
+   bool inserted_swapchain = false;
+   try {
+      std::lock_guard<std::mutex> dg(dev->lock);
+      std::lock_guard<std::mutex> sg(sc->lock);
+      if (sc->destroying || sc->presentation_torn_down ||
+          sc->id != alias->swapchain_id) {
+         delete alias;
+         dev->disp.DestroyImage(device, image, pAllocator);
+         return helios_refuse(
+            HELIOS_CNT_alias_image_refused_unknown_swapchain,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "alias swapchain retired during image creation");
+      }
+      inserted_device = dev->aliases.emplace(image, alias).second;
+      if (inserted_device)
+         inserted_swapchain = sc->aliases.insert(alias).second;
+      if (!inserted_swapchain && inserted_device)
+         dev->aliases.erase(image);
+   } catch (const std::bad_alloc &) {
+      if (inserted_device) {
+         std::lock_guard<std::mutex> dg(dev->lock);
+         dev->aliases.erase(image);
+      }
+   }
+   if (!inserted_device || !inserted_swapchain) {
+      delete alias;
+      dev->disp.DestroyImage(device, image, pAllocator);
+      return helios_refuse(HELIOS_CNT_alias_image_refused_tracking,
+                           VK_ERROR_OUT_OF_HOST_MEMORY,
+                           "duplicate or untracked alias image");
+   }
+
+   *pImage = image;
+   return VK_SUCCESS;
 }
 
 static VKAPI_ATTR void VKAPI_CALL
@@ -4191,8 +4678,170 @@ helios_DestroyImage(VkDevice device, VkImage image,
                     const VkAllocationCallbacks *pAllocator)
 {
    HeliosDevice *dev = helios_device_of(device);
-   if (dev && dev->disp.DestroyImage)
+   if (!dev || !dev->disp.DestroyImage)
+      return;
+
+   HeliosAlias *alias = nullptr;
+   {
+      std::lock_guard<std::mutex> g(dev->lock);
+      if (dev->canonical_images.find(image) != dev->canonical_images.end()) {
+         helios_count(HELIOS_CNT_alias_destroy_refused_foreign);
+         return;
+      }
+      auto it = dev->aliases.find(image);
+      if (it != dev->aliases.end()) {
+         alias = it->second;
+         dev->aliases.erase(it);
+      }
+   }
+   if (!alias) {
       dev->disp.DestroyImage(device, image, pAllocator);
+      return;
+   }
+
+   HeliosSwapchain *sc = alias->sc;
+   /* The alias VkImage is the owner-facing object; its distinct dedicated
+    * import remains alive until after that object is destroyed, even when a
+    * batched bind returned an indeterminate result. */
+   dev->disp.DestroyImage(device, image, pAllocator);
+   if (alias->memory != VK_NULL_HANDLE)
+      dev->disp.FreeMemory(device, alias->memory, nullptr);
+
+   /* Keep the alias in its parent set until the lower object and import are
+    * gone.  Concurrent destruction of distinct alias images can therefore
+    * never close S/H while another lower destroy is still using the backing. */
+   bool last_retained_alias = false;
+   if (sc) {
+      std::lock_guard<std::mutex> g(sc->lock);
+      sc->aliases.erase(alias);
+      if (alias->slot_index < sc->slots.size()) {
+         HeliosSlot &slot = sc->slots[alias->slot_index];
+         if (slot.alias_refs > 0)
+            slot.alias_refs--;
+      }
+      last_retained_alias =
+         sc->presentation_torn_down && sc->aliases.empty();
+   }
+   delete alias;
+
+   if (last_retained_alias)
+      helios_release_retained_swapchain(sc);
+}
+
+struct HeliosAliasBindEntry {
+   HeliosAlias *alias = nullptr;
+   HeliosSwapchain *sc = nullptr;
+   uint32_t slot_index = UINT32_MAX;
+   VkDeviceMemory memory = VK_NULL_HANDLE;
+   VkBindMemoryStatus *status = nullptr;
+   bool alias_bind = false;
+   bool null_form = false;
+};
+
+static VkResult
+helios_allocate_alias_memory(HeliosDevice *dev, HeliosAliasBindEntry *entry)
+{
+   HeliosSlot &slot = entry->sc->slots[entry->slot_index];
+   if (!slot.h)
+      return helios_refuse(HELIOS_CNT_alias_bind_refused_import,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "alias backing handle is no longer live");
+
+   VkMemoryWin32HandlePropertiesKHR mprops = {};
+   mprops.sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR;
+   VkResult result = dev->disp.GetMemoryWin32HandlePropertiesKHR(
+      dev->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, slot.h,
+      &mprops);
+   if (result != VK_SUCCESS)
+      return helios_refuse(HELIOS_CNT_alias_bind_refused_import, result,
+                           "alias handle memory properties");
+
+   VkImageMemoryRequirementsInfo2 req_info = {};
+   req_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+   req_info.image = entry->alias->image;
+   VkMemoryRequirements2 req = {};
+   req.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+   dev->disp.GetImageMemoryRequirements2(dev->device, &req_info, &req);
+
+   uint32_t compatible =
+      req.memoryRequirements.memoryTypeBits & mprops.memoryTypeBits;
+   if (!compatible || !req.memoryRequirements.size)
+      return helios_refuse(HELIOS_CNT_alias_bind_refused_import,
+                           VK_ERROR_INITIALIZATION_FAILED,
+                           "no compatible alias import memory type");
+   uint32_t type_index = 0;
+   while (!(compatible & (1u << type_index)))
+      type_index++;
+
+   VkMemoryDedicatedAllocateInfo dedicated = {};
+   dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+   dedicated.image = entry->alias->image;
+
+   VkImportMemoryWin32HandleInfoKHR import = {};
+   import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
+   import.pNext = &dedicated;
+   import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+   import.handle = slot.h;
+   import.name = nullptr;
+
+   VkMemoryAllocateInfo alloc = {};
+   alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+   alloc.pNext = &import;
+   alloc.allocationSize = req.memoryRequirements.size;
+   alloc.memoryTypeIndex = type_index;
+   result = dev->disp.AllocateMemory(dev->device, &alloc, nullptr,
+                                     &entry->memory);
+   if (result != VK_SUCCESS)
+      return helios_refuse(HELIOS_CNT_alias_bind_refused_import, result,
+                           "dedicated D3D12_RESOURCE alias import");
+   return VK_SUCCESS;
+}
+
+static bool
+helios_validate_alias_bind_chain(
+   const VkBindImageMemoryInfo &info,
+   const VkBindImageMemorySwapchainInfoKHR *swapchain_info,
+   VkBindMemoryStatus **out_status)
+{
+   *out_status = nullptr;
+   uint32_t swapchain_count = 0;
+   uint32_t device_group_count = 0;
+   uint32_t status_count = 0;
+   for (const VkBaseInStructure *s =
+           (const VkBaseInStructure *)info.pNext;
+        s; s = s->pNext) {
+      switch (s->sType) {
+      case VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR:
+         swapchain_count++;
+         if (s != (const VkBaseInStructure *)swapchain_info)
+            return false;
+         break;
+      case VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO: {
+         device_group_count++;
+         const auto *group =
+            (const VkBindImageMemoryDeviceGroupInfo *)s;
+         if (device_group_count != 1 || group->splitInstanceBindRegionCount != 0 ||
+             (group->deviceIndexCount != 0 &&
+              (group->deviceIndexCount != 1 || !group->pDeviceIndices ||
+               group->pDeviceIndices[0] != 0)))
+            return false;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS:
+         status_count++;
+         if (status_count != 1 ||
+             !((VkBindMemoryStatus *)s)->pResult)
+            return false;
+         *out_status = (VkBindMemoryStatus *)s;
+         break;
+      case VK_STRUCTURE_TYPE_BIND_IMAGE_PLANE_MEMORY_INFO:
+      default:
+         /* Alias images are not disjoint and no other bind extension is
+          * enabled by the layer.  Never silently discard conflicting input. */
+         return false;
+      }
+   }
+   return swapchain_count == 1;
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -4200,32 +4849,20 @@ helios_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
                         const VkBindImageMemoryInfo *pBindInfos)
 {
    HeliosDevice *dev = helios_device_of(device);
-   if (!dev || !dev->disp.BindImageMemory2)
+   if (!dev || !dev->disp.BindImageMemory2 ||
+       (bindInfoCount && !pBindInfos))
       return VK_ERROR_INITIALIZATION_FAILED;
+   if (!bindInfoCount)
+      return dev->disp.BindImageMemory2(device, 0, pBindInfos);
 
-   bool any_alias = false;
-   for (uint32_t i = 0; i < bindInfoCount; i++) {
-      const VkBindImageMemorySwapchainInfoKHR *bs =
-         (const VkBindImageMemorySwapchainInfoKHR *)helios_find_pnext(
-            pBindInfos[i].pNext,
-            VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
-      if (bs && bs->swapchain != VK_NULL_HANDLE)
-         any_alias = true;
-   }
-   if (any_alias)
-      return helios_refuse(HELIOS_CNT_alias_bind_refused_unimplemented,
-                           VK_ERROR_INITIALIZATION_FAILED,
-                           "swapchain-memory alias bind is not implemented in "
-                           "this generation");
-
-   /* No non-null alias entry. The null form is consumed and stripped, and the
-    * ordinary lower bind is forwarded with the caller's memory and offset
-    * (§10.7:2359-2363). Input order and per-bind output chains are preserved
-    * by construction: only the consumed node is removed. */
-   std::vector<VkBindImageMemoryInfo> copies;
+   std::vector<VkBindImageMemoryInfo> copies(pBindInfos,
+                                              pBindInfos + bindInfoCount);
+   std::vector<HeliosAliasBindEntry> entries(bindInfoCount);
    std::vector<HeliosStrippedChain> chains(bindInfoCount);
-   std::vector<char> stripped(bindInfoCount, 0);
-   bool any_stripped = false;
+   std::unordered_set<HeliosAlias *> batch_aliases;
+   bool translated = false;
+
+   /* Validate the complete array before allocating or consuming anything. */
    for (uint32_t i = 0; i < bindInfoCount; i++) {
       const VkBindImageMemorySwapchainInfoKHR *bs =
          (const VkBindImageMemorySwapchainInfoKHR *)helios_find_pnext(
@@ -4233,24 +4870,166 @@ helios_BindImageMemory2(VkDevice device, uint32_t bindInfoCount,
             VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR);
       if (!bs)
          continue;
-      any_stripped = true;
+      translated = true;
+      uint32_t swapchain_nodes = 0;
+      for (const VkBaseInStructure *s =
+              (const VkBaseInStructure *)pBindInfos[i].pNext;
+           s; s = s->pNext)
+         if (s->sType ==
+             VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR)
+            swapchain_nodes++;
+      if (swapchain_nodes != 1)
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_pnext,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "duplicate alias bind structure");
       if (!helios_strip_pnext(pBindInfos[i].pNext, (const VkBaseInStructure *)bs,
                               &chains[i]))
-         return helios_refuse(HELIOS_CNT_alias_bind_refused_unimplemented,
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_pnext,
                               VK_ERROR_INITIALIZATION_FAILED,
-                              "cannot unlink VkBindImageMemorySwapchainInfoKHR "
-                              "from behind an unknown pNext structure");
-      stripped[i] = 1;
+                              "cannot unlink alias bind structure");
+      copies[i].pNext = chains[i].head;
+
+      if (bs->swapchain == VK_NULL_HANDLE) {
+         entries[i].null_form = true;
+         continue;
+      }
+
+      VkBindMemoryStatus *status = nullptr;
+      if (!helios_validate_alias_bind_chain(pBindInfos[i], bs, &status))
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_pnext,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "conflicting alias bind pNext");
+
+      HeliosSwapchain *sc = helios_swapchain_of(dev, bs->swapchain);
+      if (!sc)
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_unknown_image,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "foreign, stale, or destroyed alias swapchain");
+
+      HeliosAlias *alias = nullptr;
+      {
+         std::lock_guard<std::mutex> g(dev->lock);
+         auto it = dev->aliases.find(pBindInfos[i].image);
+         if (it != dev->aliases.end())
+            alias = it->second;
+      }
+      if (!alias || alias->dev != dev || alias->sc != sc ||
+          alias->swapchain_id != sc->id)
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_unknown_image,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "image was not created for this swapchain");
+      if (pBindInfos[i].memory != VK_NULL_HANDLE)
+         return helios_refuse(
+            HELIOS_CNT_alias_bind_refused_vuid_01630,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "VUID-VkBindImageMemoryInfo-memory-01630");
+      if (pBindInfos[i].memoryOffset != 0)
+         return helios_refuse(
+            HELIOS_CNT_alias_bind_refused_vuid_01631,
+            VK_ERROR_INITIALIZATION_FAILED,
+            "VUID-VkBindImageMemoryInfo-memoryOffset-01631");
+
+      {
+         std::lock_guard<std::mutex> g(sc->lock);
+         if (sc->destroying || sc->presentation_torn_down ||
+             bs->imageIndex >= sc->slots.size())
+            return helios_refuse(
+               HELIOS_CNT_alias_bind_refused_vuid_01644,
+               VK_ERROR_INITIALIZATION_FAILED,
+               "VUID-VkBindImageMemorySwapchainInfoKHR-imageIndex-01644");
+      }
+      if (alias->bind_attempted || alias->state != HELIOS_ALIAS_CANDIDATE ||
+          (alias->slot_index != UINT32_MAX &&
+           alias->slot_index != bs->imageIndex) ||
+          !batch_aliases.insert(alias).second)
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_duplicate,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "duplicate or repeated alias bind");
+
+      entries[i].alias = alias;
+      entries[i].sc = sc;
+      entries[i].slot_index = bs->imageIndex;
+      entries[i].status = status;
+      entries[i].alias_bind = true;
    }
-   if (!any_stripped)
+   if (!translated)
       return dev->disp.BindImageMemory2(device, bindInfoCount, pBindInfos);
 
-   helios_count(HELIOS_CNT_alias_null_form_forwarded);
-   copies.assign(pBindInfos, pBindInfos + bindInfoCount);
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      if (entries[i].null_form)
+         helios_count(HELIOS_CNT_alias_null_form_forwarded);
+      if (entries[i].alias_bind)
+         entries[i].alias->bind_attempted = true;
+   }
+
+   /* Every alias gets a distinct dedicated import of the retained H[i]. */
    for (uint32_t i = 0; i < bindInfoCount; i++)
-      if (stripped[i])
-         copies[i].pNext = chains[i].head;
-   return dev->disp.BindImageMemory2(device, bindInfoCount, copies.data());
+      if (entries[i].alias_bind) {
+         VkResult result = helios_allocate_alias_memory(dev, &entries[i]);
+         if (result != VK_SUCCESS) {
+            for (HeliosAliasBindEntry &entry : entries) {
+               if (entry.memory != VK_NULL_HANDLE)
+                  dev->disp.FreeMemory(device, entry.memory, nullptr);
+               if (entry.alias_bind)
+                  entry.alias->bind_attempted = false;
+            }
+            return result;
+         }
+         copies[i].memory = entries[i].memory;
+         copies[i].memoryOffset = 0;
+      }
+
+   /* Resolve every generation-only candidate to its exact slot before the
+    * one ordinary lower batch.  A7 then observes the real image/allocation
+    * operands through the normal vkBindImageMemory2 and QueueSubmit2 paths. */
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      HeliosAliasBindEntry &entry = entries[i];
+      if (!entry.alias_bind)
+         continue;
+      VkResult result = dev->disp.SetHeliosPresentableImage(
+         device, entry.alias->image, entry.alias->swapchain_id,
+         entry.slot_index);
+      if (result != VK_SUCCESS) {
+         entry.alias->slot_index = entry.slot_index;
+         for (HeliosAliasBindEntry &cleanup : entries) {
+            if (cleanup.memory != VK_NULL_HANDLE)
+               dev->disp.FreeMemory(device, cleanup.memory, nullptr);
+            if (cleanup.alias_bind)
+               cleanup.alias->bind_attempted = false;
+         }
+         return helios_refuse(HELIOS_CNT_alias_bind_refused_tag,
+                              VK_ERROR_INITIALIZATION_FAILED,
+                              "concrete alias slot tag");
+      }
+      entry.alias->slot_index = entry.slot_index;
+      if (entry.status)
+         *entry.status->pResult = VK_ERROR_UNKNOWN;
+   }
+
+   VkResult result =
+      dev->disp.BindImageMemory2(device, bindInfoCount, copies.data());
+
+   /* Once the batch has been issued the lower contract permits partial binds.
+    * Retain every imported memory and exact backing reference until the alias
+    * image is destroyed, even when the aggregate result is failure. */
+   for (HeliosAliasBindEntry &entry : entries) {
+      if (!entry.alias_bind)
+         continue;
+      entry.alias->memory = entry.memory;
+      entry.memory = VK_NULL_HANDLE;
+      if (result == VK_SUCCESS ||
+          (entry.status && *entry.status->pResult == VK_SUCCESS))
+         entry.alias->state = HELIOS_ALIAS_BOUND;
+      else if (result == VK_ERROR_DEVICE_LOST)
+         entry.alias->state = HELIOS_ALIAS_LOST;
+      else
+         entry.alias->state = HELIOS_ALIAS_INDETERMINATE;
+      {
+         std::lock_guard<std::mutex> g(entry.sc->lock);
+         entry.sc->slots[entry.slot_index].alias_refs++;
+      }
+   }
+   return result;
 }
 
 /* ==================================================================== */

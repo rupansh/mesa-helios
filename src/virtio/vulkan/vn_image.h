@@ -77,6 +77,7 @@ struct vn_image {
     * misuse be reported against a specific slot rather than "some image". */
    struct {
       bool tagged;
+      bool alias_candidate;
       uint64_t swapchain_id;
       uint32_t image_index;
    } helios_presentable;

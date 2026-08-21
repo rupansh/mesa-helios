@@ -1423,11 +1423,36 @@ vn_SetHeliosPresentableImageHELIOS(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
    }
 
-   /* One image is one slot. A second tag naming a different slot means the
-    * layer has aliased two slots onto one image, which would make every
-    * later ownership transfer ambiguous and is precisely the confusion this
-    * record exists to prevent. Re-tagging the SAME slot is idempotent, so a
-    * retried swapchain build is not punished. */
+   const bool candidate =
+      imageIndex == HELIOS_PRESENTABLE_IMAGE_ALIAS_CANDIDATE;
+
+   /* Alias creation records only its exact swapchain generation. Bind then
+    * resolves that candidate to one concrete slot. No other retag or
+    * candidate-to-generation transition is accepted. */
+   if (candidate) {
+      if (img->helios_presentable.tagged ||
+          (img->helios_presentable.alias_candidate &&
+           img->helios_presentable.swapchain_id != swapchainId))
+         return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
+      img->helios_presentable.alias_candidate = true;
+      img->helios_presentable.swapchain_id = swapchainId;
+      img->helios_presentable.image_index =
+         HELIOS_PRESENTABLE_IMAGE_ALIAS_CANDIDATE;
+      return VK_SUCCESS;
+   }
+
+   if (img->helios_presentable.alias_candidate) {
+      if (img->helios_presentable.swapchain_id != swapchainId)
+         return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);
+      img->helios_presentable.alias_candidate = false;
+      img->helios_presentable.tagged = true;
+      img->helios_presentable.image_index = imageIndex;
+      return VK_SUCCESS;
+   }
+
+   /* One canonical image is one slot. A second tag naming a different slot
+    * would make every later ownership transfer ambiguous. Re-tagging the same
+    * slot is idempotent. */
    if (img->helios_presentable.tagged &&
        (img->helios_presentable.swapchain_id != swapchainId ||
         img->helios_presentable.image_index != imageIndex)) {
@@ -1441,6 +1466,7 @@ vn_SetHeliosPresentableImageHELIOS(VkDevice device,
    }
 
    img->helios_presentable.tagged = true;
+   img->helios_presentable.alias_candidate = false;
    img->helios_presentable.swapchain_id = swapchainId;
    img->helios_presentable.image_index = imageIndex;
    return VK_SUCCESS;

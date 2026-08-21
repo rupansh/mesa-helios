@@ -191,8 +191,21 @@ extern "C" {
    X(present_dxgi_out_of_date)                                                \
    X(teardown_release_wait_failed)                                            \
    X(teardown_barrier_failed)                                                 \
-   X(alias_image_refused_unimplemented)                                       \
-   X(alias_bind_refused_unimplemented)                                        \
+   X(alias_image_refused_unknown_swapchain)                                   \
+   X(alias_image_refused_vuid_00995)                                          \
+   X(alias_image_refused_pnext)                                               \
+   X(alias_image_refused_create)                                              \
+   X(alias_image_refused_tag)                                                 \
+   X(alias_image_refused_tracking)                                            \
+   X(alias_bind_refused_unknown_image)                                        \
+   X(alias_bind_refused_vuid_01630)                                           \
+   X(alias_bind_refused_vuid_01631)                                           \
+   X(alias_bind_refused_vuid_01644)                                           \
+   X(alias_bind_refused_duplicate)                                            \
+   X(alias_bind_refused_pnext)                                                \
+   X(alias_bind_refused_import)                                               \
+   X(alias_bind_refused_tag)                                                  \
+   X(alias_destroy_refused_foreign)                                           \
    X(alias_null_form_forwarded)                                               \
    X(sync_object_refused_tracking)
 
