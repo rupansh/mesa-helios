@@ -24,7 +24,6 @@
 #include "wsi_common_private.h"
 #include "wsi_common_entrypoints.h"
 #include "util/u_debug.h"
-#include "util/log.h"
 #include "util/macros.h"
 #include "util/os_file.h"
 #include "util/os_time.h"
@@ -41,7 +40,6 @@
 #include "vk_util.h"
 
 #include <assert.h>
-#include <inttypes.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -51,310 +49,6 @@
 #endif
 
 uint64_t WSI_DEBUG;
-
-struct helios_wsi_perf {
-   bool initialized;
-   bool enabled;
-   uint64_t interval;
-   uint64_t frames;
-   uint64_t submit_calls;
-   uint64_t submit_ns;
-   uint64_t wait_ns;
-   uint64_t invalidate_ns;
-   uint64_t queue_present_ns;
-};
-
-static struct helios_wsi_perf helios_wsi_perf;
-
-/* Insurance blits skipped on vehicle-served chains (see
- * wsi_helios_insurance_blit_enabled below). App-thread only. */
-static uint64_t helios_insurance_blits_skipped;
-
-static void
-helios_wsi_perf_init(void)
-{
-   if (helios_wsi_perf.initialized)
-      return;
-
-   helios_wsi_perf.initialized = true;
-   helios_wsi_perf.interval = 300;
-
-   const char *enabled = os_get_option("HELIOS_WSI_PERF");
-   helios_wsi_perf.enabled = enabled && enabled[0] && enabled[0] != '0';
-
-   const char *interval = os_get_option("HELIOS_WSI_PERF_INTERVAL");
-   if (interval) {
-      char *end = NULL;
-      unsigned long long parsed = strtoull(interval, &end, 10);
-      if (end && *end == '\0' && parsed > 0)
-         helios_wsi_perf.interval = parsed;
-   }
-}
-
-static void
-helios_wsi_perf_write(void)
-{
-   FILE *f = stderr;
-   const char *path = os_get_option("HELIOS_WSI_PERF_FILE");
-   if (path && path[0]) {
-      FILE *opened = fopen(path, "a");
-      if (opened)
-         f = opened;
-   }
-
-   fprintf(f,
-           "Helios WSI common frames=%" PRIu64
-           " submit_calls=%" PRIu64
-           " submit_ms=%.3f submit_avg_us=%.3f"
-           " wait_ms=%.3f wait_avg_us=%.3f"
-           " invalidate_ms=%.3f invalidate_avg_us=%.3f"
-           " queue_present_ms=%.3f queue_present_avg_us=%.3f"
-           " insurance_skipped=%" PRIu64 "\n",
-           helios_wsi_perf.frames,
-           helios_wsi_perf.submit_calls,
-           (double)helios_wsi_perf.submit_ns / 1000000.0,
-           helios_wsi_perf.submit_calls ?
-              (double)helios_wsi_perf.submit_ns / 1000.0 /
-              (double)helios_wsi_perf.submit_calls : 0.0,
-           (double)helios_wsi_perf.wait_ns / 1000000.0,
-           helios_wsi_perf.frames ?
-              (double)helios_wsi_perf.wait_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
-           (double)helios_wsi_perf.invalidate_ns / 1000000.0,
-           helios_wsi_perf.frames ?
-              (double)helios_wsi_perf.invalidate_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
-           (double)helios_wsi_perf.queue_present_ns / 1000000.0,
-           helios_wsi_perf.frames ?
-              (double)helios_wsi_perf.queue_present_ns / 1000.0 / (double)helios_wsi_perf.frames : 0.0,
-           helios_insurance_blits_skipped);
-
-   if (f != stderr)
-      fclose(f);
-}
-
-/* Insurance-blit control (WS2, 28th session): a vehicle-served chain still
- * submits the pre-recorded image->buffer blit with every present so the sw
- * GDI fallback always has fresh bytes — but the vehicle-fail latch is
- * TERMINAL, so the per-frame insurance only ever buys the handful of
- * in-flight frames around one latch, at the cost of a full-frame
- * device->host-visible GPU copy per present (~7 MB at Doom res) and a
- * later present-order retirement (the published value includes the blit).
- * HELIOS_WSI_INSURANCE_BLIT=0 skips the blit while the vehicle serves
- * (counted; A/B lever, default ON until measured). */
-static bool
-wsi_helios_insurance_blit_enabled(void)
-{
-   static int cached = -1;
-   if (cached < 0) {
-      const char *env = os_get_option("HELIOS_WSI_INSURANCE_BLIT");
-      cached = !(env && env[0] == '0');
-   }
-   return cached > 0;
-}
-
-static void
-helios_wsi_perf_note_submit(uint64_t submit_ns)
-{
-   helios_wsi_perf_init();
-   if (!helios_wsi_perf.enabled)
-      return;
-
-   helios_wsi_perf.submit_calls++;
-   helios_wsi_perf.submit_ns += submit_ns;
-}
-
-static void
-helios_wsi_perf_note_frame(uint64_t wait_ns, uint64_t invalidate_ns,
-                           uint64_t queue_present_ns)
-{
-   helios_wsi_perf_init();
-   if (!helios_wsi_perf.enabled)
-      return;
-
-   helios_wsi_perf.frames++;
-   helios_wsi_perf.wait_ns += wait_ns;
-   helios_wsi_perf.invalidate_ns += invalidate_ns;
-   helios_wsi_perf.queue_present_ns += queue_present_ns;
-
-   if (helios_wsi_perf.frames % helios_wsi_perf.interval == 0)
-      helios_wsi_perf_write();
-}
-
-/* Helios async software-present worker — see the field comment in
- * wsi_common_private.h. One thread + FIFO per sw swapchain; the app's
- * vkQueuePresentKHR no longer blocks on the frame fence or the GDI blit
- * (measured 5-6 ms + 0.65 ms per frame under Doom = the 120 fps ceiling).
- */
-struct wsi_helios_present_job {
-   uint32_t image_index;
-   uint64_t present_id;
-   struct wsi_helios_present_job *next;
-};
-
-bool
-wsi_helios_async_present_enabled(void)
-{
-   static int cached = -1;
-   if (cached < 0) {
-      const char *env = os_get_option("HELIOS_WSI_ASYNC_PRESENT");
-      cached = !(env && env[0] == '0');
-   }
-   return cached > 0;
-}
-
-/* The moved inline-sw present tail: frame-fence wait, cached-map invalidate,
- * backend queue_present (the GDI blit). Runs on the worker thread; the
- * backend marks the image IDLE at the end, which is what un-blocks acquire.
- */
-static VkResult
-wsi_helios_present_execute(struct wsi_swapchain *swapchain,
-                           uint32_t image_index,
-                           uint64_t present_id)
-{
-   const struct wsi_device *wsi = swapchain->wsi;
-   struct wsi_image *image =
-      swapchain->get_wsi_image(swapchain, image_index);
-
-   uint64_t helios_wait_ns = 0;
-   uint64_t helios_invalidate_ns = 0;
-   VkResult result;
-
-   uint64_t helios_start_ns;
-
-   /* Vehicle-served chains skip the fence wait + invalidate (see the
-    * helios_vehicle_serving field comment). */
-   if (!swapchain->helios_vehicle_serving) {
-      helios_start_ns = os_time_get_nano();
-      result = wsi->WaitForFences(swapchain->device, 1,
-                                  &swapchain->fences[image_index],
-                                  true, ~0ull);
-      helios_wait_ns = os_time_get_nano() - helios_start_ns;
-      if (result != VK_SUCCESS) {
-         mesa_logd("wsi: async sw present WaitForFences(image=%u) failed: %s",
-                   image_index, vk_Result_to_str(result));
-         return result;
-      }
-
-      if (image->cpu_map != NULL) {
-         helios_start_ns = os_time_get_nano();
-         const VkMappedMemoryRange range = {
-            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-            .memory = image->blit.buffer != VK_NULL_HANDLE ?
-                      image->blit.memory : image->memory,
-            .offset = 0,
-            .size = VK_WHOLE_SIZE,
-         };
-         result =
-            wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
-         helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
-         if (result != VK_SUCCESS) {
-            mesa_logd("wsi: async sw present invalidate(image=%u) failed: %s",
-                      image_index, vk_Result_to_str(result));
-            return result;
-         }
-      }
-   }
-
-   /* The damage region is only consumed by the dxgi backend (never async);
-    * the sw blit is always full-extent, so NULL is exact here. */
-   helios_start_ns = os_time_get_nano();
-   result = swapchain->queue_present(swapchain, image_index, present_id, NULL);
-   uint64_t helios_queue_present_ns = os_time_get_nano() - helios_start_ns;
-
-   helios_wsi_perf_note_frame(helios_wait_ns, helios_invalidate_ns,
-                              helios_queue_present_ns);
-   if (result != VK_SUCCESS)
-      mesa_logd("wsi: async sw queue_present(image=%u) failed: %s",
-                image_index, vk_Result_to_str(result));
-   return result;
-}
-
-static int
-wsi_helios_present_worker(void *arg)
-{
-   struct wsi_swapchain *swapchain = arg;
-
-   mtx_lock(&swapchain->helios_async.mutex);
-   for (;;) {
-      while (!swapchain->helios_async.head && !swapchain->helios_async.stop)
-         cnd_wait(&swapchain->helios_async.cond,
-                  &swapchain->helios_async.mutex);
-
-      struct wsi_helios_present_job *job = swapchain->helios_async.head;
-      if (!job)
-         break; /* stop requested and the queue is fully drained */
-
-      swapchain->helios_async.head = job->next;
-      if (!swapchain->helios_async.head)
-         swapchain->helios_async.tail = NULL;
-      mtx_unlock(&swapchain->helios_async.mutex);
-
-      VkResult result = wsi_helios_present_execute(swapchain,
-                                                   job->image_index,
-                                                   job->present_id);
-      vk_free(&swapchain->alloc, job);
-
-      mtx_lock(&swapchain->helios_async.mutex);
-      if (result != VK_SUCCESS &&
-          swapchain->helios_async.status == VK_SUCCESS)
-         swapchain->helios_async.status = result;
-   }
-   mtx_unlock(&swapchain->helios_async.mutex);
-   return 0;
-}
-
-/* Returns the latched worker status on failure-so-far, VK_SUCCESS when the
- * job is queued, or VK_ERROR_OUT_OF_HOST_MEMORY (caller may present inline).
- */
-static VkResult
-wsi_helios_present_enqueue(struct wsi_swapchain *swapchain,
-                           uint32_t image_index,
-                           uint64_t present_id)
-{
-   struct wsi_helios_present_job *job =
-      vk_alloc(&swapchain->alloc, sizeof(*job), 8,
-               VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-   if (!job)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-
-   job->image_index = image_index;
-   job->present_id = present_id;
-   job->next = NULL;
-
-   mtx_lock(&swapchain->helios_async.mutex);
-   VkResult status = swapchain->helios_async.status;
-   if (status != VK_SUCCESS) {
-      mtx_unlock(&swapchain->helios_async.mutex);
-      vk_free(&swapchain->alloc, job);
-      return status;
-   }
-   if (swapchain->helios_async.tail)
-      swapchain->helios_async.tail->next = job;
-   else
-      swapchain->helios_async.head = job;
-   swapchain->helios_async.tail = job;
-   cnd_signal(&swapchain->helios_async.cond);
-   mtx_unlock(&swapchain->helios_async.mutex);
-   return VK_SUCCESS;
-}
-
-void
-wsi_helios_present_worker_finish(struct wsi_swapchain *swapchain)
-{
-   if (!swapchain->helios_async.enabled)
-      return;
-
-   mtx_lock(&swapchain->helios_async.mutex);
-   swapchain->helios_async.stop = true;
-   cnd_signal(&swapchain->helios_async.cond);
-   mtx_unlock(&swapchain->helios_async.mutex);
-
-   /* The worker drains every queued present before exiting, so pending blits
-    * land before the chain's fences/images are destroyed. */
-   thrd_join(swapchain->helios_async.thread, NULL);
-   cnd_destroy(&swapchain->helios_async.cond);
-   mtx_destroy(&swapchain->helios_async.mutex);
-   swapchain->helios_async.enabled = false;
-}
 
 static const struct debug_control debug_control[] = {
    { "buffer",       WSI_DEBUG_BUFFER },
@@ -535,16 +229,10 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(QueueSubmit2);
    WSI_GET_CB(SetDebugUtilsObjectNameEXT);
    WSI_GET_CB(WaitForFences);
-   WSI_GET_CB(InvalidateMappedMemoryRanges);
    WSI_GET_CB(MapMemory);
    WSI_GET_CB(UnmapMemory);
-   /* WaitSemaphores also serves the Helios vehicle acquire-side recycle
-    * gate, which needs timeline waits without KHR_present_wait. */
-   if (wsi->has_present_wait || wsi->has_timeline_semaphore)
+   if (wsi->has_present_wait)
       WSI_GET_CB(WaitSemaphores);
-#ifdef VK_USE_PLATFORM_WIN32_KHR
-   WSI_GET_CB(ImportSemaphoreWin32HandleKHR);
-#endif
 #undef WSI_GET_CB
 
 #if defined(VK_USE_PLATFORM_XCB_KHR)
@@ -912,24 +600,6 @@ wsi_swapchain_init(const struct wsi_device *wsi,
       chain->present_timing.supported_query_stages = timing_caps.presentStageQueries;
    }
 
-   if (wsi->sw && wsi_helios_async_present_enabled()) {
-      chain->helios_async.status = VK_SUCCESS;
-      if (mtx_init(&chain->helios_async.mutex, mtx_plain) == thrd_success) {
-         if (cnd_init(&chain->helios_async.cond) == thrd_success) {
-            if (thrd_create(&chain->helios_async.thread,
-                            wsi_helios_present_worker, chain) == thrd_success) {
-               chain->helios_async.enabled = true;
-            } else {
-               cnd_destroy(&chain->helios_async.cond);
-               mtx_destroy(&chain->helios_async.mutex);
-            }
-         } else {
-            mtx_destroy(&chain->helios_async.mutex);
-         }
-      }
-      /* !enabled falls back to the inline sw present path — slower, correct */
-   }
-
    return VK_SUCCESS;
 
 fail:
@@ -993,10 +663,6 @@ wsi_swapchain_get_present_mode(struct wsi_device *wsi,
 void
 wsi_swapchain_finish(struct wsi_swapchain *chain)
 {
-   /* Join the async present worker FIRST: it may still hold queued blits
-    * referencing the fences and images destroyed below. */
-   wsi_helios_present_worker_finish(chain);
-
    wsi_destroy_image_info(chain, &chain->image_info);
 
    if (chain->fences) {
@@ -1014,9 +680,6 @@ wsi_swapchain_finish(struct wsi_swapchain *chain)
    chain->wsi->DestroySemaphore(chain->device, chain->dma_buf_semaphore,
                                 &chain->alloc);
    chain->wsi->DestroySemaphore(chain->device, chain->present_id_timeline,
-                                &chain->alloc);
-   chain->wsi->DestroySemaphore(chain->device,
-                                chain->helios_present_order.semaphore,
                                 &chain->alloc);
 
    if (chain->cmd_pools) {
@@ -2386,32 +2049,20 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
                                                fence_count, fences);
    }
 
-   uint64_t helios_submit_start_ns = os_time_get_nano();
    VkResult result = wsi->QueueSubmit2(vk_queue_to_handle(queue), 1, info,
                                        fence_count > 0 ? fences[0]
                                                        : VK_NULL_HANDLE);
-   helios_wsi_perf_note_submit(os_time_get_nano() - helios_submit_start_ns);
-   if (result != VK_SUCCESS) {
-      mesa_logd("wsi: QueueSubmit2 failed: %s, cmd_buffers=%u, wait_sems=%u, signal_sems=%u, fences=%u",
-                vk_Result_to_str(result), info->commandBufferInfoCount,
-                info->waitSemaphoreInfoCount, info->signalSemaphoreInfoCount,
-                fence_count);
+   if (result != VK_SUCCESS)
       return result;
-   }
 
    for (uint32_t i = 1; i < fence_count; i++) {
       const VkSubmitInfo2 submit_info = {
          .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
       };
-      helios_submit_start_ns = os_time_get_nano();
       result = wsi->QueueSubmit2(vk_queue_to_handle(queue),
                                  1, &submit_info, fences[i]);
-      helios_wsi_perf_note_submit(os_time_get_nano() - helios_submit_start_ns);
-      if (result != VK_SUCCESS) {
-         mesa_logd("wsi: QueueSubmit2 empty fence[%u/%u] failed: %s",
-                   i, fence_count, vk_Result_to_str(result));
+      if (result != VK_SUCCESS)
          return result;
-      }
    }
 
    return VK_SUCCESS;
@@ -2420,8 +2071,7 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
 struct wsi_image_signal_info {
    uint64_t present_id;
    uint32_t semaphore_count;
-   /* 3: explicit_sync/dma_buf + present_id_timeline + helios_present_order */
-   VkSemaphoreSubmitInfo semaphore_infos[3];
+   VkSemaphoreSubmitInfo semaphore_infos[2];
    uint32_t fence_count;
    VkFence fences[2];
 };
@@ -2644,26 +2294,6 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
       }
 
-      /* Helios dcomp present vehicle: signal the present-order timeline with
-       * this present's value. The signal rides the pre-present submit (after
-       * the app's wait semaphores => after the frame's rendering) and the
-       * venus retire thread fires the exported NT semaphore at host GPU
-       * completion — the vehicle's copy-time consumer wait pairs with the
-       * (resid -> value) publish the win32 backend makes for this present. */
-      if (swapchain->helios_present_order.semaphore != VK_NULL_HANDLE) {
-         const uint64_t helios_value =
-            ++swapchain->helios_present_order.next_value;
-         image->helios_present_value = helios_value;
-         const VkSemaphoreSubmitInfo sem_info = {
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .semaphore = swapchain->helios_present_order.semaphore,
-            .value = helios_value,
-            .stageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-         };
-         wsi_image_signal_info_add_semaphore(&image_signal_infos[i],
-                                             sem_info);
-      }
-
       /* The present fence guards all client-allocated resources and GPU
        * execution that may be in use by the swapchain.  Since everything tied
        * to the swapchain itself is managed by us, this really just means the
@@ -2746,22 +2376,11 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          }
 
          if (swapchain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
-            /* Vehicle-served chains: the buffer blit is pure sw-fallback
-             * insurance (the vehicle copies the IMAGE, not the buffer).
-             * Skipping it (knob) also retires the present-order value at
-             * render completion instead of blit completion. The frames
-             * in flight around a (terminal) vehicle-fail latch may show
-             * one stale GDI frame each — counted, loud. */
-            if (swapchain->helios_vehicle_serving &&
-                !wsi_helios_insurance_blit_enabled()) {
-               helios_insurance_blits_skipped++;
-            } else {
-               command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
-                  .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-                  .commandBuffer =
-                     image->blit.cmd_buffers[queue->queue_family_index],
-               };
-            }
+            command_buffer_infos[command_buffer_count++] = (VkCommandBufferSubmitInfo) {
+               .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+               .commandBuffer =
+                  image->blit.cmd_buffers[queue->queue_family_index],
+            };
          }
 
          if (needs_timing_command_buffer) {
@@ -2892,71 +2511,18 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      uint64_t helios_wait_ns = 0;
-      uint64_t helios_invalidate_ns = 0;
-      uint64_t helios_queue_present_ns = 0;
-
-      if (wsi->sw && swapchain->helios_async.enabled) {
-         /* Hand the frame-fence wait + blit to the per-chain worker; a
-          * worker-side failure latches and is returned by a LATER present
-          * (one-frame-late error reporting, same latch pattern as the win32
-          * chain status). OOM here falls through to the inline path. */
-         results[i] = wsi_helios_present_enqueue(
-            swapchain, image_index, image_signal_infos[i].present_id);
-         if (results[i] != VK_ERROR_OUT_OF_HOST_MEMORY)
-            continue;
-      }
-
-      if (wsi->sw && !swapchain->helios_vehicle_serving) {
-         uint64_t helios_start_ns = os_time_get_nano();
-         VkResult wait_result =
-            wsi->WaitForFences(vk_device_to_handle(dev),
-                               1, &swapchain->fences[image_index], true,
-                               ~0ull);
-         helios_wait_ns = os_time_get_nano() - helios_start_ns;
-         if (wait_result != VK_SUCCESS) {
-            mesa_logd("wsi: sw present WaitForFences(image=%u) failed: %s",
-                      image_index, vk_Result_to_str(wait_result));
-            results[i] = wait_result;
-            continue;
-         }
-
-         if (image->cpu_map != NULL) {
-            helios_start_ns = os_time_get_nano();
-            const VkMappedMemoryRange range = {
-               .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-               .memory = image->blit.buffer != VK_NULL_HANDLE ?
-                         image->blit.memory : image->memory,
-               .offset = 0,
-               .size = VK_WHOLE_SIZE,
-            };
-            results[i] =
-               wsi->InvalidateMappedMemoryRanges(swapchain->device, 1, &range);
-            helios_invalidate_ns = os_time_get_nano() - helios_start_ns;
-            if (results[i] != VK_SUCCESS) {
-               mesa_logd("wsi: sw present invalidate(image=%u) failed: %s",
-                         image_index, vk_Result_to_str(results[i]));
-               continue;
-            }
-         }
+      if (wsi->sw) {
+         wsi->WaitForFences(vk_device_to_handle(dev),
+                            1, &swapchain->fences[image_index], true, ~0ull);
       }
 
       const VkPresentRegionKHR *region = NULL;
       if (regions && regions->pRegions)
          region = &regions->pRegions[i];
 
-      uint64_t helios_start_ns = os_time_get_nano();
       results[i] = swapchain->queue_present(swapchain, image_index,
                                             image_signal_infos[i].present_id,
                                             region);
-      helios_queue_present_ns = os_time_get_nano() - helios_start_ns;
-      if (wsi->sw)
-         helios_wsi_perf_note_frame(helios_wait_ns, helios_invalidate_ns,
-                                    helios_queue_present_ns);
-      if (results[i] != VK_SUCCESS) {
-         mesa_logd("wsi: queue_present(image=%u) failed: %s", image_index,
-                   vk_Result_to_str(results[i]));
-      }
       if (results[i] != VK_SUCCESS && results[i] != VK_SUBOPTIMAL_KHR)
          continue;
 
@@ -3246,25 +2812,13 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
       .image = image->image,
       .buffer = VK_NULL_HANDLE,
    };
-   VkMemoryAllocateInfo memory_info = {
+   const VkMemoryAllocateInfo memory_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &memory_dedicated_info,
       .allocationSize = reqs.size,
       .memoryTypeIndex =
          info->select_image_memory_type(wsi, reqs.memoryTypeBits),
    };
-
-   /* Helios dcomp present vehicle: export the frame image's dedicated
-    * memory so its venus blob is USE_SHAREABLE (importable by resid from
-    * the vehicle's DXVK context). */
-   VkExportMemoryAllocateInfo helios_image_export_info;
-   if (info->helios_image_export_handle_types) {
-      helios_image_export_info = (VkExportMemoryAllocateInfo) {
-         .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-         .handleTypes = info->helios_image_export_handle_types,
-      };
-      __vk_append_struct(&memory_info, &helios_image_export_info);
-   }
 
    result = wsi->AllocateMemory(chain->device, &memory_info,
                                 &chain->alloc, &image->memory);
@@ -3691,29 +3245,10 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
    if (params->alloc_shm && chain->blit.type != WSI_SWAPCHAIN_NO_BLIT)
       handle_types = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
 
-   /* Helios dcomp present vehicle: the frame images must be shareable venus
-    * blobs so the vehicle's DXVK context can alias-import them by resid —
-    * external image info on the VkImage here, VkExportMemoryAllocateInfo on
-    * the image's dedicated memory in wsi_create_buffer_blit_context (the
-    * export handle types are what flip the blob to USE_SHAREABLE). The blit
-    * BUFFER (the sw fallback's cpu_map) stays private. OPAQUE_FD is venus's
-    * renderer-side handle type on this transport. */
-   VkExternalMemoryHandleTypeFlags helios_image_export = 0;
-#ifdef _WIN32
-   if (wsi_helios_vehicle_enabled() &&
-       chain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT) {
-      helios_image_export = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-      assert(handle_types == 0);
-      handle_types = helios_image_export;
-   }
-#endif
-
    VkResult result = wsi_configure_image(chain, pCreateInfo,
                                          handle_types, info);
    if (result != VK_SUCCESS)
       return result;
-
-   info->helios_image_export_handle_types = helios_image_export;
 
    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
       wsi_configure_buffer_image(chain, pCreateInfo,

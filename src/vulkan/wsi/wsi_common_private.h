@@ -119,13 +119,6 @@ struct wsi_image_info {
    /* For buffer blit images, the size of the buffer in bytes */
    uint64_t linear_size;
 
-   /* Helios dcomp present vehicle: nonzero routes a
-    * VkExportMemoryAllocateInfo with these handle types onto the frame
-    * IMAGE's dedicated memory allocation (wsi_create_buffer_blit_context),
-    * which is what makes the venus blob USE_SHAREABLE — importable by the
-    * vehicle's DXVK context by resid. The blit BUFFER stays private. */
-   VkExternalMemoryHandleTypeFlags helios_image_export_handle_types;
-
    wsi_memory_type_select_cb select_image_memory_type;
    wsi_memory_type_select_cb select_blit_dst_memory_type;
 
@@ -183,11 +176,6 @@ struct wsi_image {
    bool acquired;
    uint64_t present_serial;
 
-   /* Helios dcomp present vehicle: the helios_present_order timeline value
-    * signaled by this image's most recent pre-present submit (stamped in
-    * wsi_common_queue_present; consumed by the win32 vehicle present). */
-   uint64_t helios_present_value;
-
    struct wsi_image_explicit_sync_timeline explicit_sync[WSI_ES_COUNT];
 
 #ifndef _WIN32
@@ -226,32 +214,6 @@ struct wsi_image_timing_request {
    VkPresentTimingInfoFlagsEXT flags;
 };
 
-struct wsi_helios_present_job;
-
-/* True unless HELIOS_WSI_ASYNC_PRESENT=0: sw presents run on a per-chain
- * worker thread (see wsi_swapchain::helios_async below), and sw backends may
- * allocate extra swapchain images beyond minImageCount so the GPU can run
- * ahead of the worker's fence-wait + blit. */
-bool
-wsi_helios_async_present_enabled(void);
-
-#ifdef _WIN32
-/* True when HELIOS_WSI_DCOMP_PRESENT is set: win32 sw swapchains attempt the
- * dcomp present vehicle (road 4), which additionally requires the frame
- * images' memory to be shareable venus blobs (see wsi_configure_cpu_image /
- * wsi_image_info::helios_image_export_handle_types). Defined in
- * wsi_common_win32.cpp. */
-bool
-wsi_helios_vehicle_enabled(void);
-#endif
-
-/* Join the per-chain async sw-present worker (idempotent). Exposed so the
- * win32 backend can drain in-flight presents BEFORE tearing down vehicle /
- * image state its queue_present path dereferences; wsi_swapchain_finish
- * still calls it for every other backend. */
-void
-wsi_helios_present_worker_finish(struct wsi_swapchain *swapchain);
-
 struct wsi_swapchain {
    struct vk_object_base base;
 
@@ -263,51 +225,6 @@ struct wsi_swapchain {
    VkAllocationCallbacks alloc;
    VkFence* fences;
    VkPresentModeKHR present_mode;
-
-   /* Helios async software-present worker (sw chains only): the inline sw
-    * present path serializes the frame-fence wait (venus: host GPU completion
-    * + wire-fence retire, ~5-6 ms under Doom) + the GDI blit on the app's
-    * present thread, capping fps at 1/(wait+blit). vkQueuePresentKHR instead
-    * enqueues {image, present_id} here and returns; the worker performs the
-    * wait + invalidate + queue_present in FIFO order. Back-pressure is the
-    * existing acquire path: an image stays non-IDLE until its blit lands, so
-    * the app can only run ahead by (image_count - 1) frames. Kill switch:
-    * HELIOS_WSI_ASYNC_PRESENT=0. */
-   struct {
-      bool enabled;
-      thrd_t thread;
-      mtx_t mutex;
-      cnd_t cond;
-      struct wsi_helios_present_job *head;
-      struct wsi_helios_present_job *tail;
-      bool stop;
-      /* first worker-side failure, latched; reported by the NEXT present */
-      VkResult status;
-   } helios_async;
-
-   /* Helios dcomp present vehicle (win32): when the backend created a
-    * present-order semaphore (timeline, exported under a
-    * Global\HeliosPresentFence_<pid>_<start>_<id> kernel name), every present's
-    * pre-present submit signals value = ++next_value and stamps it into
-    * wsi_image::helios_present_value. The publish of (frame resid -> pid,
-    * fence id, value) pairs the vehicle's copy-time consumer wait with this
-    * signal, which the ICD retire thread fires at host GPU completion.
-    * VK_NULL_HANDLE = feature off (the common code then does nothing). */
-   struct {
-      VkSemaphore semaphore;
-      uint64_t next_value;
-   } helios_present_order;
-
-   /* Helios dcomp present vehicle: true while the vehicle serves this
-    * chain's presents. The sw present prep (frame-fence wait + cpu_map
-    * invalidate) is skipped then — a 4 ms serial cost per present whose
-    * ordering duties are covered elsewhere: the vehicle's copy-time
-    * consumer wait orders the copy against the frame's GPU writes, and the
-    * pre-present throttle still waits fences[i] before reuse. Written and
-    * read on the (single) present worker thread; the one frame that races
-    * a FAILED latch falls back to GDI without the wait — bounded, counted,
-    * self-heals. */
-   bool helios_vehicle_serving;
    /**
     * Timeline for presents completing according to VK_KHR_present_wait.  The
     * present should complete as close as possible (before or after!) to the

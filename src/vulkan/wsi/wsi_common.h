@@ -149,15 +149,6 @@ struct wsi_device {
       VkResult (*create_image_memory)(VkDevice device, void *resource,
                                       const VkAllocationCallbacks *alloc,
                                       VkDeviceMemory *out);
-      /* Helios dcomp present vehicle: venus resource id + the creator's
-       * exact allocation identity (vkAllocateMemory size / memoryTypeIndex)
-       * of a VkDeviceMemory. Returns 0 when the memory is not backed by a
-       * shareable venus blob (the vehicle then latches off, loudly). Set by
-       * the venus driver (vn_wsi.c). */
-      uint32_t (*get_helios_resource_identity)(VkDevice device,
-                                               VkDeviceMemory memory,
-                                               uint64_t *alloc_size,
-                                               uint32_t *memory_type_index);
    } win32;
 
    struct {
@@ -257,15 +248,9 @@ struct wsi_device {
    WSI_CB(QueueSubmit2);
    WSI_CB(SetDebugUtilsObjectNameEXT);
    WSI_CB(WaitForFences);
-   WSI_CB(InvalidateMappedMemoryRanges);
    WSI_CB(MapMemory);
    WSI_CB(UnmapMemory);
    WSI_CB(WaitSemaphores);
-#ifdef VK_USE_PLATFORM_WIN32_KHR
-   /* Helios dcomp present vehicle: import of the vehicle's named present
-    * fence (acquire-side image-recycle gate). */
-   WSI_CB(ImportSemaphoreWin32HandleKHR);
-#endif
 #undef WSI_CB
 
     struct wsi_interface *                  wsi[VK_ICD_WSI_PLATFORM_MAX];
