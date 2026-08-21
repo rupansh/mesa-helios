@@ -1715,6 +1715,13 @@ static size_t
 helios_pnext_size(VkStructureType type)
 {
    switch (type) {
+   case VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO:
+      /* The loader prepends its private create-chain nodes before calling a
+       * layer.  They are loader-owned rather than application-owned, but they
+       * still sit in the prefix that must be copied when an existing feature
+       * bit is forced.  Copy the complete public loader-layer record after
+       * advancing VK_LAYER_LINK_INFO; never drop or edit it in place. */
+      return sizeof(VkLayerDeviceCreateInfo);
    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
       return sizeof(VkPhysicalDeviceFeatures2);
    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
@@ -3874,6 +3881,28 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          helios_count(HELIOS_CNT_present_refused_surface_lost);
    }
 
+   /* Once every input has been resolved, every exit writes the exact result
+    * array before returning.  A failure of the one common lower submission
+    * affects every otherwise-presentable member because their shared waits
+    * and ownership releases are one indivisible operation. */
+   const auto write_present_results = [&]() {
+      if (pPresentInfo->pResults)
+         for (uint32_t k = 0; k < results.size(); k++)
+            pPresentInfo->pResults[k] = results[k];
+   };
+   const auto fail_all_presentable = [&](const char *reason) -> VkResult {
+      for (uint32_t k = 0; k < items.size(); k++) {
+         if (results[k] != VK_SUCCESS)
+            continue;
+         results[k] = VK_ERROR_DEVICE_LOST;
+         helios_present_fail_slot(items[k].sc,
+                                  items[k].sc->slots[items[k].index]);
+      }
+      write_present_results();
+      return helios_refuse(HELIOS_CNT_present_submit_failed,
+                           VK_ERROR_DEVICE_LOST, reason);
+   };
+
    /* ---- one lower vkQueueSubmit2 on the application's queue ---- */
    std::vector<VkSemaphoreSubmitInfo> waits;
    waits.reserve(pPresentInfo->waitSemaphoreCount);
@@ -3905,8 +3934,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
             VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0);
       }
       if (r != VK_SUCCESS) {
-         helios_count(HELIOS_CNT_present_submit_failed);
-         return VK_ERROR_DEVICE_LOST;
+         return fail_all_presentable("record release barrier");
       }
       VkCommandBufferSubmitInfo cbi = {};
       cbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
@@ -3924,9 +3952,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
    if (!any_presentable) {
       /* Nothing to present: no wait is consumed and no image changes. Report
        * the per-swapchain results and the first error as the aggregate. */
-      if (pPresentInfo->pResults)
-         for (uint32_t k = 0; k < items.size(); k++)
-            pPresentInfo->pResults[k] = results[k];
+      write_present_results();
       for (VkResult r : results)
          if (r != VK_SUCCESS)
             return r;
@@ -3943,15 +3969,10 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
    si.pSignalSemaphoreInfos = signals.empty() ? nullptr : signals.data();
 
    if (dev->disp.QueueSubmit2(queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
-      helios_count(HELIOS_CNT_present_submit_failed);
-      for (uint32_t k = 0; k < items.size(); k++) {
-         if (results[k] == VK_SUCCESS)
-            helios_present_fail_slot(items[k].sc,
-                                     items[k].sc->slots[items[k].index]);
-      }
-      return VK_ERROR_DEVICE_LOST;
+      return fail_all_presentable("common release submit");
    }
 
+   const char *release_state_error = nullptr;
    for (uint32_t k = 0; k < items.size(); k++) {
       if (results[k] != VK_SUCCESS)
          continue;
@@ -3963,9 +3984,9 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          items[k].sc->lost = true;
          if (items[k].sc->state_event)
             SetEvent(items[k].sc->state_event);
-         return helios_refuse(HELIOS_CNT_present_submit_failed,
-                              VK_ERROR_DEVICE_LOST,
-                              "slot changed during common release submit");
+         release_state_error =
+            "slot changed during common release submit";
+         break;
       }
       if (items[k].sc->release_count >=
           items[k].sc->release_fifo.size()) {
@@ -3973,13 +3994,14 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          items[k].sc->lost = true;
          if (items[k].sc->state_event)
             SetEvent(items[k].sc->state_event);
-         return helios_refuse(HELIOS_CNT_present_submit_failed,
-                              VK_ERROR_DEVICE_LOST,
-                              "release FIFO capacity invariant");
+         release_state_error = "release FIFO capacity invariant";
+         break;
       }
       slot.state = HELIOS_SLOT_PRESENT_QUEUED;
       slot.externally_owned = true;
    }
+   if (release_state_error)
+      return fail_all_presentable(release_state_error);
 
    /* ---- the per-(swapchain,image) D3D chain, in input order ----
     * No layer mutex is held across these D3D/DXGI calls (§10.7:2604). */
@@ -4124,9 +4146,7 @@ helios_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
          SetEvent(sc->state_event);
    }
 
-   if (pPresentInfo->pResults)
-      for (uint32_t k = 0; k < items.size(); k++)
-         pPresentInfo->pResults[k] = results[k];
+   write_present_results();
 
    /*
     * §10.7:2691-2695 — after the common release has transferred ownership, a
