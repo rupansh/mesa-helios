@@ -3244,9 +3244,19 @@ vn_semaphore_init_payloads(struct vn_device *dev,
    sem->payload = &sem->permanent;
 
 #if DETECT_OS_WINDOWS
-   (void)win32_export_info_pnext;
-   if (sem->external_handle_types)
-      return VK_ERROR_FEATURE_NOT_PRESENT; /* A6 owns export advertisement. */
+   if (sem->external_handle_types) {
+      if (sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||
+          sem->external_handle_types !=
+             VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT ||
+          win32_export_info_pnext)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+
+      VkResult result = vn_renderer_sync_create(
+         dev->renderer, initial_val, VN_RENDERER_SYNC_SHAREABLE,
+         &sem->permanent.win32_sync);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 #endif
 
    return VK_SUCCESS;
@@ -4548,9 +4558,31 @@ vn_GetSemaphoreWin32HandleKHR(
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
-   (void)pGetWin32HandleInfo;
+   if (!pHandle)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
    *pHandle = NULL;
-   return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   if (!pGetWin32HandleInfo)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   struct vn_semaphore *sem =
+      vn_semaphore_from_handle(pGetWin32HandleInfo->semaphore);
+   if (!sem || sem->base.vk.device != &dev->base.vk ||
+       sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||
+       pGetWin32HandleInfo->handleType !=
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT ||
+       !(sem->external_handle_types & pGetWin32HandleInfo->handleType) ||
+       sem->payload != &sem->permanent ||
+       !sem->permanent.win32_sync)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   void *handle = NULL;
+   VkResult result = vn_renderer_helios_sync_export_win32(
+      dev->renderer, sem->permanent.win32_sync,
+      pGetWin32HandleInfo->handleType, &handle);
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, result);
+   *pHandle = (HANDLE)handle;
+   return VK_SUCCESS;
 }
 #endif
 

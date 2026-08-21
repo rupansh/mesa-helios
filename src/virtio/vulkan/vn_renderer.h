@@ -264,9 +264,15 @@ vn_renderer_helios_sync_create_from_win32(
    void *handle,
    struct vn_renderer_sync **out_sync);
 
-/* The imported local handle is deliberately not exportable or nameable. */
 uint32_t
 vn_renderer_helios_sync_handle(const struct vn_renderer_sync *sync);
+
+VkResult
+vn_renderer_helios_sync_export_win32(
+   struct vn_renderer *renderer,
+   struct vn_renderer_sync *sync,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void **out_handle);
 #endif
 
 struct vn_renderer {

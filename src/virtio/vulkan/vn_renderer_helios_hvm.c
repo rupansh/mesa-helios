@@ -17,6 +17,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <windows.h>
+#include <winternl.h>
 
 #include "vn_renderer.h"
 #ifndef _NTDEF_
@@ -513,15 +514,59 @@ helios_bo_cache_op(struct vn_renderer *renderer,
 static VkResult
 helios_sync_create(struct vn_renderer *renderer,
                    uint64_t initial_value,
-                   uint32_t flags,
-                   struct vn_renderer_sync **out_sync)
+   uint32_t flags,
+   struct vn_renderer_sync **out_sync)
 {
    *out_sync = NULL;
-   if (initial_value || (flags & VN_RENDERER_SYNC_SHAREABLE))
+   const uint32_t known_flags =
+      VN_RENDERER_SYNC_SHAREABLE | VN_RENDERER_SYNC_BINARY;
+   if ((flags & ~known_flags) ||
+       ((flags & VN_RENDERER_SYNC_SHAREABLE) &&
+        (flags & VN_RENDERER_SYNC_BINARY)))
       return VK_ERROR_FEATURE_NOT_PRESENT;
    struct helios_sync *sync = calloc(1, sizeof(*sync));
    if (!sync)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   if (flags & VN_RENDERER_SYNC_SHAREABLE) {
+      struct helios *helios = helios_from_renderer(renderer);
+      D3DKMT_CREATESYNCHRONIZATIONOBJECT2 create;
+      memset(&create, 0, sizeof(create));
+      create.hDevice = helios->device;
+      create.Info.Type = D3DDDI_MONITORED_FENCE;
+      create.Info.Flags.Shared = 1;
+      create.Info.Flags.NtSecuritySharing = 1;
+      create.Info.MonitoredFence.InitialFenceValue = initial_value;
+      create.Info.MonitoredFence.EngineAffinity = 1u;
+      const NTSTATUS st = D3DKMTCreateSynchronizationObject2(&create);
+      if (st != 0 || !create.hSyncObject ||
+          !create.Info.MonitoredFence.FenceValueCPUVirtualAddress ||
+          !create.Info.MonitoredFence.FenceValueGPUVirtualAddress) {
+         if (create.hSyncObject) {
+            D3DKMT_DESTROYSYNCHRONIZATIONOBJECT destroy = {
+               .hSyncObject = create.hSyncObject,
+            };
+            HELIOS_IGNORE_STATUS(
+               D3DKMTDestroySynchronizationObject(&destroy));
+         }
+         free(sync);
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+      sync->sync = create.hSyncObject;
+      sync->mapping.CurrentValueCpuVa =
+         create.Info.MonitoredFence.FenceValueCPUVirtualAddress;
+      sync->mapping.CurrentValueGpuVa =
+         create.Info.MonitoredFence.FenceValueGPUVirtualAddress;
+      sync->native = true;
+      sync->base.allocation_handle = create.hSyncObject;
+      *out_sync = &sync->base;
+      return VK_SUCCESS;
+   }
+
+   if (initial_value) {
+      free(sync);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
    VkResult result = helios_allocation_create(
       helios_from_renderer(renderer), HELIOS_PAGE_BYTES,
       HELIOS_HVM1_ROLE_FEEDBACK, &sync->feedback);
@@ -586,13 +631,24 @@ helios_sync_read(struct vn_renderer *renderer,
 
 static VkResult
 helios_sync_write(struct vn_renderer *renderer,
-                  struct vn_renderer_sync *sync,
+                  struct vn_renderer_sync *base,
                   uint64_t value)
 {
-   (void)renderer;
-   (void)sync;
-   (void)value;
-   return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct helios_sync *sync = (struct helios_sync *)base;
+   if (!sync->native || !sync->sync)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+   struct helios *helios = helios_from_renderer(renderer);
+   D3DKMT_HANDLE object = sync->sync;
+   UINT64 fence_value = value;
+   D3DKMT_SIGNALSYNCHRONIZATIONOBJECTFROMCPU signal;
+   memset(&signal, 0, sizeof(signal));
+   signal.hDevice = helios->device;
+   signal.ObjectCount = 1;
+   signal.ObjectHandleArray = &object;
+   signal.FenceValueArray = &fence_value;
+   return D3DKMTSignalSynchronizationObjectFromCpu(&signal) == 0
+             ? VK_SUCCESS
+             : VK_ERROR_DEVICE_LOST;
 }
 
 static uint16_t
@@ -734,6 +790,38 @@ vn_renderer_helios_sync_handle(const struct vn_renderer_sync *base)
 {
    const struct helios_sync *sync = (const struct helios_sync *)base;
    return sync && sync->native ? sync->sync : 0;
+}
+
+VkResult
+vn_renderer_helios_sync_export_win32(
+   struct vn_renderer *renderer,
+   struct vn_renderer_sync *base,
+   VkExternalSemaphoreHandleTypeFlagBits handle_type,
+   void **out_handle)
+{
+   (void)renderer;
+   if (out_handle)
+      *out_handle = NULL;
+   struct helios_sync *sync = (struct helios_sync *)base;
+   if (!out_handle || !sync || !sync->native || !sync->sync ||
+       handle_type !=
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   D3DKMT_HANDLE object = sync->sync;
+   OBJECT_ATTRIBUTES attributes;
+   memset(&attributes, 0, sizeof(attributes));
+   attributes.Length = sizeof(attributes);
+   HANDLE handle = NULL;
+   const NTSTATUS st =
+      D3DKMTShareObjects(1, &object, &attributes, GENERIC_ALL, &handle);
+   if (st != 0 || !handle) {
+      if (handle)
+         CloseHandle(handle);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+   *out_handle = handle;
+   return VK_SUCCESS;
 }
 
 static void

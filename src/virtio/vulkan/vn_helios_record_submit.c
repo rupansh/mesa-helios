@@ -745,9 +745,10 @@ helios_classify_semaphore(struct vn_device *dev,
    if (!sem->payload)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    *out_native = false;
-   if (sem->payload->type != VN_SYNC_TYPE_IMPORTED_WIN32_SYNC)
-      return VK_SUCCESS;
    if (!sem->payload->win32_sync)
+      return VK_SUCCESS;
+   if (sem->payload->type != VN_SYNC_TYPE_IMPORTED_WIN32_SYNC &&
+       sem->payload != &sem->permanent)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    const uint32_t native =
       vn_renderer_helios_sync_handle(sem->payload->win32_sync);
@@ -1675,8 +1676,7 @@ helios_scope_track_fence_and_submit1_signals(
       for (uint32_t i = 0; i < submit->signalSemaphoreCount; i++) {
          struct vn_semaphore *sem =
             vn_semaphore_from_handle(submit->pSignalSemaphores[i]);
-         if (sem && sem->payload &&
-             sem->payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC)
+         if (sem && sem->payload && sem->payload->win32_sync)
             continue;
          const uint64_t value =
             sem && sem->type == VK_SEMAPHORE_TYPE_TIMELINE
@@ -1720,8 +1720,7 @@ helios_scope_track_fence_and_submit2_signals(
             &submit->pSignalSemaphoreInfos[i];
          struct vn_semaphore *sem =
             vn_semaphore_from_handle(info->semaphore);
-         if (sem && sem->payload &&
-             sem->payload->type == VN_SYNC_TYPE_IMPORTED_WIN32_SYNC)
+         if (sem && sem->payload && sem->payload->win32_sync)
             continue;
          const uint64_t value =
             sem && sem->type == VK_SEMAPHORE_TYPE_TIMELINE ? info->value : 1;

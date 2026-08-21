@@ -3528,7 +3528,7 @@ vn_GetPhysicalDeviceExternalSemaphoreProperties(
          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
       pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
       pExternalSemaphoreProperties->externalSemaphoreFeatures =
-         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;
       return;
    }
 #endif

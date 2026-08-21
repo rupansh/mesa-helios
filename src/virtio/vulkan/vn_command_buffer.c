@@ -256,10 +256,6 @@ vn_cmd_fix_image_memory_barrier_common(const struct vn_image *img,
        * next-layer GDPA path.  PRESENT is meaningful for that exact tag only
        * as the reciprocal GENERAL <-> EXTERNAL ownership pair.  FOREIGN_EXT
        * is never accepted as an approximation. */
-      if (img->base.vk.sharing_mode != VK_SHARING_MODE_EXCLUSIVE) {
-         result.valid = false;
-         return result;
-      }
       if (*old_layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
          /* Present releases the exact tagged image from the canonical Vulkan
           * family to the external D3D12 owner.  Keep the wire-visible layout

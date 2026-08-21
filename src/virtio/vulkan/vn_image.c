@@ -1405,7 +1405,6 @@ vn_SetHeliosPresentableImageHELIOS(VkDevice device,
    struct vn_image *img = vn_image_from_handle(image);
 
    if (!img || img->base.vk.base.device != &dev->base.vk || !swapchainId ||
-       img->base.vk.sharing_mode != VK_SHARING_MODE_EXCLUSIVE ||
        vn_helios_submit_instance_mode(dev->instance) ==
           VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
       return vn_error(dev->instance, VK_ERROR_INITIALIZATION_FAILED);

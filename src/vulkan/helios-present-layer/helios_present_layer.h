@@ -112,7 +112,7 @@ extern "C" {
    X(physdev_refused_api_below_13)                                            \
    X(physdev_refused_no_external_image_import)                                \
    X(physdev_refused_no_external_image_dedicated)                             \
-   X(physdev_refused_no_external_semaphore_import)                            \
+   X(physdev_refused_no_external_semaphore_export)                            \
    X(physdev_refused_no_canonical_family)                                     \
    X(physdev_refused_queue_capacity)                                          \
    X(physdev_refused_no_luid)                                                 \
@@ -152,8 +152,8 @@ extern "C" {
    X(swapchain_refused_colorspace_support)                                    \
    X(swapchain_refused_shared_resource)                                       \
    X(swapchain_refused_shared_handle)                                         \
-   X(swapchain_refused_fence_create)                                          \
-   X(swapchain_refused_fence_share)                                           \
+   X(swapchain_refused_semaphore_export)                                      \
+   X(swapchain_refused_fence_open)                                            \
    X(swapchain_refused_command_objects)                                       \
    X(swapchain_refused_image_create)                                          \
    X(swapchain_refused_memory_properties)                                     \
@@ -161,7 +161,6 @@ extern "C" {
    X(swapchain_refused_memory_import)                                         \
    X(swapchain_refused_memory_bind)                                           \
    X(swapchain_refused_semaphore_create)                                      \
-   X(swapchain_refused_semaphore_import)                                      \
    X(swapchain_refused_vk_command_objects)                                    \
    X(swapchain_refused_alloc)                                                 \
    X(acquire_refused_unknown_swapchain)                                       \

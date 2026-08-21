@@ -213,7 +213,7 @@ struct HeliosDeviceDispatch {
    PFN_vkGetMemoryWin32HandlePropertiesKHR GetMemoryWin32HandlePropertiesKHR;
    PFN_vkCreateSemaphore CreateSemaphore;
    PFN_vkDestroySemaphore DestroySemaphore;
-   PFN_vkImportSemaphoreWin32HandleKHR ImportSemaphoreWin32HandleKHR;
+   PFN_vkGetSemaphoreWin32HandleKHR GetSemaphoreWin32HandleKHR;
    PFN_vkCreateFence CreateFence;
    PFN_vkDestroyFence DestroyFence;
    PFN_vkWaitForFences WaitForFences;
@@ -1124,17 +1124,13 @@ helios_admit_compute(HeliosInstance *inst, VkPhysicalDevice phys,
       return;
    }
 
-   /* --- exact external-semaphore query: D3D12_FENCE_BIT IMPORTABLE --- */
+   /* --- exact external-semaphore query: D3D12_FENCE_BIT EXPORTABLE --- */
    /*
     * The query must describe the semaphore this layer will actually create.
-    * §10.3:1170-1178 creates Ready[i]/Release[i] with
-    * VkSemaphoreTypeCreateInfo{TIMELINE, initialValue=0} and then imports
-    * D3D12_FENCE_BIT into them, so the capability question is about a TIMELINE
-    * semaphore. Omitting this chain asks about a BINARY one — a semaphore this
-    * layer never creates — and a driver is entitled to answer differently:
-    * measured on the Helios ICD 2026-08-10, D3D12_FENCE_BIT is importable for
-    * timeline semaphores and absent for binary ones, so the unchained query
-    * refused a device that satisfies the contract.
+    * F8 corrected the sharing direction: Ready[i]/Release[i] are lower-Vulkan
+    * timeline semaphores exported as D3D12_FENCE_BIT, then opened by the exact
+    * D3D12 device.  Omitting the type chain asks about a binary semaphore and
+    * therefore does not establish the capability this layer uses.
     */
    VkSemaphoreTypeCreateInfo sem_type_info = {};
    sem_type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -1149,16 +1145,16 @@ helios_admit_compute(HeliosInstance *inst, VkPhysicalDevice phys,
    sem_props.sType = VK_STRUCTURE_TYPE_EXTERNAL_SEMAPHORE_PROPERTIES;
    if (!inst->disp.GetPhysicalDeviceExternalSemaphoreProperties) {
       info.reject_reason = "no vkGetPhysicalDeviceExternalSemaphoreProperties";
-      helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_import,
+      helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_export,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
       return;
    }
    inst->disp.GetPhysicalDeviceExternalSemaphoreProperties(phys, &sem_info,
                                                            &sem_props);
    if (!(sem_props.externalSemaphoreFeatures &
-         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT)) {
-      info.reject_reason = "D3D12_FENCE_BIT not IMPORTABLE";
-      helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_import,
+         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)) {
+      info.reject_reason = "D3D12_FENCE_BIT not EXPORTABLE";
+      helios_refuse(HELIOS_CNT_physdev_refused_no_external_semaphore_export,
                     VK_ERROR_INITIALIZATION_FAILED, info.reject_reason);
       return;
    }
@@ -2072,7 +2068,7 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
                "vkGetMemoryWin32HandlePropertiesKHR");
    HELIOS_GDPA(CreateSemaphore, "vkCreateSemaphore");
    HELIOS_GDPA(DestroySemaphore, "vkDestroySemaphore");
-   HELIOS_GDPA(ImportSemaphoreWin32HandleKHR, "vkImportSemaphoreWin32HandleKHR");
+   HELIOS_GDPA(GetSemaphoreWin32HandleKHR, "vkGetSemaphoreWin32HandleKHR");
    HELIOS_GDPA(CreateFence, "vkCreateFence");
    HELIOS_GDPA(DestroyFence, "vkDestroyFence");
    HELIOS_GDPA(WaitForFences, "vkWaitForFences");
@@ -2135,7 +2131,7 @@ helios_CreateDevice(VkPhysicalDevice physicalDevice,
          { (const void *)dev->disp.GetMemoryWin32HandlePropertiesKHR, "vkGetMemoryWin32HandlePropertiesKHR" },
          { (const void *)dev->disp.CreateSemaphore, "vkCreateSemaphore" },
          { (const void *)dev->disp.DestroySemaphore, "vkDestroySemaphore" },
-         { (const void *)dev->disp.ImportSemaphoreWin32HandleKHR, "vkImportSemaphoreWin32HandleKHR" },
+         { (const void *)dev->disp.GetSemaphoreWin32HandleKHR, "vkGetSemaphoreWin32HandleKHR" },
          { (const void *)dev->disp.CreateCommandPool, "vkCreateCommandPool" },
          { (const void *)dev->disp.DestroyCommandPool, "vkDestroyCommandPool" },
          { (const void *)dev->disp.ResetCommandPool, "vkResetCommandPool" },
@@ -2389,30 +2385,22 @@ helios_slot_teardown(HeliosDevice *dev, HeliosSlot &slot)
    }
 }
 
-/* Creates one D3D12 fence, exports it, imports it as a permanent timeline
- * semaphore, and closes the transient handle (§10.3:1180-1188, §10.7:2563-2570). */
+/* Creates one exportable lower-Vulkan timeline semaphore, exports its
+ * D3D12_FENCE_BIT NT handle, opens that exact object on the owning D3D12
+ * device, and closes the transient handle on every path (F8). */
 static bool
-helios_import_fence(HeliosDevice *dev, ID3D12Device *d3d, ID3D12Fence **out_fence,
-                    VkSemaphore *out_sem)
+helios_export_fence(HeliosDevice *dev, ID3D12Device *d3d,
+                    ID3D12Fence **out_fence, VkSemaphore *out_sem)
 {
-   ID3D12Fence *fence = nullptr;
-   if (FAILED(d3d->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence))) ||
-       !fence) {
-      helios_refuse(HELIOS_CNT_swapchain_refused_fence_create,
-                    VK_ERROR_INITIALIZATION_FAILED, "CreateFence");
-      return false;
-   }
-   HANDLE h = nullptr;
-   if (FAILED(d3d->CreateSharedHandle(fence, nullptr, GENERIC_ALL, nullptr, &h)) ||
-       !h) {
-      fence->Release();
-      helios_refuse(HELIOS_CNT_swapchain_refused_fence_share,
-                    VK_ERROR_INITIALIZATION_FAILED, "CreateSharedHandle(fence)");
-      return false;
-   }
-
+   *out_fence = nullptr;
+   *out_sem = VK_NULL_HANDLE;
+   VkExportSemaphoreCreateInfo export_info = {};
+   export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+   export_info.handleTypes =
+      VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
    VkSemaphoreTypeCreateInfo type = {};
    type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+   type.pNext = &export_info;
    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
    type.initialValue = 0;
    VkSemaphoreCreateInfo sci = {};
@@ -2421,31 +2409,39 @@ helios_import_fence(HeliosDevice *dev, ID3D12Device *d3d, ID3D12Fence **out_fenc
 
    VkSemaphore sem = VK_NULL_HANDLE;
    if (dev->disp.CreateSemaphore(dev->device, &sci, nullptr, &sem) != VK_SUCCESS) {
-      CloseHandle(h);
-      fence->Release();
       helios_refuse(HELIOS_CNT_swapchain_refused_semaphore_create,
                     VK_ERROR_INITIALIZATION_FAILED, nullptr);
       return false;
    }
 
-   VkImportSemaphoreWin32HandleInfoKHR imp = {};
-   imp.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR;
-   imp.semaphore = sem;
-   imp.flags = 0; /* permanent import */
-   imp.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
-   imp.handle = h;
-   imp.name = nullptr;
-   VkResult r = dev->disp.ImportSemaphoreWin32HandleKHR(dev->device, &imp);
-
-   /* Win32 semaphore import does not transfer NT-handle ownership, so closing
-    * the transient handle after a successful import is mandatory
-    * (§10.3:1186-1188). */
-   CloseHandle(h);
-   if (r != VK_SUCCESS) {
+   VkSemaphoreGetWin32HandleInfoKHR get = {};
+   get.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+   get.semaphore = sem;
+   get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+   HANDLE h = nullptr;
+   VkResult r =
+      dev->disp.GetSemaphoreWin32HandleKHR(dev->device, &get, &h);
+   if (r != VK_SUCCESS || !h) {
+      if (h)
+         CloseHandle(h);
       dev->disp.DestroySemaphore(dev->device, sem, nullptr);
-      fence->Release();
-      helios_refuse(HELIOS_CNT_swapchain_refused_semaphore_import,
-                    VK_ERROR_INITIALIZATION_FAILED, nullptr);
+      helios_refuse(HELIOS_CNT_swapchain_refused_semaphore_export,
+                    VK_ERROR_INITIALIZATION_FAILED,
+                    "vkGetSemaphoreWin32HandleKHR");
+      return false;
+   }
+
+   ID3D12Fence *fence = nullptr;
+   const HRESULT hr =
+      d3d->OpenSharedHandle(h, IID_PPV_ARGS(&fence));
+   CloseHandle(h);
+   h = nullptr;
+   if (FAILED(hr) || !fence) {
+      helios_com_release(fence);
+      dev->disp.DestroySemaphore(dev->device, sem, nullptr);
+      helios_refuse(HELIOS_CNT_swapchain_refused_fence_open,
+                    VK_ERROR_INITIALIZATION_FAILED,
+                    "ID3D12Device::OpenSharedHandle");
       return false;
    }
 
@@ -2575,13 +2571,13 @@ static bool
 helios_create_slot_recording_objects(HeliosDevice *dev, ID3D12Device *d3d,
                                      HeliosSlot &slot)
 {
-   if (FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+   if (FAILED(d3d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
                                           IID_PPV_ARGS(&slot.alloc)))) {
       helios_refuse(HELIOS_CNT_swapchain_refused_command_objects,
                     VK_ERROR_INITIALIZATION_FAILED, "CreateCommandAllocator");
       return false;
    }
-   if (FAILED(d3d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.alloc,
+   if (FAILED(d3d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, slot.alloc,
                                      nullptr, IID_PPV_ARGS(&slot.list)))) {
       helios_refuse(HELIOS_CNT_swapchain_refused_command_objects,
                     VK_ERROR_INITIALIZATION_FAILED, "CreateCommandList");
@@ -2764,7 +2760,7 @@ helios_CreateSwapchainKHR(VkDevice device,
 
    /* ---- D3D12 queue + DXGI flip-model swapchain --------------------- */
    D3D12_COMMAND_QUEUE_DESC qdesc = {};
-   qdesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+   qdesc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
    qdesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
    qdesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
    qdesc.NodeMask = 0;
@@ -2886,8 +2882,8 @@ helios_CreateSwapchainKHR(VkDevice device,
          return helios_refuse(HELIOS_CNT_swapchain_refused_shared_handle,
                               VK_ERROR_INITIALIZATION_FAILED, "CreateSharedHandle");
       }
-      if (!helios_import_fence(dev, d3d, &slot.ready, &slot.ready_sem) ||
-          !helios_import_fence(dev, d3d, &slot.release, &slot.release_sem) ||
+      if (!helios_export_fence(dev, d3d, &slot.ready, &slot.ready_sem) ||
+          !helios_export_fence(dev, d3d, &slot.release, &slot.release_sem) ||
           !helios_create_slot_recording_objects(dev, d3d, slot) ||
           !helios_import_image(dev, sc, slot, i)) {
          helios_destroy_swapchain_locked(sc);
