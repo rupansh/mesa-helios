@@ -284,11 +284,30 @@ vn_buffer_init(struct vn_device *dev,
       return VK_SUCCESS;
    }
 
-   /* If cache miss or not cacheable, make synchronous call */
-   result = vn_call_vkCreateBuffer(dev->primary_ring, dev_handle, create_info,
-                                   NULL, &buf_handle);
-   if (result != VK_SUCCESS)
-      return result;
+   /* The record-only Windows transport gives every replyless control command
+    * a real C51 terminal before this call returns.  Do not request the
+    * redundant output-handle reply for vkCreateBuffer there: the guest already
+    * assigned buf_handle, and the K11 private reply path otherwise observes no
+    * matching opcode for this first uncached create.  The immediately
+    * following synchronous requirements query names that exact handle, so it
+    * both proves host object creation and supplies the uncached result.  Normal
+    * loader instances retain the stock synchronous create path.
+    */
+#if DETECT_OS_WINDOWS
+   const bool record_only =
+      vn_helios_submit_instance_mode(dev->instance) ==
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   if (record_only) {
+      vn_async_vkCreateBuffer(dev->primary_ring, dev_handle, create_info,
+                              NULL, &buf_handle);
+   } else
+#endif
+   {
+      result = vn_call_vkCreateBuffer(dev->primary_ring, dev_handle,
+                                      create_info, NULL, &buf_handle);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    buf->requirements.memory.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
    buf->requirements.memory.pNext = &buf->requirements.dedicated;
@@ -303,6 +322,13 @@ vn_buffer_init(struct vn_device *dev,
          .buffer = buf_handle,
       },
       &buf->requirements.memory);
+#if DETECT_OS_WINDOWS
+   if (record_only &&
+       (!buf->requirements.memory.memoryRequirements.size ||
+        !buf->requirements.memory.memoryRequirements.alignment ||
+        !buf->requirements.memory.memoryRequirements.memoryTypeBits))
+      return VK_ERROR_DEVICE_LOST;
+#endif
    vn_physical_device_sanitize_memory_requirements(
       dev->physical_device,
       &buf->requirements.memory.memoryRequirements);
