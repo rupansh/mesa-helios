@@ -10,6 +10,8 @@
 
 #include "vn_device_memory.h"
 
+void vn_renderer_helios_diag_log(const char *fmt, ...);
+
 #include "venus-protocol/vn_protocol_driver_device_memory.h"
 #include "venus-protocol/vn_protocol_driver_transport.h"
 #include "vk_debug_utils.h"
@@ -574,22 +576,57 @@ vn_device_memory_defer_outer_allocate(
       .memoryTypeIndex = clean_info.alloc.memoryTypeIndex,
    };
    VkDeviceMemory memory = vn_device_memory_to_handle(mem);
-   const size_t payload_bytes = vn_sizeof_vkAllocateMemory(
+   const size_t generated_bytes = vn_sizeof_vkAllocateMemory(
       vn_device_to_handle(dev), &local, NULL, &memory);
-   if (!payload_bytes || payload_bytes > HELIOS_HOB1_MAX_BYTES)
+   if (!generated_bytes ||
+       generated_bytes > HELIOS_HOB1_MAX_BYTES ||
+       sizeof(clean_info) > HELIOS_HOB1_MAX_BYTES - generated_bytes) {
+      vn_renderer_helios_diag_log("HAM1 defer arm=size generated=%zu",
+                                  generated_bytes);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
-   uint8_t *payload = malloc(payload_bytes);
+   /* The normalized chain can contain at most the members held by clean_info.
+    * Use that whole fixed storage as bounded encoder headroom, then seal only
+    * the measured byte count below.  This keeps an encoder/sizeof disagreement
+    * from becoming an unchecked write without allocating HOB1's 15 MiB limit
+    * for every ordinary resource. */
+   const size_t payload_capacity = generated_bytes + sizeof(clean_info);
+   uint8_t *payload = malloc(payload_capacity);
    if (!payload)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   /* Encode the exact generated command components directly.  The generated
+    * vkAllocateMemory wrapper emitted 136 bytes for its own 120-byte size on
+    * the Windows record-only dedicated-buffer chain, corrupting the process
+    * heap before the first D3D resource could be admitted.  These are the same
+    * schema components in the same order; the measured terminal length, not
+    * the faulty generated size, defines the sealed deferred record. */
    struct vn_cs_encoder encoder =
-      VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_bytes);
-   vn_encode_vkAllocateMemory(&encoder, 0, vn_device_to_handle(dev),
-                              &local, NULL, &memory);
+      VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_capacity);
+   const VkCommandTypeEXT command_type = VK_COMMAND_TYPE_vkAllocateMemory_EXT;
+   const VkFlags command_flags = 0;
+   const VkDevice device = vn_device_to_handle(dev);
+   vn_encode_VkCommandTypeEXT(&encoder, &command_type);
+   vn_encode_VkFlags(&encoder, &command_flags);
+   vn_encode_VkDevice(&encoder, &device);
+   vn_encode_simple_pointer(&encoder, &local);
+   vn_encode_VkStructureType(&encoder, &local.sType);
+   vn_encode_VkMemoryAllocateInfo_pnext(&encoder, local.pNext);
+   vn_encode_VkMemoryAllocateInfo_self(&encoder, &local);
+   vn_encode_simple_pointer(&encoder, NULL);
+   vn_encode_simple_pointer(&encoder, &memory);
+   vn_encode_VkDeviceMemory(&encoder, &memory);
+   const size_t payload_bytes = vn_cs_encoder_get_len(&encoder);
    if (vn_cs_encoder_get_fatal(&encoder) ||
-       vn_cs_encoder_get_len(&encoder) != payload_bytes) {
+       !payload_bytes || payload_bytes > payload_capacity ||
+       payload_bytes > HELIOS_HOB1_MAX_BYTES) {
+      vn_renderer_helios_diag_log(
+         "HAM1 defer arm=encode fatal=%d bytes=%zu generated=%zu cap=%zu",
+         vn_cs_encoder_get_fatal(&encoder) ? 1 : 0, payload_bytes,
+         generated_bytes, payload_capacity);
       free(payload);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_INITIALIZATION_FAILED;
    }
 
    const size_t chain_bytes =
@@ -606,6 +643,9 @@ vn_device_memory_defer_outer_allocate(
    if (payload_bytes < sizeof(uint32_t) ||
        operand_offset > payload_bytes - sizeof(uint32_t) ||
        placeholder != 0) {
+      vn_renderer_helios_diag_log(
+         "HAM1 defer arm=operand off=%u bytes=%zu placeholder=0x%08x",
+         operand_offset, payload_bytes, placeholder);
       free(payload);
       return VK_ERROR_INITIALIZATION_FAILED;
    }
@@ -1189,6 +1229,13 @@ vn_AllocateMemory(VkDevice device,
    VkResult association_result =
       vn_device_memory_reserve_outer_association(dev, mem, pAllocateInfo);
    if (association_result != VK_SUCCESS) {
+      vn_renderer_helios_diag_log(
+         "HAM1 vkAllocateMemory ASSOC-REFUSED result=%d size=%llu type=%u "
+         "mode=%d",
+         association_result,
+         (unsigned long long)pAllocateInfo->allocationSize,
+         pAllocateInfo->memoryTypeIndex,
+         (int)vn_helios_submit_instance_mode(dev->instance));
       vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
       return vn_error(dev->instance, association_result);
    }
@@ -1263,6 +1310,12 @@ vn_AllocateMemory(VkDevice device,
 
    if (result != VK_SUCCESS) {
 #ifdef _WIN32
+      vn_renderer_helios_diag_log(
+         "HAM1 vkAllocateMemory FAILED result=%d size=%llu type=%u assoc=%d "
+         "mode=%d",
+         result, (unsigned long long)pAllocateInfo->allocationSize,
+         pAllocateInfo->memoryTypeIndex, mem->helios_outer_registered ? 1 : 0,
+         (int)vn_helios_submit_instance_mode(dev->instance));
       (void)vn_device_memory_release_outer_association(dev, mem);
 #endif
       vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
@@ -1308,14 +1361,15 @@ vn_FreeMemory(VkDevice device,
    const bool host_materialized = mem->helios_host_materialized;
 
    if (record_only) {
-      /* S_FALSE from the package-owned outer begin edge means this exact
-       * allocation never appeared in an accepted batch. There is no host
-       * namespace object to destroy and no context to join: discard its
-       * unconsumed immutable records and retire local ownership directly. An
-       * active scope distinguishes the ordinary first-and-terminal batch,
-       * where allocation and free must still be emitted together. */
-      if (!host_materialized &&
-          !vn_helios_record_has_active_scope(dev->instance)) {
+      /* An allocation that never appeared in an accepted batch has no host
+       * namespace object to destroy and no queue milestone to join.  Discard
+       * its unconsumed immutable records and retire local ownership directly,
+       * including when DXVK opened a teardown scope before issuing Destroy and
+       * Free.  Emitting allocate/bind/destroy/free into that empty scope would
+       * create an allocation-only A7 stream with no real final queue operation
+       * (measured as Nr2OuterRej reason Schema on the bounded create/destroy
+       * probe).  The scope consequently remains empty and closes ABANDONED. */
+      if (!host_materialized) {
          const VkAllocationCallbacks *free_alloc =
             pAllocator ? pAllocator : &dev->base.vk.alloc;
          mem->helios_free_allocator = *free_alloc;
