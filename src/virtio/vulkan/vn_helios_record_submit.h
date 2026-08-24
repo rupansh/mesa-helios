@@ -200,5 +200,25 @@ vn_helios_query_pool_progress(struct vn_query_pool *pool,
                               uint64_t *context_generation,
                               uint64_t *progress_value);
 
+/* A7 object-materialization lane.  In record-only mode, object commands that
+ * dereference an outer allocation on the host (image/buffer view create and
+ * destroy, descriptor-set updates) queue on the device and ride the next
+ * sealed outer batch after its deferred allocate/bind records.  `payload` is
+ * a malloc'd complete generated venus command; ownership transfers on
+ * VK_SUCCESS.  `deps` names the referenced outer bindings so the consuming
+ * batch adds a use record for any dependency whose allocate/bind records are
+ * still pending, splicing them into the same batch. */
+VkResult
+vn_helios_record_defer_object_command(
+   struct vn_device *dev,
+   void *payload,
+   uint64_t payload_bytes,
+   const struct vn_helios_memory_binding *deps,
+   uint32_t dep_count);
+
+/* Device teardown: free never-consumed object commands. */
+void
+vn_helios_record_drop_object_commands(struct vn_device *dev);
+
 #endif /* _WIN32 */
 #endif /* VN_HELIOS_RECORD_SUBMIT_H */

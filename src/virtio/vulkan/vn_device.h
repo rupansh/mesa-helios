@@ -73,6 +73,15 @@ struct vn_device {
    uint32_t helios_outer_allocation_count;
    struct list_head helios_address_buffers;
    uint32_t helios_address_buffer_count;
+   /* A7 object-materialization lane: view creates/destroys and descriptor
+    * updates dereference outer allocations on the host, so in record-only
+    * mode they queue here and ride the next sealed outer batch after the
+    * deferred allocate/bind records (HVC1 is unordered against pending
+    * batches — measured 2026-08-24 as host-side view creates on unbound
+    * images). Covered by `mutex`. */
+   struct list_head helios_object_commands;
+   uint32_t helios_object_command_count;
+   uint64_t helios_object_command_bytes;
 #endif
 
    simple_mtx_t mutex;

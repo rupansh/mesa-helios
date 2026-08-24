@@ -717,6 +717,9 @@ vn_device_init(struct vn_device *dev,
    dev->helios_outer_allocation_count = 0;
    list_inithead(&dev->helios_address_buffers);
    dev->helios_address_buffer_count = 0;
+   list_inithead(&dev->helios_object_commands);
+   dev->helios_object_command_count = 0;
+   dev->helios_object_command_bytes = 0;
 #endif
 
    return VK_SUCCESS;
@@ -856,6 +859,9 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    assert(dev->helios_outer_allocation_count == 0);
    assert(list_is_empty(&dev->helios_address_buffers));
    assert(dev->helios_address_buffer_count == 0);
+   /* Object commands still pending at device destruction never reached the
+    * host; the renderer context teardown reclaims their host twins. */
+   vn_helios_record_drop_object_commands(dev);
 #endif
    simple_mtx_destroy(&dev->mutex);
    vk_free(alloc, dev);

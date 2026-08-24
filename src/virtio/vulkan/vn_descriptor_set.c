@@ -18,7 +18,9 @@
 #include "vn_device.h"
 #if DETECT_OS_WINDOWS
 #include "vn_buffer.h"
+#include "vn_cs.h"
 #include "vn_image.h"
+#include "vn_helios_hwa2.h"
 #include "vn_helios_record_submit.h"
 #endif
 #include "vn_pipeline.h"
@@ -1066,6 +1068,134 @@ helios_descriptor_from_write(struct vn_device *dev,
    }
 }
 
+static bool
+helios_descriptor_update_add_dep(struct vn_helios_memory_binding **deps,
+                                 uint32_t *dep_count,
+                                 uint32_t *dep_capacity,
+                                 const struct vn_helios_memory_binding *dep)
+{
+   if (!dep->valid)
+      return true;
+   for (uint32_t i = 0; i < *dep_count; i++) {
+      if ((*deps)[i].outer_allocation_token == dep->outer_allocation_token)
+         return true;
+   }
+   if (*dep_count == *dep_capacity) {
+      uint32_t capacity = *dep_capacity ? *dep_capacity * 2u : 8u;
+      void *grown = realloc(*deps, capacity * sizeof(**deps));
+      if (!grown)
+         return false;
+      *deps = grown;
+      *dep_capacity = capacity;
+   }
+   (*deps)[(*dep_count)++] = *dep;
+   return true;
+}
+
+/* A7 object-materialization lane: a host descriptor write dereferences the
+ * referenced views/buffers, so in record-only mode every update rides the
+ * next sealed outer batch — after any still-pending view creates it names
+ * (FIFO order) and after the allocate/bind records its deps splice in.  A
+ * ring-borne update would overtake both (see vn_CreateImageView). */
+static void
+helios_defer_descriptor_update(struct vn_device *dev,
+                               VkDevice device,
+                               uint32_t write_count,
+                               const VkWriteDescriptorSet *writes,
+                               uint32_t copy_count,
+                               const VkCopyDescriptorSet *copies)
+{
+   struct vn_helios_memory_binding *deps = NULL;
+   uint32_t dep_count = 0;
+   uint32_t dep_capacity = 0;
+   bool ok = true;
+
+   for (uint32_t w = 0; w < write_count && ok; w++) {
+      const VkWriteDescriptorSet *write = &writes[w];
+      switch (write->descriptorType) {
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         for (uint32_t j = 0; j < write->descriptorCount && ok; j++) {
+            const struct vn_image_view *view =
+               vn_image_view_from_handle(write->pImageInfo[j].imageView);
+            if (!view || !view->image)
+               continue;
+            for (uint32_t p = 0;
+                 p < ARRAY_SIZE(view->image->helios_bindings) && ok; p++) {
+               ok = helios_descriptor_update_add_dep(
+                  &deps, &dep_count, &dep_capacity,
+                  &view->image->helios_bindings[p]);
+            }
+         }
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         for (uint32_t j = 0; j < write->descriptorCount && ok; j++) {
+            const struct vn_buffer_view *view =
+               vn_buffer_view_from_handle(write->pTexelBufferView[j]);
+            if (!view || !view->helios_buffer)
+               continue;
+            ok = helios_descriptor_update_add_dep(
+               &deps, &dep_count, &dep_capacity,
+               &view->helios_buffer->helios_binding);
+         }
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+         for (uint32_t j = 0; j < write->descriptorCount && ok; j++) {
+            const struct vn_buffer *buf =
+               vn_buffer_from_handle(write->pBufferInfo[j].buffer);
+            if (!buf)
+               continue;
+            ok = helios_descriptor_update_add_dep(
+               &deps, &dep_count, &dep_capacity, &buf->helios_binding);
+         }
+         break;
+      default:
+         break;
+      }
+   }
+
+   VkResult defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (ok) {
+      const size_t generated = vn_sizeof_vkUpdateDescriptorSets(
+         device, write_count, writes, copy_count, copies);
+      if (generated && generated <= HELIOS_HOB1_MAX_BYTES - 256) {
+         const size_t capacity = generated + 256;
+         uint8_t *buf = malloc(capacity);
+         if (buf) {
+            struct vn_cs_encoder enc =
+               VN_CS_ENCODER_INITIALIZER_LOCAL(buf, capacity);
+            vn_encode_vkUpdateDescriptorSets(&enc, 0, device, write_count,
+                                             writes, copy_count, copies);
+            const size_t len = vn_cs_encoder_get_len(&enc);
+            if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity) {
+               defer_result = vn_helios_record_defer_object_command(
+                  dev, buf, len, deps, dep_count);
+               if (defer_result == VK_SUCCESS)
+                  buf = NULL;
+            } else {
+               defer_result = VK_ERROR_INITIALIZATION_FAILED;
+            }
+            free(buf);
+         }
+      }
+   }
+   free(deps);
+   if (defer_result != VK_SUCCESS) {
+      /* Falling back to the ring could overtake pending creates and kill the
+       * venus context from the host side; fail the device loudly instead. */
+      vn_renderer_helios_diag_log(
+         "HOC1 descriptor update defer failed result=%d writes=%u",
+         (int)defer_result, write_count);
+      p_atomic_set(&dev->helios_lost, 1);
+   }
+}
+
 static void
 helios_descriptor_track_updates(struct vn_device *dev,
                                 uint32_t write_count,
@@ -1147,8 +1277,13 @@ vn_UpdateDescriptorSets(VkDevice device,
    helios_descriptor_track_updates(dev, descriptorWriteCount,
                                    pDescriptorWrites, descriptorCopyCount,
                                    pDescriptorCopies);
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      helios_defer_descriptor_update(dev, device, descriptorWriteCount,
+                                     pDescriptorWrites, descriptorCopyCount,
+                                     pDescriptorCopies);
+   } else
 #endif
-
    vn_async_vkUpdateDescriptorSets(dev->primary_ring, device,
                                    descriptorWriteCount, pDescriptorWrites,
                                    descriptorCopyCount, pDescriptorCopies);
@@ -1414,8 +1549,12 @@ vn_UpdateDescriptorSetWithTemplate(
 #if DETECT_OS_WINDOWS
    helios_descriptor_track_updates(dev, update.write_count, update.writes,
                                    0, NULL);
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      helios_defer_descriptor_update(dev, device, update.write_count,
+                                     update.writes, 0, NULL);
+   } else
 #endif
-
    vn_async_vkUpdateDescriptorSets(
       dev->primary_ring, device, update.write_count, update.writes, 0, NULL);
 

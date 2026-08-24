@@ -22,6 +22,7 @@
 #include "vn_device.h"
 #include "vn_device_memory.h"
 #include "vn_helios_direct_dispatch.h"
+#include "vn_helios_hwa2.h"
 #include "vn_helios_native_kmt.h"
 #include "vn_image.h"
 #include "vn_instance.h"
@@ -77,6 +78,27 @@ struct helios_scope_signal {
    uint64_t value;
 };
 
+/* One queued object-materialization command (view create/destroy, descriptor
+ * update).  Reservation mirrors vn_helios_deferred_record: the consuming
+ * scope stamps its generation/batch, clears it on abandon, and frees the item
+ * on commit.  `deps` names every outer binding the command's host execution
+ * dereferences; the consuming batch must name any dep whose allocate/bind
+ * records are still pending, or skip the item (and, through shared deps,
+ * everything ordered after it on the same objects). */
+struct vn_helios_object_command {
+   struct list_head link;
+   uint64_t reserved_context_generation;
+   uint64_t reserved_batch_id;
+   uint8_t *payload;
+   uint64_t payload_bytes;
+   uint32_t dep_count;
+   struct vn_helios_memory_binding deps[];
+};
+
+/* Pending-lane budget: far above any real create burst, far below
+ * HELIOS_HOB1_MAX_BYTES so a consuming batch always has payload room. */
+#define HELIOS_OBJECT_COMMAND_MAX_PENDING_BYTES (4u * 1024u * 1024u)
+
 struct HeliosTranslatorScope_T {
    struct vn_helios_record_context *context;
    thrd_t thread;
@@ -93,6 +115,9 @@ struct HeliosTranslatorScope_T {
    struct vn_helios_deferred_record **deferred_records;
    uint32_t deferred_record_count;
    uint32_t deferred_record_capacity;
+   struct vn_helios_object_command **object_commands;
+   uint32_t object_command_count;
+   uint32_t object_command_capacity;
    struct vn_query_pool **query_pools;
    uint32_t query_pool_count;
    uint32_t query_pool_capacity;
@@ -1292,6 +1317,134 @@ helios_find_outer_memory_locked(
    return NULL;
 }
 
+enum helios_object_command_disposition {
+   HELIOS_OBJECT_COMMAND_CONSUME,
+   HELIOS_OBJECT_COMMAND_SKIP,
+   HELIOS_OBJECT_COMMAND_DROP,
+};
+
+/* Decide one queued object command's fate for the sealing batch, under
+ * dev->mutex.  Deterministic across the count and copy passes: both run in
+ * one continuous critical section.  A dep whose memory is gone was freed
+ * before ever materializing — the command references a host object that was
+ * never bound; drop it (its whole per-object chain shares the dep, so the
+ * chain drops together).  A dep with pending allocate/bind records must be
+ * named by this batch so the records splice ahead of the command; otherwise
+ * skip (shared deps keep per-object program order across skips). */
+static enum helios_object_command_disposition
+helios_object_command_disposition_locked(
+   struct vn_device *dev,
+   const struct vn_helios_object_command *item,
+   const struct vn_helios_command_use *uses,
+   uint32_t use_count)
+{
+   if (item->reserved_context_generation || item->reserved_batch_id)
+      return HELIOS_OBJECT_COMMAND_SKIP;
+   for (uint32_t d = 0; d < item->dep_count; d++) {
+      const struct vn_device_memory *mem =
+         helios_find_outer_memory_locked(dev, &item->deps[d]);
+      if (!mem)
+         return HELIOS_OBJECT_COMMAND_DROP;
+      if (list_is_empty(&mem->helios_deferred_records))
+         continue;
+      bool named = false;
+      for (uint32_t i = 0; i < use_count; i++) {
+         if (uses[i].binding.outer_allocation_token ==
+             item->deps[d].outer_allocation_token) {
+            named = true;
+            break;
+         }
+      }
+      if (!named)
+         return HELIOS_OBJECT_COMMAND_SKIP;
+   }
+   return HELIOS_OBJECT_COMMAND_CONSUME;
+}
+
+static bool
+helios_scope_reserve_object_commands(struct HeliosTranslatorScope_T *scope,
+                                     uint32_t count)
+{
+   size_t bytes;
+   if (count <= scope->object_command_capacity)
+      return true;
+   if (!helios_size_mul(count, sizeof(*scope->object_commands), &bytes))
+      return false;
+   void *items = realloc(scope->object_commands, bytes);
+   if (!items)
+      return false;
+   scope->object_commands = items;
+   scope->object_command_capacity = count;
+   return true;
+}
+
+VkResult
+vn_helios_record_defer_object_command(
+   struct vn_device *dev,
+   void *payload,
+   uint64_t payload_bytes,
+   const struct vn_helios_memory_binding *deps,
+   uint32_t dep_count)
+{
+   if (!dev || !payload || !payload_bytes ||
+       payload_bytes > HELIOS_HOB1_MAX_BYTES ||
+       (dep_count && !deps) || dep_count > HELIOS_HOB1_MAX_USE_RECORDS)
+      return VK_ERROR_VALIDATION_FAILED_EXT;
+   size_t item_bytes;
+   if (!helios_size_mul(dep_count, sizeof(*deps), &item_bytes) ||
+       item_bytes > SIZE_MAX - sizeof(struct vn_helios_object_command))
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   struct vn_helios_object_command *item =
+      calloc(1, sizeof(*item) + item_bytes);
+   if (!item)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   item->payload = payload;
+   item->payload_bytes = payload_bytes;
+   item->dep_count = dep_count;
+   if (dep_count)
+      memcpy(item->deps, deps, item_bytes);
+
+   simple_mtx_lock(&dev->mutex);
+   if (dev->helios_object_command_bytes >
+          HELIOS_OBJECT_COMMAND_MAX_PENDING_BYTES - payload_bytes ||
+       dev->helios_object_command_count == HELIOS_HOB1_MAX_OPERAND_RECORDS) {
+      simple_mtx_unlock(&dev->mutex);
+      free(item);
+      vn_renderer_helios_diag_log(
+         "HOC1 pending-lane overflow bytes=%llu count=%u",
+         (unsigned long long)dev->helios_object_command_bytes,
+         dev->helios_object_command_count);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   list_addtail(&item->link, &dev->helios_object_commands);
+   dev->helios_object_command_count++;
+   dev->helios_object_command_bytes += payload_bytes;
+   simple_mtx_unlock(&dev->mutex);
+   return VK_SUCCESS;
+}
+
+void
+vn_helios_record_drop_object_commands(struct vn_device *dev)
+{
+   if (!dev)
+      return;
+   simple_mtx_lock(&dev->mutex);
+   if (dev->helios_object_command_count)
+      vn_renderer_helios_diag_log("HOC1 drop pending=%u bytes=%llu",
+                                  dev->helios_object_command_count,
+                                  (unsigned long long)
+                                     dev->helios_object_command_bytes);
+   list_for_each_entry_safe(struct vn_helios_object_command, item,
+                            &dev->helios_object_commands, link) {
+      list_del(&item->link);
+      free(item->payload);
+      free(item);
+   }
+   dev->helios_object_command_count = 0;
+   dev->helios_object_command_bytes = 0;
+   simple_mtx_unlock(&dev->mutex);
+}
+
 static VkResult
 helios_record_append(struct vn_queue *queue,
                      enum helios_record_refusal refusal,
@@ -1404,24 +1557,109 @@ helios_record_append(struct vn_queue *queue,
       }
    }
 
-   if (!helios_scope_reserve_uses(scope, command_use_count)) {
+   /* Object-materialization lane: pending object commands ride this batch
+    * after the deferred allocate/bind records.  A dep memory with pending
+    * records that the caller's uses do not name gets a synthetic READ use so
+    * its records splice into this same batch ahead of the command.  The scan
+    * and the later count/copy passes take dev->mutex separately; an item
+    * queued between them is evaluated fresh by the count pass and, lacking a
+    * synthetic use, is skipped to the next batch. */
+   struct vn_helios_command_use *merged_uses = NULL;
+   const struct vn_helios_command_use *effective_uses = command_uses;
+   uint32_t effective_use_count = command_use_count;
+   if (!deferred_only) {
+      uint32_t synthetic_capacity = 0;
+      simple_mtx_lock(&dev->mutex);
+      list_for_each_entry(struct vn_helios_object_command, item,
+                          &dev->helios_object_commands, link) {
+         if (item->reserved_context_generation || item->reserved_batch_id)
+            continue;
+         synthetic_capacity += item->dep_count;
+      }
+      if (synthetic_capacity) {
+         size_t merged_bytes;
+         if (!helios_size_mul((size_t)command_use_count + synthetic_capacity,
+                              sizeof(*merged_uses), &merged_bytes) ||
+             !(merged_uses = malloc(merged_bytes))) {
+            simple_mtx_unlock(&dev->mutex);
+            scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
+            helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         if (command_use_count)
+            memcpy(merged_uses, command_uses,
+                   command_use_count * sizeof(*merged_uses));
+         uint32_t merged_count = command_use_count;
+         list_for_each_entry(struct vn_helios_object_command, item,
+                             &dev->helios_object_commands, link) {
+            if (item->reserved_context_generation || item->reserved_batch_id)
+               continue;
+            for (uint32_t d = 0; d < item->dep_count; d++) {
+               const struct vn_device_memory *mem =
+                  helios_find_outer_memory_locked(dev, &item->deps[d]);
+               /* A free-pending memory's records carry the terminal free,
+                * which only a teardown scope may consume — never name it
+                * here; the item skips until the teardown retires it. */
+               if (!mem || list_is_empty(&mem->helios_deferred_records) ||
+                   mem->helios_free_pending)
+                  continue;
+               bool present = false;
+               for (uint32_t i = 0; i < merged_count; i++) {
+                  if (merged_uses[i].binding.outer_allocation_token ==
+                      item->deps[d].outer_allocation_token) {
+                     present = true;
+                     break;
+                  }
+               }
+               if (present || merged_count == HELIOS_HOB1_MAX_USE_RECORDS)
+                  continue;
+               merged_uses[merged_count++] =
+                  (struct vn_helios_command_use){
+                     .binding = {
+                        .device_generation =
+                           item->deps[d].device_generation,
+                        .outer_allocation_token =
+                           item->deps[d].outer_allocation_token,
+                        .outer_allocation_bytes =
+                           item->deps[d].outer_allocation_bytes,
+                        .byte_offset = 0,
+                        .byte_length =
+                           item->deps[d].outer_allocation_bytes,
+                        .valid = true,
+                     },
+                     .access_flags = HELIOS_HOB1_ACCESS_READ,
+                  };
+            }
+         }
+         if (merged_count > command_use_count) {
+            effective_uses = merged_uses;
+            effective_use_count = merged_count;
+         }
+      }
+      simple_mtx_unlock(&dev->mutex);
+   }
+
+   if (!helios_scope_reserve_uses(scope, effective_use_count)) {
       scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
       helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+      free(merged_uses);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
-   for (uint32_t i = 0; i < command_use_count; i++) {
-      const struct vn_helios_command_use *command_use = &command_uses[i];
+   for (uint32_t i = 0; i < effective_use_count; i++) {
+      const struct vn_helios_command_use *command_use = &effective_uses[i];
       if (!vn_device_memory_helios_binding_live(dev,
                                                 &command_use->binding)) {
          scope->failure = HELIOS_TRANSLATOR_STATUS_FOREIGN_VULKAN_HANDLE;
          helios_record_refuse(owner, HELIOS_RECORD_REFUSE_FOREIGN_HANDLE);
+         free(merged_uses);
          return VK_ERROR_VALIDATION_FAILED_EXT;
       }
       for (uint32_t j = 0; j < i; j++) {
-         if (command_uses[j].binding.outer_allocation_token ==
+         if (effective_uses[j].binding.outer_allocation_token ==
              command_use->binding.outer_allocation_token) {
             scope->failure = HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
             helios_record_refuse(owner, HELIOS_RECORD_REFUSE_DEFERRED_USE);
+            free(merged_uses);
             return VK_ERROR_VALIDATION_FAILED_EXT;
          }
       }
@@ -1442,24 +1680,28 @@ helios_record_append(struct vn_queue *queue,
       if (use_status != HELIOS_TRANSLATOR_STATUS_OK) {
          scope->failure = use_status;
          helios_record_refuse(owner, HELIOS_RECORD_REFUSE_DEFERRED_USE);
+         free(merged_uses);
          return VK_ERROR_VALIDATION_FAILED_EXT;
       }
       scope->uses[i] = sealed_use;
    }
-   scope->use_count = command_use_count;
+   scope->use_count = effective_use_count;
 
    uint32_t deferred_count = 0;
    uint32_t final_free_count = 0;
    uint32_t operand_count = 0;
    uint64_t deferred_bytes = 0;
+   uint32_t object_count = 0;
+   uint64_t object_bytes = 0;
    simple_mtx_lock(&dev->mutex);
-   for (uint32_t i = 0; i < command_use_count; i++) {
+   for (uint32_t i = 0; i < effective_use_count; i++) {
       const struct vn_device_memory *mem =
-         helios_find_outer_memory_locked(dev, &command_uses[i].binding);
+         helios_find_outer_memory_locked(dev, &effective_uses[i].binding);
       if (!mem) {
          simple_mtx_unlock(&dev->mutex);
          scope->failure = HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
          helios_record_refuse(owner, HELIOS_RECORD_REFUSE_FOREIGN_HANDLE);
+         free(merged_uses);
          return VK_ERROR_VALIDATION_FAILED_EXT;
       }
       list_for_each_entry(struct vn_helios_deferred_record, record,
@@ -1471,6 +1713,7 @@ helios_record_append(struct vn_queue *queue,
             simple_mtx_unlock(&dev->mutex);
             scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
             helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+            free(merged_uses);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
          }
          deferred_count++;
@@ -1481,6 +1724,7 @@ helios_record_append(struct vn_queue *queue,
             simple_mtx_unlock(&dev->mutex);
             scope->failure = HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
             helios_record_refuse(owner, HELIOS_RECORD_REFUSE_DEFERRED_USE);
+            free(merged_uses);
             return VK_ERROR_VALIDATION_FAILED_EXT;
          }
          if (record->resource_operand_offset !=
@@ -1495,6 +1739,7 @@ helios_record_append(struct vn_queue *queue,
                   HELIOS_TRANSLATOR_STATUS_PAYLOAD_PLACEHOLDER_NON_ZERO;
                helios_record_refuse(owner,
                                     HELIOS_RECORD_REFUSE_DEFERRED_USE);
+               free(merged_uses);
                return VK_ERROR_VALIDATION_FAILED_EXT;
             }
             if (operand_count == HELIOS_HOB1_MAX_OPERAND_RECORDS) {
@@ -1503,47 +1748,73 @@ helios_record_append(struct vn_queue *queue,
                   HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
                helios_record_refuse(owner,
                                     HELIOS_RECORD_REFUSE_BATCH_BOUND);
+               free(merged_uses);
                return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
             operand_count++;
          }
       }
    }
+   if (!deferred_only) {
+      list_for_each_entry(struct vn_helios_object_command, item,
+                          &dev->helios_object_commands, link) {
+         if (helios_object_command_disposition_locked(
+                dev, item, effective_uses, effective_use_count) !=
+             HELIOS_OBJECT_COMMAND_CONSUME)
+            continue;
+         if (object_count == HELIOS_HOB1_MAX_OPERAND_RECORDS ||
+             object_bytes > HELIOS_HOB1_MAX_BYTES - item->payload_bytes) {
+            simple_mtx_unlock(&dev->mutex);
+            scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
+            helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+            free(merged_uses);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
+         object_count++;
+         object_bytes += item->payload_bytes;
+      }
+   }
    if (deferred_only && (deferred_count == 0 || final_free_count != 1)) {
       simple_mtx_unlock(&dev->mutex);
       scope->failure = HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
       helios_record_refuse(owner, HELIOS_RECORD_REFUSE_DEFERRED_USE);
+      free(merged_uses);
       return VK_ERROR_VALIDATION_FAILED_EXT;
    }
-   if (command_bytes > HELIOS_HOB1_MAX_BYTES - deferred_bytes ||
-       payload_bytes >
-          HELIOS_HOB1_MAX_BYTES - deferred_bytes - command_bytes) {
+   if (object_bytes > HELIOS_HOB1_MAX_BYTES - deferred_bytes ||
+       command_bytes >
+          HELIOS_HOB1_MAX_BYTES - deferred_bytes - object_bytes ||
+       payload_bytes > HELIOS_HOB1_MAX_BYTES - deferred_bytes -
+                          object_bytes - command_bytes) {
       simple_mtx_unlock(&dev->mutex);
       scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
       helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+      free(merged_uses);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    const uint64_t total_payload =
-      deferred_bytes + command_bytes + payload_bytes;
+      deferred_bytes + object_bytes + command_bytes + payload_bytes;
    const uint64_t assembled = HELIOS_HOB1_HEADER_BYTES + total_payload +
-      (uint64_t)command_use_count * HELIOS_HOB1_USE_RECORD_BYTES +
+      (uint64_t)effective_use_count * HELIOS_HOB1_USE_RECORD_BYTES +
       (uint64_t)operand_count * HELIOS_HOB1_OPERAND_RECORD_BYTES;
    if (assembled > HELIOS_HOB1_MAX_BYTES ||
        !helios_scope_reserve_deferred(scope, deferred_count) ||
+       !helios_scope_reserve_object_commands(scope, object_count) ||
        !helios_scope_reserve_operands(scope, operand_count) ||
        !helios_scope_reserve_payload(scope, total_payload)) {
       simple_mtx_unlock(&dev->mutex);
       scope->failure = HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED;
       helios_record_refuse(owner, HELIOS_RECORD_REFUSE_BATCH_BOUND);
+      free(merged_uses);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
 
    uint64_t write_offset = 0;
    scope->deferred_record_count = 0;
    scope->operand_count = 0;
-   for (uint32_t i = 0; i < command_use_count; i++) {
+   for (uint32_t i = 0; i < effective_use_count; i++) {
       struct vn_device_memory *mem =
-         helios_find_outer_memory_locked(dev, &command_uses[i].binding);
+         helios_find_outer_memory_locked(dev, &effective_uses[i].binding);
       assert(mem);
       scope->uses[i].first_operand = 0;
       list_for_each_entry(struct vn_helios_deferred_record, record,
@@ -1579,7 +1850,38 @@ helios_record_append(struct vn_queue *queue,
          write_offset += record->payload_bytes;
       }
    }
+   scope->object_command_count = 0;
+   if (!deferred_only) {
+      list_for_each_entry_safe(struct vn_helios_object_command, item,
+                               &dev->helios_object_commands, link) {
+         switch (helios_object_command_disposition_locked(
+            dev, item, effective_uses, effective_use_count)) {
+         case HELIOS_OBJECT_COMMAND_DROP:
+            list_del(&item->link);
+            assert(dev->helios_object_command_count > 0);
+            dev->helios_object_command_count--;
+            dev->helios_object_command_bytes -= item->payload_bytes;
+            free(item->payload);
+            free(item);
+            break;
+         case HELIOS_OBJECT_COMMAND_CONSUME:
+            item->reserved_context_generation =
+               scope->context->context_generation;
+            item->reserved_batch_id = scope->batch_id;
+            scope->object_commands[scope->object_command_count++] = item;
+            memcpy(scope->payload + write_offset, item->payload,
+                   item->payload_bytes);
+            write_offset += item->payload_bytes;
+            break;
+         case HELIOS_OBJECT_COMMAND_SKIP:
+            break;
+         }
+      }
+      assert(scope->object_command_count == object_count);
+   }
    simple_mtx_unlock(&dev->mutex);
+   free(merged_uses);
+   merged_uses = NULL;
 
    mtx_lock(&queue->helios_record_mutex);
    if (streams) {
@@ -1908,6 +2210,50 @@ helios_scope_retire_deferred(struct HeliosTranslatorScope_T *scope,
 }
 
 static bool
+helios_scope_retire_object_commands(struct HeliosTranslatorScope_T *scope,
+                                    bool committed)
+{
+   if (!scope->object_command_count)
+      return true;
+   struct vn_device *dev = vn_device_from_vk(
+      scope->context->queue->base.vk.base.device);
+   if (!dev)
+      return false;
+   simple_mtx_lock(&dev->mutex);
+   for (uint32_t i = 0; i < scope->object_command_count; i++) {
+      const struct vn_helios_object_command *item =
+         scope->object_commands[i];
+      if (!item ||
+          item->reserved_context_generation !=
+             scope->context->context_generation ||
+          item->reserved_batch_id != scope->batch_id) {
+         simple_mtx_unlock(&dev->mutex);
+         return false;
+      }
+   }
+   for (uint32_t i = 0; i < scope->object_command_count; i++) {
+      struct vn_helios_object_command *item = scope->object_commands[i];
+      item->reserved_context_generation = 0;
+      item->reserved_batch_id = 0;
+      if (committed) {
+         list_del(&item->link);
+         assert(dev->helios_object_command_count > 0);
+         dev->helios_object_command_count--;
+         dev->helios_object_command_bytes -= item->payload_bytes;
+      }
+   }
+   simple_mtx_unlock(&dev->mutex);
+   if (committed) {
+      for (uint32_t i = 0; i < scope->object_command_count; i++) {
+         free(scope->object_commands[i]->payload);
+         free(scope->object_commands[i]);
+      }
+   }
+   scope->object_command_count = 0;
+   return true;
+}
+
+static bool
 helios_scope_note_allocation_progress(struct HeliosTranslatorScope_T *scope,
                                       uint64_t progress_value)
 {
@@ -1989,6 +2335,10 @@ vn_helios_record_scope_close(HeliosTranslatorScope opaque,
           scope,
           disposition == HELIOS_TRANSLATOR_SCOPE_DISPOSITION_COMMITTED))
       return HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
+   if (!helios_scope_retire_object_commands(
+          scope,
+          disposition == HELIOS_TRANSLATOR_SCOPE_DISPOSITION_COMMITTED))
+      return HELIOS_TRANSLATOR_STATUS_UNKNOWN_ALLOCATION_TOKEN;
 
    if (disposition == HELIOS_TRANSLATOR_SCOPE_DISPOSITION_COMMITTED) {
       const uint64_t context_generation =
@@ -2041,6 +2391,7 @@ vn_helios_record_scope_close(HeliosTranslatorScope opaque,
    mtx_unlock(&context->lock);
    free(scope->operands);
    free(scope->deferred_records);
+   free(scope->object_commands);
    free(scope->query_pools);
    free(scope->events);
    free(scope->signals);

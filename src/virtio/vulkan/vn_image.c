@@ -23,6 +23,7 @@
 #include "vn_device.h"
 #include "vn_device_memory.h"
 #if DETECT_OS_WINDOWS
+#include "vn_helios_hwa2.h"
 #include "vn_helios_record_submit.h"
 #endif
 #include "vn_physical_device.h"
@@ -1186,6 +1187,58 @@ vn_CreateImageView(VkDevice device,
    view->image = img;
 
    VkImageView view_handle = vn_image_view_to_handle(view);
+
+#if DETECT_OS_WINDOWS
+   /* A7: a view dereferences the image's outer allocation on the host, and
+    * HVC1 is unordered against the batch that materializes the deferred
+    * allocate/bind — a ring-borne create reaches the host on an unbound
+    * image (measured: dwm's views baked dead addresses, black desktop,
+    * 2026-08-24).  Ride the object-materialization lane instead. */
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      struct vn_helios_memory_binding deps[ARRAY_SIZE(img->helios_bindings)];
+      uint32_t dep_count = 0;
+      for (uint32_t i = 0; i < ARRAY_SIZE(img->helios_bindings); i++) {
+         if (img->helios_bindings[i].valid)
+            deps[dep_count++] = img->helios_bindings[i];
+      }
+      if (dep_count) {
+         VkResult defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         const size_t generated =
+            vn_sizeof_vkCreateImageView(device, pCreateInfo, NULL,
+                                        &view_handle);
+         if (generated && generated <= HELIOS_HOB1_MAX_BYTES - 256) {
+            const size_t capacity = generated + 256;
+            uint8_t *buf = malloc(capacity);
+            if (buf) {
+               struct vn_cs_encoder enc =
+                  VN_CS_ENCODER_INITIALIZER_LOCAL(buf, capacity);
+               vn_encode_vkCreateImageView(&enc, 0, device, pCreateInfo,
+                                           NULL, &view_handle);
+               const size_t len = vn_cs_encoder_get_len(&enc);
+               if (!vn_cs_encoder_get_fatal(&enc) && len &&
+                   len <= capacity) {
+                  defer_result = vn_helios_record_defer_object_command(
+                     dev, buf, len, deps, dep_count);
+                  if (defer_result == VK_SUCCESS)
+                     buf = NULL;
+               } else {
+                  defer_result = VK_ERROR_INITIALIZATION_FAILED;
+               }
+               free(buf);
+            }
+         }
+         if (defer_result != VK_SUCCESS) {
+            vn_object_base_fini(&view->base);
+            vk_free(alloc, view);
+            return vn_error(dev->instance, defer_result);
+         }
+         *pView = view_handle;
+         return VK_SUCCESS;
+      }
+   }
+#endif
+
    vn_async_vkCreateImageView(dev->primary_ring, device, pCreateInfo, NULL,
                               &view_handle);
 
@@ -1207,7 +1260,59 @@ vn_DestroyImageView(VkDevice device,
    if (!view)
       return;
 
+#if DETECT_OS_WINDOWS
+   /* The destroy must trail its create on the object-materialization lane;
+    * a ring destroy would overtake a still-pending create.  Same deps as the
+    * create so both skip or drop together. */
+   bool destroyed = false;
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+       view->image) {
+      const struct vn_image *img = view->image;
+      struct vn_helios_memory_binding deps[ARRAY_SIZE(img->helios_bindings)];
+      uint32_t dep_count = 0;
+      for (uint32_t i = 0; i < ARRAY_SIZE(img->helios_bindings); i++) {
+         if (img->helios_bindings[i].valid)
+            deps[dep_count++] = img->helios_bindings[i];
+      }
+      if (dep_count) {
+         const size_t generated =
+            vn_sizeof_vkDestroyImageView(device, imageView, NULL);
+         if (generated && generated <= HELIOS_HOB1_MAX_BYTES - 256) {
+            const size_t capacity = generated + 256;
+            uint8_t *buf = malloc(capacity);
+            if (buf) {
+               struct vn_cs_encoder enc =
+                  VN_CS_ENCODER_INITIALIZER_LOCAL(buf, capacity);
+               vn_encode_vkDestroyImageView(&enc, 0, device, imageView,
+                                            NULL);
+               const size_t len = vn_cs_encoder_get_len(&enc);
+               if (!vn_cs_encoder_get_fatal(&enc) && len &&
+                   len <= capacity &&
+                   vn_helios_record_defer_object_command(
+                      dev, buf, len, deps, dep_count) == VK_SUCCESS) {
+                  destroyed = true;
+               } else {
+                  free(buf);
+               }
+            }
+         }
+         if (!destroyed) {
+            /* Never fall back to the ring: it could overtake the pending
+             * create.  Leak the host twin loudly; context teardown
+             * reclaims it. */
+            vn_renderer_helios_diag_log(
+               "HOC1 view destroy defer failed view=%p", (void *)view);
+            destroyed = true;
+         }
+      }
+   }
+   if (!destroyed)
+      vn_async_vkDestroyImageView(dev->primary_ring, device, imageView,
+                                  NULL);
+#else
    vn_async_vkDestroyImageView(dev->primary_ring, device, imageView, NULL);
+#endif
 
    vn_object_base_fini(&view->base);
    vk_free(alloc, view);

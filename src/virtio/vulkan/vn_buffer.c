@@ -17,6 +17,7 @@
 #include "vn_device_memory.h"
 #if DETECT_OS_WINDOWS
 #include "vn_cs.h"
+#include "vn_helios_hwa2.h"
 #include "vn_helios_record_submit.h"
 #endif
 #include "vn_physical_device.h"
@@ -904,6 +905,46 @@ vn_CreateBufferView(VkDevice device,
 #endif
 
    VkBufferView view_handle = vn_buffer_view_to_handle(view);
+
+#if DETECT_OS_WINDOWS
+   /* A7 object-materialization lane: see vn_CreateImageView. */
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+       view->helios_buffer && view->helios_buffer->helios_binding.valid) {
+      VkResult defer_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      const size_t generated =
+         vn_sizeof_vkCreateBufferView(device, pCreateInfo, NULL,
+                                      &view_handle);
+      if (generated && generated <= HELIOS_HOB1_MAX_BYTES - 256) {
+         const size_t capacity = generated + 256;
+         uint8_t *buf = malloc(capacity);
+         if (buf) {
+            struct vn_cs_encoder enc =
+               VN_CS_ENCODER_INITIALIZER_LOCAL(buf, capacity);
+            vn_encode_vkCreateBufferView(&enc, 0, device, pCreateInfo, NULL,
+                                         &view_handle);
+            const size_t len = vn_cs_encoder_get_len(&enc);
+            if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity) {
+               defer_result = vn_helios_record_defer_object_command(
+                  dev, buf, len, &view->helios_buffer->helios_binding, 1);
+               if (defer_result == VK_SUCCESS)
+                  buf = NULL;
+            } else {
+               defer_result = VK_ERROR_INITIALIZATION_FAILED;
+            }
+            free(buf);
+         }
+      }
+      if (defer_result != VK_SUCCESS) {
+         vn_object_base_fini(&view->base);
+         vk_free(alloc, view);
+         return vn_error(dev->instance, defer_result);
+      }
+      *pView = view_handle;
+      return VK_SUCCESS;
+   }
+#endif
+
    vn_async_vkCreateBufferView(dev->primary_ring, device, pCreateInfo, NULL,
                                &view_handle);
 
@@ -925,7 +966,45 @@ vn_DestroyBufferView(VkDevice device,
    if (!view)
       return;
 
+#if DETECT_OS_WINDOWS
+   /* Trail the create on the object-materialization lane; see
+    * vn_DestroyImageView. */
+   bool destroyed = false;
+   if (vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+       view->helios_buffer && view->helios_buffer->helios_binding.valid) {
+      const size_t generated =
+         vn_sizeof_vkDestroyBufferView(device, bufferView, NULL);
+      if (generated && generated <= HELIOS_HOB1_MAX_BYTES - 256) {
+         const size_t capacity = generated + 256;
+         uint8_t *buf = malloc(capacity);
+         if (buf) {
+            struct vn_cs_encoder enc =
+               VN_CS_ENCODER_INITIALIZER_LOCAL(buf, capacity);
+            vn_encode_vkDestroyBufferView(&enc, 0, device, bufferView, NULL);
+            const size_t len = vn_cs_encoder_get_len(&enc);
+            if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity &&
+                vn_helios_record_defer_object_command(
+                   dev, buf, len, &view->helios_buffer->helios_binding,
+                   1) == VK_SUCCESS) {
+               destroyed = true;
+            } else {
+               free(buf);
+            }
+         }
+      }
+      if (!destroyed) {
+         vn_renderer_helios_diag_log(
+            "HOC1 buffer-view destroy defer failed view=%p", (void *)view);
+         destroyed = true;
+      }
+   }
+   if (!destroyed)
+      vn_async_vkDestroyBufferView(dev->primary_ring, device, bufferView,
+                                   NULL);
+#else
    vn_async_vkDestroyBufferView(dev->primary_ring, device, bufferView, NULL);
+#endif
 
    vn_object_base_fini(&view->base);
    vk_free(alloc, view);
