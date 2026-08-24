@@ -134,13 +134,10 @@ vn_helios_record_note_reentrant_join(struct vn_instance *instance);
 void
 vn_helios_record_note_deferred_use(struct vn_instance *instance);
 
-bool
-vn_helios_record_has_active_scope(struct vn_instance *instance);
-
-/* Finish one allocation-backed lifetime entirely inside the calling thread's
- * current outer scope.  The payload consists only of immutable deferred
- * allocation/bind/destroy/free records already owned by `mem`; the sealed use
- * names that exact allocation at offset zero. */
+/* Finish one materialized allocation-backed lifetime entirely inside the
+ * calling thread's current outer scope.  The payload consists only of
+ * immutable destroy/free records already owned by `mem`; the sealed use names
+ * that exact allocation at offset zero. */
 VkResult
 vn_helios_record_memory_teardown(struct vn_device *dev,
                                  struct vn_device_memory *mem);

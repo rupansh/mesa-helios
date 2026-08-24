@@ -330,9 +330,8 @@ vn_image_store_reqs_in_cache(struct vn_device *dev,
 }
 
 static void
-vn_image_init_memory_requirements(struct vn_image *img,
-                                  struct vn_device *dev,
-                                  uint32_t plane_count)
+vn_image_init_memory_requirement_structs(struct vn_image *img,
+                                         uint32_t plane_count)
 {
    assert(plane_count <= ARRAY_SIZE(img->requirements));
 
@@ -344,6 +343,14 @@ vn_image_init_memory_requirements(struct vn_image *img,
          VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS;
       img->requirements[i].dedicated.pNext = NULL;
    }
+}
+
+static void
+vn_image_init_memory_requirements(struct vn_image *img,
+                                  struct vn_device *dev,
+                                  uint32_t plane_count)
+{
+   vn_image_init_memory_requirement_structs(img, plane_count);
 
    VkDevice dev_handle = vn_device_to_handle(dev);
    VkImage img_handle = vn_image_to_handle(img);
@@ -386,6 +393,89 @@ vn_image_init_memory_requirements(struct vn_image *img,
    }
 }
 
+#if DETECT_OS_WINDOWS
+/* Keep creation and the first requirements query in one finite host-control
+ * transaction.  The image deliberately remains live: the caller adopts this
+ * exact object after creating its associated WDDM allocation, and the existing
+ * bind/destroy path then moves its allocation-backed work to the outer batch.
+ * The generated KMD schema accepts this pair only when both commands name the
+ * same nonzero device and image.  A successful, complete requirements reply
+ * therefore proves that the guest-assigned image handle exists without a
+ * second host-worker boundary between create and query. */
+static VkResult
+vn_image_create_query_record_only(struct vn_device *dev,
+                                  const VkImageCreateInfo *create_info,
+                                  struct vn_image *img)
+{
+   VkDevice device = vn_device_to_handle(dev);
+   VkImage image = vn_image_to_handle(img);
+   VkImageMemoryRequirementsInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = image,
+   };
+   vn_image_init_memory_requirement_structs(img, 1);
+
+   const size_t create_bytes =
+      vn_sizeof_vkCreateImage(device, create_info, NULL, &image);
+   const size_t query_bytes = vn_sizeof_vkGetImageMemoryRequirements2(
+      device, &info, &img->requirements[0].memory);
+   const size_t reply_bytes = vn_sizeof_vkGetImageMemoryRequirements2_reply(
+      device, &info, &img->requirements[0].memory);
+   if (!create_bytes || !query_bytes || !reply_bytes ||
+       create_bytes > SIZE_MAX - query_bytes)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   const size_t command_bytes = create_bytes + query_bytes;
+   uint8_t *command = malloc(command_bytes);
+   if (!command)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   struct vn_ring_submit_command submit;
+   struct vn_cs_encoder *encoder = vn_ring_submit_command_init(
+      dev->primary_ring, &submit, command, command_bytes, reply_bytes);
+   vn_encode_vkCreateImage(encoder, 0, device, create_info, NULL, &image);
+   vn_encode_vkGetImageMemoryRequirements2(
+      encoder, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, &info,
+      &img->requirements[0].memory);
+   if (vn_cs_encoder_get_fatal(encoder) ||
+       vn_cs_encoder_get_len(encoder) != command_bytes) {
+      free(command);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   vn_ring_submit_command(dev->primary_ring, &submit);
+   struct vn_cs_decoder *decoder =
+      vn_ring_get_command_reply(dev->primary_ring, &submit);
+   if (!decoder) {
+      free(command);
+      return VK_ERROR_DEVICE_LOST;
+   }
+   vn_decode_vkGetImageMemoryRequirements2_reply(
+      decoder, device, &info, &img->requirements[0].memory);
+   const bool complete_reply = decoder->cur == decoder->end;
+   vn_ring_free_command_reply(dev->primary_ring, &submit);
+   free(command);
+   /* Temporary runtime diagnostic: keep the wire path unchanged but expose
+    * which validated reply field was unusable through vkCreateImage's result.
+    * Removed after the bounded DWM capture. */
+   if (!complete_reply)
+      return VK_ERROR_UNKNOWN;
+   if (!img->requirements[0].memory.memoryRequirements.size)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (!img->requirements[0].memory.memoryRequirements.alignment)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   if (!img->requirements[0].memory.memoryRequirements.memoryTypeBits)
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+
+   vn_physical_device_sanitize_memory_requirements(
+      dev->physical_device,
+      &img->requirements[0].memory.memoryRequirements);
+   return img->requirements[0].memory.memoryRequirements.memoryTypeBits
+             ? VK_SUCCESS
+             : VK_ERROR_FEATURE_NOT_PRESENT;
+}
+#endif
+
 static VkResult
 vn_image_init(struct vn_device *dev,
               const VkImageCreateInfo *create_info,
@@ -405,13 +495,23 @@ vn_image_init(struct vn_device *dev,
       return VK_SUCCESS;
    }
 
-   result = vn_call_vkCreateImage(dev->primary_ring, device, create_info,
-                                  NULL, &image);
-   if (result != VK_SUCCESS)
-      return result;
-
    const uint32_t plane_count = vn_image_get_plane_count(create_info);
-   vn_image_init_memory_requirements(img, dev, plane_count);
+#if DETECT_OS_WINDOWS
+   if (plane_count == 1 &&
+       vn_helios_submit_instance_mode(dev->instance) ==
+          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      result = vn_image_create_query_record_only(dev, create_info, img);
+      if (result != VK_SUCCESS)
+         return result;
+   } else
+#endif
+   {
+      result = vn_call_vkCreateImage(dev->primary_ring, device, create_info,
+                                     NULL, &image);
+      if (result != VK_SUCCESS)
+         return result;
+      vn_image_init_memory_requirements(img, dev, plane_count);
+   }
 
    if (cacheable)
       vn_image_store_reqs_in_cache(dev, key, plane_count, img->requirements);

@@ -1545,7 +1545,7 @@ helios_record_append(struct vn_queue *queue,
       struct vn_device_memory *mem =
          helios_find_outer_memory_locked(dev, &command_uses[i].binding);
       assert(mem);
-      scope->uses[i].first_operand = scope->operand_count;
+      scope->uses[i].first_operand = 0;
       list_for_each_entry(struct vn_helios_deferred_record, record,
                           &mem->helios_deferred_records, link) {
          record->reserved_context_generation =
@@ -1556,6 +1556,8 @@ helios_record_append(struct vn_queue *queue,
                 record->payload_bytes);
          if (record->resource_operand_offset !=
              VN_HELIOS_NO_RESOURCE_OPERAND) {
+            if (scope->uses[i].operand_count == 0)
+               scope->uses[i].first_operand = scope->operand_count;
             uint32_t zero = UINT32_MAX;
             memcpy(&zero,
                    record->payload + record->resource_operand_offset,
@@ -1639,14 +1641,6 @@ vn_helios_record_memory_teardown(struct vn_device *dev,
    return helios_record_append(
       scope->context->queue, HELIOS_RECORD_REFUSE_DEFERRED_USE,
       NULL, 0, &use, 1, NULL, true);
-}
-
-bool
-vn_helios_record_has_active_scope(struct vn_instance *instance)
-{
-   struct vn_helios_submit_instance *owner =
-      helios_submit_owner(instance);
-   return owner && helios_current_scope(owner) != NULL;
 }
 
 static VkResult
@@ -1760,10 +1754,6 @@ vn_helios_record_scope_seal(HeliosTranslatorScope opaque,
    mtx_lock(&queue->helios_record_mutex);
    uint32_t next_operand = 0;
    for (uint32_t i = 0; i < scope->use_count; i++) {
-      if (scope->uses[i].first_operand != next_operand) {
-         mtx_unlock(&queue->helios_record_mutex);
-         return HELIOS_TRANSLATOR_STATUS_OPERAND_ENCODING;
-      }
       const HeliosTranslatorStatusCode checked_use =
          helios_translator_check_sealed_use(
             &scope->uses[i], scope->context->context_flags);
@@ -1771,7 +1761,13 @@ vn_helios_record_scope_seal(HeliosTranslatorScope opaque,
          mtx_unlock(&queue->helios_record_mutex);
          return checked_use;
       }
-      next_operand += scope->uses[i].operand_count;
+      if (scope->uses[i].operand_count != 0) {
+         if (scope->uses[i].first_operand != next_operand) {
+            mtx_unlock(&queue->helios_record_mutex);
+            return HELIOS_TRANSLATOR_STATUS_OPERAND_ENCODING;
+         }
+         next_operand += scope->uses[i].operand_count;
+      }
    }
    if (next_operand != scope->operand_count) {
       mtx_unlock(&queue->helios_record_mutex);
