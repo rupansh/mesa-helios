@@ -122,6 +122,16 @@ vn_renderer_helios_diag_log(const char *fmt, ...)
    line[used++] = '\n';
    line[used] = '\0';
    OutputDebugStringA(line);
+   /* Diagnostic triple-write: OutputDebugString needs a listener nobody has
+    * running, and dwm has no stderr; the append file is readable from the
+    * probe workflow. */
+   fputs(line, stderr);
+   fflush(stderr);
+   FILE *f = fopen("C:\\ProgramData\\Helios\\icd-diag.log", "a");
+   if (f) {
+      fputs(line, f);
+      fclose(f);
+   }
 }
 
 static uint64_t

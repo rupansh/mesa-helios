@@ -22,6 +22,7 @@
 
 #if defined(_WIN32)
 #include "vn_helios_record_submit.h"
+#include "vn_helios_hwa2.h"
 #endif
 
 /* device commands */
@@ -627,6 +628,41 @@ vn_device_init(struct vn_device *dev,
          break;
       }
    }
+#if DETECT_OS_WINDOWS
+   {
+      /* One-shot per device: the exact chain this create sends to the host.
+       * 2026-08-24: host validation reports the session device lacks features
+       * (EXT buffer_device_address, sync2) the guest demonstrably enabled;
+       * this names which layer loses them. */
+      char buf[600];
+      size_t used = 0;
+      for (const VkBaseInStructure *s = final_create_info.pNext; s;
+           s = s->pNext) {
+         int r = snprintf(buf + used, sizeof(buf) - used, " %d", (int)s->sType);
+         if (r <= 0 || (size_t)r >= sizeof(buf) - used)
+            break;
+         used += r;
+      }
+      vn_renderer_helios_diag_log("HD1 vkCreateDevice pnext sTypes:%s", buf);
+      used = 0;
+      buf[0] = '\0';
+      for (uint32_t i = 0; i < final_create_info.enabledExtensionCount; i++) {
+         int r = snprintf(buf + used, sizeof(buf) - used, " %s",
+                          final_create_info.ppEnabledExtensionNames[i]);
+         if (r <= 0 || (size_t)r >= sizeof(buf) - used)
+            break;
+         used += r;
+      }
+      vn_renderer_helios_diag_log("HD1 vkCreateDevice exts:%s", buf);
+      const VkPhysicalDeviceBufferDeviceAddressFeaturesEXT *bda =
+         vk_find_struct_const(final_create_info.pNext,
+                              PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_EXT);
+      vn_renderer_helios_diag_log("HD1 bdaEXT present=%d enable=%u capture=%u",
+                                  bda != NULL,
+                                  bda ? bda->bufferDeviceAddress : 0,
+                                  bda ? bda->bufferDeviceAddressCaptureReplay : 0);
+   }
+#endif
    result = vn_call_vkCreateDevice(dev->primary_ring, physical_dev_handle,
                                    &final_create_info, NULL, &dev_handle);
    STACK_ARRAY_FINISH(queue_infos);

@@ -373,6 +373,124 @@ vn_buffer_create(struct vn_device *dev,
    return VK_SUCCESS;
 }
 
+#if DETECT_OS_WINDOWS
+/* The installed renderer does not implement the maintenance4 opcode used by
+ * vkGetDeviceBufferMemoryRequirements, while its ordinary create/query path
+ * is complete.  Keep the fallback spec-valid and A7-complete by placing the
+ * private buffer's whole lifetime in one generated control transaction:
+ *
+ *   CreateBuffer -> GetBufferMemoryRequirements2 -> DestroyBuffer
+ *
+ * KMD admission accepts this sole allocation-class command only after the
+ * generated schema proves all three commands name the same nonzero device and
+ * buffer, with no intervening bind or trailing command.  The buffer is thus
+ * provably unbound and dead before this function returns; no child object is
+ * left for vkDestroyDevice and no outer allocation identity is fabricated.
+ */
+static VkResult
+vn_buffer_query_unbound_requirements_record_only(
+   struct vn_device *dev,
+   const VkBufferCreateInfo *create_info,
+   struct vn_buffer_memory_requirements *out_reqs)
+{
+   const VkAllocationCallbacks *alloc = &dev->base.vk.alloc;
+   struct vn_buffer *probe =
+      vk_zalloc(alloc, sizeof(*probe), VN_DEFAULT_ALIGN,
+                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!probe)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   vn_object_base_init(&probe->base, VK_OBJECT_TYPE_BUFFER, &dev->base);
+   VkDevice device = vn_device_to_handle(dev);
+   VkBuffer buffer = vn_buffer_to_handle(probe);
+   VkBufferMemoryRequirementsInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+      .buffer = buffer,
+   };
+   struct vn_buffer_memory_requirements reqs = {
+      .memory = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+      },
+      .dedicated = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+      },
+   };
+   reqs.memory.pNext = &reqs.dedicated;
+
+   const size_t create_bytes =
+      vn_sizeof_vkCreateBuffer(device, create_info, NULL, &buffer);
+   const size_t query_bytes =
+      vn_sizeof_vkGetBufferMemoryRequirements2(device, &info,
+                                               &reqs.memory);
+   const size_t destroy_bytes =
+      vn_sizeof_vkDestroyBuffer(device, buffer, NULL);
+   const size_t reply_bytes =
+      vn_sizeof_vkGetBufferMemoryRequirements2_reply(device, &info,
+                                                     &reqs.memory);
+   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   if (!create_bytes || !query_bytes || !destroy_bytes || !reply_bytes ||
+       create_bytes > SIZE_MAX - query_bytes ||
+       create_bytes + query_bytes > SIZE_MAX - destroy_bytes)
+      goto out_probe;
+
+   const size_t command_bytes =
+      create_bytes + query_bytes + destroy_bytes;
+   uint8_t *command = malloc(command_bytes);
+   if (!command)
+      goto out_probe;
+
+   struct vn_ring_submit_command submit;
+   struct vn_cs_encoder *encoder = vn_ring_submit_command_init(
+      dev->primary_ring, &submit, command, command_bytes, reply_bytes);
+   vn_encode_vkCreateBuffer(encoder, 0, device, create_info, NULL, &buffer);
+   vn_encode_vkGetBufferMemoryRequirements2(
+      encoder, VK_COMMAND_GENERATE_REPLY_BIT_EXT, device, &info,
+      &reqs.memory);
+   vn_encode_vkDestroyBuffer(encoder, 0, device, buffer, NULL);
+   if (vn_cs_encoder_get_fatal(encoder) ||
+       vn_cs_encoder_get_len(encoder) != command_bytes) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
+      goto out_command;
+   }
+
+   vn_ring_submit_command(dev->primary_ring, &submit);
+   struct vn_cs_decoder *decoder =
+      vn_ring_get_command_reply(dev->primary_ring, &submit);
+   if (!decoder) {
+      result = VK_ERROR_DEVICE_LOST;
+      goto out_command;
+   }
+   vn_decode_vkGetBufferMemoryRequirements2_reply(
+      decoder, device, &info, &reqs.memory);
+   const bool complete_reply = decoder->cur == decoder->end;
+   vn_ring_free_command_reply(dev->primary_ring, &submit);
+   if (!complete_reply ||
+       !reqs.memory.memoryRequirements.size ||
+       !reqs.memory.memoryRequirements.alignment ||
+       !reqs.memory.memoryRequirements.memoryTypeBits) {
+      result = VK_ERROR_DEVICE_LOST;
+      goto out_command;
+   }
+
+   vn_physical_device_sanitize_memory_requirements(
+      dev->physical_device, &reqs.memory.memoryRequirements);
+   if (!reqs.memory.memoryRequirements.memoryTypeBits) {
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
+      goto out_command;
+   }
+   *out_reqs = reqs;
+   out_reqs->memory.pNext = &out_reqs->dedicated;
+   result = VK_SUCCESS;
+
+out_command:
+   free(command);
+out_probe:
+   vn_object_base_fini(&probe->base);
+   vk_free(alloc, probe);
+   return result;
+}
+#endif
+
 struct vn_buffer_create_info {
    VkBufferCreateInfo create;
    VkExternalMemoryBufferCreateInfo external;
@@ -468,7 +586,12 @@ vn_CreateBuffer(VkDevice device,
          VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
       dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
       dev->base.vk.enabled_features.bufferDeviceAddress &&
-      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      /* The EXT struct's captureReplay maps to the RENAMED unified bit
+       * (vk_physical_device_features_gen.py RENAMED_FEATURES); the core
+       * bufferDeviceAddressCaptureReplay stays false by design in
+       * record-only DXVK, so checking it zeroed EVERY device address
+       * (2026-08-24: Xid-31 VA-0 GPU faults on every content submit). */
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplayEXT &&
       (vn_buffer_effective_usage(pCreateInfo) &
        VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
    if (helios_capture_replay ||
@@ -835,12 +958,19 @@ vn_GetDeviceBufferMemoryRequirements(
       vn_renderer_handle_type_for_guest(
          dev->physical_device,
          external_info ? external_info->handleTypes : 0);
-   const bool helios_capture_replay =
+   const bool record_only =
       vn_helios_submit_instance_mode(dev->instance) ==
-         VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY &&
+      VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
+   const bool helios_capture_replay =
+      record_only &&
       dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
       dev->base.vk.enabled_features.bufferDeviceAddress &&
-      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      /* The EXT struct's captureReplay maps to the RENAMED unified bit
+       * (vk_physical_device_features_gen.py RENAMED_FEATURES); the core
+       * bufferDeviceAddressCaptureReplay stays false by design in
+       * record-only DXVK, so checking it zeroed EVERY device address
+       * (2026-08-24: Xid-31 VA-0 GPU faults on every content submit). */
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplayEXT &&
       (vn_buffer_effective_usage(pInfo->pCreateInfo) &
        VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT);
    struct vn_buffer_create_info local_info;
@@ -866,6 +996,37 @@ vn_GetDeviceBufferMemoryRequirements(
       vn_copy_cached_memory_requirements(&reqs, pMemoryRequirements);
       return;
    }
+
+#if DETECT_OS_WINDOWS
+   if (record_only) {
+      /* The installed virglrenderer 1.3 host completes the device bootstrap
+       * through vkGetDeviceQueue2, but leaves the immediately following
+       * generated vkGetDeviceBufferMemoryRequirements reply target untouched.
+       * Do not let that one non-replying generated command kill the directly
+       * owned K11 session.  Vulkan defines this query to return the memory
+       * requirements a buffer created from the same VkBufferCreateInfo would
+       * have, so use the exact self-contained unbound query transaction above.
+       * Its create info is already the same fixed-up external/capture-replay
+       * chain used by vn_CreateBuffer; no requirement is inferred.
+       */
+      const VkResult result =
+         vn_buffer_query_unbound_requirements_record_only(
+            dev, pInfo->pCreateInfo, &reqs);
+      if (result == VK_SUCCESS) {
+         if (entry)
+            vn_buffer_reqs_cache_entry_init(cache, entry, &reqs.memory);
+         vn_copy_cached_memory_requirements(&reqs, pMemoryRequirements);
+         return;
+      }
+
+      /* This entry point has no VkResult channel.  Leave an unmistakably
+       * unusable requirement instead of allowing the caller to consume a
+       * partially initialized host reply. */
+      pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){ 0 };
+      (void)vn_error(dev->instance, result);
+      return;
+   }
+#endif
 
    /* Make the host call if not found in cache or not cacheable */
    vn_call_vkGetDeviceBufferMemoryRequirements(dev->primary_ring, device,
