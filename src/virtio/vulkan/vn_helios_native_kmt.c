@@ -954,6 +954,36 @@ helios_native_context_submit_ordered(
       return r;
    }
 
+   /* Sync-graph trace (2026-08-24 stall): first 256 ordered submits then
+    * every 256th, each with its imported wait/signal points, so a submission
+    * that never completes names the fence value nobody signals. */
+   {
+      static volatile LONG helios_ordered_trace_n;
+      const long tn = InterlockedIncrement(&helios_ordered_trace_n);
+      if (tn <= 256 || (tn % 256) == 0 || wait_count || signal_count) {
+         char pts[640];
+         size_t u = 0;
+         pts[0] = '\0';
+         for (uint32_t i = 0; i < wait_count && u + 40 < sizeof(pts); i++)
+            u += (size_t)snprintf(pts + u, sizeof(pts) - u, " w%08x:%llu",
+                                  waits[i].handle,
+                                  (unsigned long long)waits[i].value);
+         for (uint32_t i = 0; i < signal_count && u + 40 < sizeof(pts); i++)
+            u += (size_t)snprintf(pts + u, sizeof(pts) - u, " s%08x:%llu",
+                                  signals[i].handle,
+                                  (unsigned long long)signals[i].value);
+         vn_renderer_helios_diag_log(
+            "HNS1 pid=%lu submit#%ld kind=%u ctx=0x%08x bytes=%u frags=%u "
+            "tok=%llu enq=%llu cmp=%llu%s",
+            (unsigned long)GetCurrentProcessId(), tn, (unsigned)c->kind,
+            c->context, (unsigned)batch->payload_bytes,
+            (unsigned)plan.fragment_count,
+            (unsigned long long)(c->next_batch_token + 1),
+            (unsigned long long)c->enqueued, (unsigned long long)c->completed,
+            pts);
+      }
+   }
+
    /* Nothing above this point submitted queue work.  Imported waits come
     * only after every pure bound check and the optional list resize, so a
     * preflight refusal cannot leave an otherwise-live context blocked on a
@@ -1024,6 +1054,25 @@ helios_native_context_submit_ordered(
          char why[128];
          snprintf(why, sizeof(why), "D3DKMTRender fragment %u/%u len=%u", f,
                   plan.fragment_count, command_length);
+         /* Dump the refused venus payload (2026-08-24: 26 boots-worth of
+          * c000000d with no way to see WHICH predicate refused). One line per
+          * 160 bytes; small first submits fit in one. */
+         {
+            const uint8_t *pb = batch->payload;
+            for (size_t off = 0;
+                 off < batch->payload_bytes && off < 480; off += 160) {
+               char hex[352];
+               const size_t n = batch->payload_bytes - off < 160
+                                   ? batch->payload_bytes - off
+                                   : 160;
+               for (size_t i = 0; i < n; i++)
+                  snprintf(hex + i * 2, 3, "%02x", pb[off + i]);
+               vn_renderer_helios_diag_log(
+                  "HNS1 pid=%lu refused payload@%u/%u kind=%u: %s",
+                  (unsigned long)GetCurrentProcessId(), (unsigned)off,
+                  (unsigned)batch->payload_bytes, (unsigned)c->kind, hex);
+            }
+         }
          const VkResult r = helios_native_lose(c, HELIOS_NATIVE_REFUSE_RENDER,
                                                why, (unsigned)st);
          LeaveCriticalSection(&c->lock);
