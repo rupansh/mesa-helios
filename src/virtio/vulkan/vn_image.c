@@ -667,6 +667,43 @@ vn_image_fix_create_info(
    return &local_info->create;
 }
 
+/* Whether this create info must be rewritten to carry the renderer's external
+ * handle type, for BOTH vn_CreateImage and the memory-requirements query.
+ *
+ * ⛔ ONE function on purpose: the two call sites must agree exactly, and when
+ * they were hand-mirrored the disagreement showed up live as undersized
+ * dedicated allocations and disallowed memory types on dwm's composition
+ * images (VUID 02964/01615/01617).
+ *
+ * The no-external-info arm used to require LINEAR. That left every OPTIMAL
+ * image DXVK creates for a Helios outer-associated allocation with
+ * handleTypes = 0 while the host bound imported DMA_BUF memory to it --
+ * VUID-VkBindImageMemoryInfo-memory-02989, 26 times per boot on 2026-08-28,
+ * and the shape that makes an image whose bytes the dma-buf cannot see.
+ * PREINITIALIZED still cannot carry external info (VUID-VkImageCreateInfo-
+ * pNext-01443). `VN_DEBUG=no_ext_optimal` restores the LINEAR-only rule.
+ */
+static bool
+vn_image_needs_external_fixup(
+   const struct vn_physical_device *physical_dev,
+   const VkImageCreateInfo *create_info,
+   const VkExternalMemoryImageCreateInfo *external_info,
+   VkExternalMemoryHandleTypeFlagBits renderer_handle_type)
+{
+   if (!renderer_handle_type)
+      return false;
+   if (external_info &&
+       vn_preserve_explicit_dmabuf_handle_types(physical_dev,
+                                                external_info->handleTypes))
+      return false;
+   if (external_info)
+      return external_info->handleTypes != renderer_handle_type;
+   if (create_info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED)
+      return false;
+   return !VN_DEBUG(NO_EXT_OPTIMAL) ||
+          create_info->tiling == VK_IMAGE_TILING_LINEAR;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateImage(VkDevice device,
                const VkImageCreateInfo *pCreateInfo,
@@ -750,23 +787,9 @@ vn_CreateImage(VkDevice device,
 #if DETECT_OS_WINDOWS
       const VkImageCreateInfo *app_create_info = pCreateInfo;
 #endif
-      /* Helios: also inject external info into LINEAR images with no
-       * external info of their own. LINEAR limits the renderer-side handle
-       * fixup to CPU-mappable images; OPTIMAL device-local images are left
-       * untouched. PREINITIALIZED images cannot legally carry external info
-       * (VUID-VkImageCreateInfo-pNext-01443). */
-      /* Helios: preserve an explicit DMA_BUF request exactly. The image and
-       * its exported memory must carry the same external handle type. */
-      const bool preserve_external =
-         external_info &&
-         vn_preserve_explicit_dmabuf_handle_types(
-            dev->physical_device, external_info->handleTypes);
-      const bool fix_external =
-         !preserve_external && renderer_handle_type &&
-         (external_info
-             ? external_info->handleTypes != renderer_handle_type
-             : (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-                pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED));
+      const bool fix_external = vn_image_needs_external_fixup(
+         dev->physical_device, pCreateInfo, external_info,
+         renderer_handle_type);
       if (fix_external) {
          pCreateInfo = vn_image_fix_create_info(
             pCreateInfo, renderer_handle_type, &local_info);
@@ -1444,30 +1467,19 @@ vn_GetDeviceImageMemoryRequirements(
 {
    struct vn_device *dev = vn_device_from_handle(device);
 
-   /* Helios: vn_CreateImage injects the renderer external handle type into
-    * LINEAR images (vn_image_fix_create_info), so the requirements reported
-    * HERE must describe the same fixed-up create info — otherwise callers
-    * size and place memory the real (external) image cannot bind: observed
-    * live as undersized dedicated allocations + disallowed memory types
-    * (VUID 02964/01615/01617) from dwm's composition images. The predicate
-    * must match vn_CreateImage's exactly. Mirrors the
-    * vn_GetDeviceBufferMemoryRequirements fix (55e3bda40b7). */
+   /* The requirements reported HERE must describe the create info
+    * vn_CreateImage will actually use, or callers size and place memory the
+    * real (external) image cannot bind. Shared predicate — see
+    * vn_image_needs_external_fixup. */
    const VkExternalMemoryImageCreateInfo *external_info = vk_find_struct_const(
       pInfo->pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
       vn_renderer_handle_type_for_guest(
          dev->physical_device,
          external_info ? external_info->handleTypes : 0);
-   const bool preserve_external =
-      external_info &&
-      vn_preserve_explicit_dmabuf_handle_types(
-         dev->physical_device, external_info->handleTypes);
-   const bool fix_external =
-      !preserve_external && renderer_handle_type &&
-      (external_info
-          ? external_info->handleTypes != renderer_handle_type
-          : (pInfo->pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-             pInfo->pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED));
+   const bool fix_external = vn_image_needs_external_fixup(
+      dev->physical_device, pInfo->pCreateInfo, external_info,
+      renderer_handle_type);
    struct vn_image_create_info local_info;
    VkDeviceImageMemoryRequirements fixed_info;
    if (fix_external) {
