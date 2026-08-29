@@ -1557,6 +1557,18 @@ helios_record_append(struct vn_queue *queue,
       }
    }
 
+   /* 2026-08-29: nothing rasterises on the host (occlusion 0/4096, every
+    * pipeline statistic zero, against a WARP control reporting 4096) while
+    * every HNS1 submit is 32-112 bytes -- far too small to carry a recorded
+    * Begin..End. This says whether any command-buffer bytes reach the batch at
+    * all, which no existing counter distinguishes from a healthy submit. */
+   vn_renderer_helios_diag_log("HRA1 append streams=%u command_bytes=%llu "
+                               "payload=%llu uses=%u",
+                               streams ? streams->count : 0u,
+                               (unsigned long long)command_bytes,
+                               (unsigned long long)payload_bytes,
+                               command_use_count);
+
    /* Object-materialization lane: pending object commands ride this batch
     * after the deferred allocate/bind records.  A dep memory with pending
     * records that the caller's uses do not name gets a synthetic READ use so
