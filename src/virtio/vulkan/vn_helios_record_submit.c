@@ -1533,6 +1533,52 @@ helios_record_append(struct vn_queue *queue,
          }
          command_bytes += exact;
 
+         /* 2026-08-29: the batch is the right SIZE, reaches QEMU, and no vertex
+          * is processed. Say what venus opcodes are actually in it. Each
+          * command is [u32 VkCommandTypeEXT][u32 flags][args], so scanning
+          * dword-aligned for the few opcodes that matter is enough to tell a
+          * real Begin..Draw..End from a batch of state with no draw in it. */
+         {
+            uint32_t n_begin = 0, n_end = 0, n_draw = 0, n_bindpipe = 0;
+            uint32_t n_bq = 0, n_render = 0, n_endrender = 0, first = 0;
+            uint32_t n_vp = 0, n_sc = 0, n_vpc = 0, n_scc = 0, n_disc = 0;
+            for (uint32_t b = 0; b < cmd->cs.buffer_count; b++) {
+               const uint32_t *w = (const uint32_t *)cmd->cs.buffers[b].base;
+               const size_t n = cmd->cs.buffers[b].committed_size / 4;
+               if (b == 0 && n)
+                  first = w[0];
+               for (size_t k = 0; k < n; k++) {
+                  /* A dword scan can only over-count, never under-count: a
+                   * recorded opcode is necessarily present as a dword. So a
+                   * ZERO here is sound evidence of absence, which is the only
+                   * direction this is used in. */
+                  switch (w[k]) {
+                  case 90:  n_begin++; break;    /* vkBeginCommandBuffer */
+                  case 91:  n_end++; break;      /* vkEndCommandBuffer */
+                  case 93:  n_bindpipe++; break; /* vkCmdBindPipeline */
+                  case 106: n_draw++; break;     /* vkCmdDraw */
+                  case 127: n_bq++; break;       /* vkCmdBeginQuery */
+                  case 94:  n_vp++; break;       /* vkCmdSetViewport */
+                  case 95:  n_sc++; break;       /* vkCmdSetScissor */
+                  case 218: n_vpc++; break;      /* vkCmdSetViewportWithCount */
+                  case 219: n_scc++; break;      /* vkCmdSetScissorWithCount */
+                  case 227: n_disc++; break;     /* vkCmdSetRasterizerDiscardEnable */
+                  case 213: n_render++; break;   /* vkCmdBeginRendering */
+                  case 214: n_endrender++; break;/* vkCmdEndRendering */
+                  default: break;
+                  }
+               }
+            }
+            vn_renderer_helios_diag_log(
+               "HRA2 stream[%u] bytes=%llu begin=%u end=%u draw=%u bindpipe=%u "
+               "beginq=%u render=%u/%u vp=%u sc=%u vpcount=%u sccount=%u "
+               "rasterdiscard=%u",
+               i, (unsigned long long)exact, n_begin, n_end, n_draw,
+               n_bindpipe, n_bq, n_render, n_endrender, n_vp, n_sc, n_vpc,
+               n_scc, n_disc);
+            (void)first;
+         }
+
          list_for_each_entry(struct vn_cmd_query_record, query,
                              &cmd->builder.query_records, head) {
             if (!helios_scope_add_query_pool(scope, dev,
