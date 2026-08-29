@@ -117,6 +117,13 @@ struct vn_physical_device {
     * VkMemoryType indices.  Keep the exact per-physical-device translation;
     * never reinterpret a guest index as a renderer index. */
    uint32_t helios_renderer_memory_type_indices[2];
+   /* The renderer memory type a dma_buf import of guest pages actually takes.
+    * Measured on the host outside the stack (RTX PRO 6000 Blackwell): the
+    * importable mask is {0, 3}, and only type 0 -- propertyFlags 0x00 -- really
+    * imports; type 3, the host-visible one, returns OUT_OF_DEVICE_MEMORY, which
+    * is exactly what the guest saw. The host never maps this memory, only the
+    * GPU touches it, so the rule is "fewest property flags". */
+   uint32_t helios_renderer_imported_memory_type_index;
 #endif
 
    struct {

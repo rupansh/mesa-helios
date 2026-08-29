@@ -14,6 +14,7 @@
 
 #include "git_sha1.h"
 #include "util/mesa-blake3.h"
+#include "util/bitscan.h"
 #include "util/os_misc.h"
 #include "venus-protocol/vn_protocol_driver_device.h"
 #include "vk_android.h"
@@ -1241,6 +1242,32 @@ vn_physical_device_init_memory_properties(
       [VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL] = renderer_device_local;
    physical_dev->helios_renderer_memory_type_indices
       [VN_HELIOS_MEMORY_TYPE_HOST_VISIBLE] = renderer_host_visible;
+
+   /* Guest-backed memory is imported by the host as a dma_buf, and the import
+    * only takes on some memory types. The host never maps it -- the GUEST holds
+    * the CPU view of the same pages -- so ask for the least-capable type, which
+    * is the one the import accepts. Measured with a host-side probe against the
+    * live GPU: NVIDIA's importable mask is {0, 3} and only type 0
+    * (propertyFlags 0x00) imports; the host-visible type 3 returns
+    * OUT_OF_DEVICE_MEMORY. On integrated parts every type is importable and the
+    * rule still lands on a working one. */
+   uint32_t imported = renderer_host_visible;
+   uint32_t imported_flag_count = UINT32_MAX;
+   for (uint32_t i = 0; i < renderer_props.memoryTypeCount; i++) {
+      const VkMemoryPropertyFlags flags =
+         renderer_props.memoryTypes[i].propertyFlags;
+      if (flags & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
+                   VK_MEMORY_PROPERTY_PROTECTED_BIT))
+         continue;
+      const uint32_t count = util_bitcount(flags);
+      if (count < imported_flag_count) {
+         imported_flag_count = count;
+         imported = i;
+      }
+   }
+   physical_dev->helios_renderer_imported_memory_type_index = imported;
+   vn_log(instance, "HELIOS_A6_IMPORTED_MEMORY_TYPE=%u flags=0x%x", imported,
+          renderer_props.memoryTypes[imported].propertyFlags);
 
    VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
    memset(props, 0, sizeof(*props));

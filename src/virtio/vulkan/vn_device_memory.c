@@ -697,9 +697,21 @@ vn_device_memory_alloc_helios_shared(struct vn_device *dev,
    struct vn_device_memory_alloc_info local_info;
    const VkMemoryAllocateInfo *clean = vn_device_memory_fix_alloc_info(
       alloc_info, 0, false, force_capture_replay, &local_info);
+   /* NOT the ordinary translation: this memory is imported by the host from
+    * guest pages, and only some renderer types accept that import. The host
+    * never maps it -- the guest holds the CPU view of the very same pages.
+    * HELIOS_IMPORTED_MEMORY_TYPE=translated is the A/B arm; it is the type the
+    * host refused with OUT_OF_DEVICE_MEMORY, kept reachable so the two can be
+    * compared without a rebuild. */
+   const char *type_arm = os_get_option("HELIOS_IMPORTED_MEMORY_TYPE");
    local_info.alloc.memoryTypeIndex =
-      vn_physical_device_renderer_memory_type_index(
-         dev->physical_device, mem->base.vk.memory_type_index);
+      (type_arm && !strcmp(type_arm, "translated"))
+         ? vn_physical_device_renderer_memory_type_index(
+              dev->physical_device, mem->base.vk.memory_type_index)
+         : dev->physical_device->helios_renderer_imported_memory_type_index;
+   vn_renderer_helios_diag_log("HHV1 allocate size=%llu renderer_type=%u",
+                               (unsigned long long)mem->base.vk.size,
+                               local_info.alloc.memoryTypeIndex);
 
    VkResult result = vn_device_memory_bo_init(dev, mem);
    if (result != VK_SUCCESS) {
@@ -707,6 +719,17 @@ vn_device_memory_alloc_helios_shared(struct vn_device *dev,
                                   (int)result,
                                   (unsigned long long)mem->base.vk.size);
       return result;
+   }
+
+   /* HELIOS_HOST_VISIBLE_SHARED=bo-only stops here, so the two halves of this
+    * route can be told apart: creating the HVM1 allocation from inside a
+    * record-only device, versus executing vkAllocateMemory on the session. A
+    * later control-lane render is refused whenever the route is attempted at
+    * all, and only one of these two can be responsible. */
+   const char *arm = os_get_option("HELIOS_HOST_VISIBLE_SHARED");
+   if (arm && !strcmp(arm, "bo-only")) {
+      vn_device_memory_bo_fini(dev, mem);
+      return VK_ERROR_FEATURE_NOT_PRESENT;
    }
 
    VkDeviceMemory memory = vn_device_memory_to_handle(mem);
@@ -750,17 +773,29 @@ vn_device_memory_alloc(struct vn_device *dev,
 #ifdef _WIN32
    if (vn_helios_submit_instance_mode(dev->instance) ==
        VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
-      /* ⛔ OFF BY DEFAULT, and the default is the measured configuration.
-       * Measured 2026-08-29 on KMD 22.22.392.0: with it on, a role-1 create
-       * refuses every size D3DKMTCreateAllocation will not take page-aligned
-       * (DXVK asks for 64-byte host-visible allocations), the surviving 4 MiB
-       * arm still fails its session allocate, and a probe process then wedges
-       * in the kernel. The route itself is sound -- see the arms-B-vs-D
-       * measurement in 16da2f5 for why it is the only one left -- but it is
-       * not finished, and shipping it on would replace a wrong picture with a
-       * hung one. HELIOS_HOST_VISIBLE_SHARED=1 is the arm. */
+      /* ⛔ OFF by default, and the default is the configuration that was
+       * measured. Every part of this route now works except one:
+       * vn_renderer_helios_allocate_memory executes on helios->bootstrap, and
+       * a session execute is not safe once the device's primary ring is live.
+       * The next ring command -- the uncached direct vkCreateBuffer that
+       * vn_buffer.c legitimately issues in this mode -- is then refused with
+       * STATUS_INVALID_PARAMETER, the session is poisoned, and every D3D11
+       * device on the box is removed. Isolated by control:
+       * HELIOS_HOST_VISIBLE_SHARED=bo-only builds the same HVM1 allocation and
+       * skips only the session execute, and the probe runs clean.
+       *
+       * Turning it on today is strictly worse than the defect it fixes -- a
+       * black desktop becomes no desktop -- so it stays off until the allocate
+       * is issued on the device's own ring with its import operand patched
+       * there. HELIOS_HOST_VISIBLE_SHARED=1 is the arm.
+       *
+       * Page-granular only: a sub-page allocation rounded up to a page is
+       * refused before any KMD counter fires, and DXVK asks for 64-byte
+       * host-visible allocations. */
+      const bool page_granular =
+         mem->base.vk.size >= 4096 && (mem->base.vk.size & 4095) == 0;
       if (vn_helios_env_enabled("HELIOS_HOST_VISIBLE_SHARED") &&
-          vn_device_memory_is_host_visible(dev, mem) &&
+          page_granular && vn_device_memory_is_host_visible(dev, mem) &&
           !mem->base.vk.export_handle_types) {
          const VkResult shared =
             vn_device_memory_alloc_helios_shared(dev, mem, alloc_info);

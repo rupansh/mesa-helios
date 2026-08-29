@@ -467,6 +467,17 @@ helios_bo_create_from_device_memory(
    const uint32_t role = (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                             ? HELIOS_HVM1_ROLE_VULKAN_HOST_VISIBLE
                             : HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL;
+   /* An HVM1 allocation is page-granular -- the KMD exports its pages, so a
+    * partial page has no meaning -- and it refuses anything else. DXVK asks
+    * for host-visible allocations as small as 64 bytes. Round up here: the
+    * host's vkAllocateMemory is told this same rounded size, which is what the
+    * KMD's byte_size == allocationSize check compares. */
+   const VkDeviceSize page = 4096;
+   if (size > UINT64_MAX - (page - 1)) {
+      free(bo);
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   }
+   size = (size + page - 1) & ~(page - 1);
    VkResult result = helios_allocation_create(helios_from_renderer(renderer),
                                               size, role, &bo->allocation);
    if (result != VK_SUCCESS) {
