@@ -1042,8 +1042,12 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
    struct helios *helios = helios_from_renderer(renderer);
    struct helios_bo *bo = (struct helios_bo *)base_bo;
    if (!alloc_info || !memory || !bo || !bo->allocation.allocation ||
-       !bo->allocation.generation || !bo->allocation.size)
+       !bo->allocation.generation || !bo->allocation.size) {
+      vn_renderer_helios_diag_log("HAM2 arm=args alloc=%d mem=%d bo=%d",
+                                  alloc_info ? 1 : 0, memory ? 1 : 0,
+                                  bo ? 1 : 0);
       return VK_ERROR_INITIALIZATION_FAILED;
+   }
 
    const VkImportMemoryResourceInfoMESA import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
@@ -1066,20 +1070,48 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
    const size_t allocate_size =
       vn_sizeof_vkAllocateMemory(device, &local, NULL, memory);
    if (set_reply_size != 36 ||
-       allocate_size > HELIOS_HNR2_MAX_PAYLOAD_BYTES - set_reply_size)
+       allocate_size > HELIOS_HNR2_MAX_PAYLOAD_BYTES - set_reply_size) {
+      vn_renderer_helios_diag_log("HAM2 arm=size reply=%zu alloc=%zu",
+                                  set_reply_size, allocate_size);
       return VK_ERROR_INITIALIZATION_FAILED;
-   const size_t payload_size = set_reply_size + allocate_size;
-   uint8_t *payload = malloc(payload_size);
+   }
+   /* ⛔ vn_sizeof_vkAllocateMemory and vn_encode_vkAllocateMemory DISAGREE on
+    * this chain: measured 128 against 144 on the record-only host-visible
+    * allocate (HAM2 arm=encode). vn_device_memory_defer_outer_allocate hit the
+    * same divergence -- 120 against 136 -- and its comment records that the
+    * generated wrapper's overrun corrupted the process heap. So encode the
+    * schema components directly, in the wrapper's own order, and let the
+    * MEASURED terminal length define the payload rather than the faulty size.
+    * The headroom is the largest chain this call can build, not the 15 MiB
+    * HNR2 ceiling. */
+   const size_t payload_capacity =
+      set_reply_size + allocate_size + sizeof(local) + sizeof(import);
+   uint8_t *payload = malloc(payload_capacity);
    if (!payload)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    struct vn_cs_encoder encoder =
-      VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_size);
+      VN_CS_ENCODER_INITIALIZER_LOCAL(payload, payload_capacity);
    vn_encode_vkSetReplyCommandStreamMESA(&encoder, 0, &reply_stream);
-   vn_encode_vkAllocateMemory(&encoder, VK_COMMAND_GENERATE_REPLY_BIT_EXT,
-                              device, &local, NULL, memory);
-   if (vn_cs_encoder_get_fatal(&encoder) ||
-       vn_cs_encoder_get_len(&encoder) != payload_size) {
+   const VkCommandTypeEXT command_type = VK_COMMAND_TYPE_vkAllocateMemory_EXT;
+   const VkFlags command_flags = VK_COMMAND_GENERATE_REPLY_BIT_EXT;
+   vn_encode_VkCommandTypeEXT(&encoder, &command_type);
+   vn_encode_VkFlags(&encoder, &command_flags);
+   vn_encode_VkDevice(&encoder, &device);
+   vn_encode_simple_pointer(&encoder, &local);
+   vn_encode_VkStructureType(&encoder, &local.sType);
+   vn_encode_VkMemoryAllocateInfo_pnext(&encoder, local.pNext);
+   vn_encode_VkMemoryAllocateInfo_self(&encoder, &local);
+   vn_encode_simple_pointer(&encoder, NULL);
+   vn_encode_simple_pointer(&encoder, memory);
+   vn_encode_VkDeviceMemory(&encoder, memory);
+   const size_t payload_size = vn_cs_encoder_get_len(&encoder);
+   if (vn_cs_encoder_get_fatal(&encoder) || !payload_size ||
+       payload_size > payload_capacity ||
+       payload_size > HELIOS_HNR2_MAX_PAYLOAD_BYTES) {
+      vn_renderer_helios_diag_log("HAM2 arm=encode fatal=%d len=%zu cap=%zu",
+                                  vn_cs_encoder_get_fatal(&encoder) ? 1 : 0,
+                                  payload_size, payload_capacity);
       free(payload);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
@@ -1088,9 +1120,21 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
     * its uint32 operand follows exactly the encoded original pNext chain. */
    const size_t import_operand_offset =
       76 + vn_sizeof_VkMemoryAllocateInfo_pnext(alloc_info->pNext);
-   if (import_operand_offset > UINT32_MAX) {
+   uint32_t placeholder = UINT32_MAX;
+   if (import_operand_offset <= UINT32_MAX &&
+       payload_size >= sizeof(placeholder) &&
+       import_operand_offset <= payload_size - sizeof(placeholder))
+      memcpy(&placeholder, payload + import_operand_offset,
+             sizeof(placeholder));
+   if (placeholder != 0) {
+      /* The KMD patches the guest blob's resource id at exactly this offset.
+       * A nonzero word here means the arithmetic and the encoding disagree,
+       * and patching would corrupt an unrelated field. */
+      vn_renderer_helios_diag_log("HAM2 arm=operand off=%zu len=%zu word=0x%08x",
+                                  import_operand_offset, payload_size,
+                                  placeholder);
       free(payload);
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
+      return VK_ERROR_INITIALIZATION_FAILED;
    }
 
    uint8_t raw_reply[24];
@@ -1114,10 +1158,16 @@ vn_renderer_helios_allocate_memory(struct vn_renderer *renderer,
    }
    LeaveCriticalSection(&helios->bootstrap_lock);
    free(payload);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      vn_renderer_helios_diag_log("HAM2 arm=session result=%d bootstrap=%d",
+                                  (int)result, helios->bootstrap ? 1 : 0);
       return result;
-   if (raw_reply_bytes != sizeof(raw_reply))
+   }
+   if (raw_reply_bytes != sizeof(raw_reply)) {
+      vn_renderer_helios_diag_log("HAM2 arm=reply bytes=%llu",
+                                  (unsigned long long)raw_reply_bytes);
       return VK_ERROR_DEVICE_LOST;
+   }
 
    struct vn_cs_decoder decoder =
       VN_CS_DECODER_INITIALIZER(raw_reply, sizeof(raw_reply));

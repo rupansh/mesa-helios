@@ -663,6 +663,85 @@ vn_device_memory_defer_outer_allocate(
 }
 #endif
 
+/* Storage for host-visible memory in record-only mode.
+ *
+ * The deferred outer route cannot supply it. The UMD's association carries a
+ * process-heap `CpuBacking`, so what the application maps and what the host
+ * renders into are two unrelated buffers; and the shared-backing-store contract
+ * that would join them requires an allocation "created as shared", which
+ * dxgkrnl enforces and no UMD can request through `D3DDDICB_ALLOCATE`
+ * (`tools/k2a_unshared_backing_probe.c`, arms B vs D).
+ *
+ * So own the storage here: a role-1 HVM1 allocation whose guest pages the KMD
+ * exports as a `VIRTIO_GPU_BLOB_MEM_GUEST` resource and the host imports, with
+ * `vkAllocateMemory` executed through the session carrying that resource in its
+ * import operand. Both mechanisms already run in this mode -- they are what the
+ * D3D12-resource import path uses -- and both halves of the pair are then one
+ * memory by construction.
+ */
+static VkResult
+vn_device_memory_alloc_helios_shared(struct vn_device *dev,
+                                     struct vn_device_memory *mem,
+                                     const VkMemoryAllocateInfo *alloc_info)
+{
+   /* Same capture-replay decision the deferred route makes; a buffer device
+    * address must not depend on which storage route its memory took. */
+   const VkMemoryAllocateFlagsInfo *flags_info =
+      vk_find_struct_const(alloc_info->pNext, MEMORY_ALLOCATE_FLAGS_INFO);
+   const bool force_capture_replay =
+      dev->base.vk.enabled_extensions.EXT_buffer_device_address &&
+      dev->base.vk.enabled_features.bufferDeviceAddress &&
+      dev->base.vk.enabled_features.bufferDeviceAddressCaptureReplay &&
+      flags_info &&
+      (flags_info->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT);
+   struct vn_device_memory_alloc_info local_info;
+   const VkMemoryAllocateInfo *clean = vn_device_memory_fix_alloc_info(
+      alloc_info, 0, false, force_capture_replay, &local_info);
+   local_info.alloc.memoryTypeIndex =
+      vn_physical_device_renderer_memory_type_index(
+         dev->physical_device, mem->base.vk.memory_type_index);
+
+   VkResult result = vn_device_memory_bo_init(dev, mem);
+   if (result != VK_SUCCESS) {
+      vn_renderer_helios_diag_log("HHV1 bo_init failed result=%d size=%llu",
+                                  (int)result,
+                                  (unsigned long long)mem->base.vk.size);
+      return result;
+   }
+
+   VkDeviceMemory memory = vn_device_memory_to_handle(mem);
+   result = vn_renderer_helios_allocate_memory(
+      dev->renderer, vn_device_to_handle(dev), clean, &memory, mem->base_bo);
+   if (result != VK_SUCCESS) {
+      vn_renderer_helios_diag_log("HHV1 session allocate failed result=%d",
+                                  (int)result);
+      vn_device_memory_bo_fini(dev, mem);
+      return result;
+   }
+   /* The host object exists now rather than when a batch consumes a deferred
+    * record, so teardown must free it. */
+   mem->helios_host_materialized = true;
+   return VK_SUCCESS;
+}
+
+/* Host-visible memory this ICD could not back with guest pages, and therefore
+ * had to leave on the deferred route where the CPU view is not the host's
+ * memory. The KMD caps a CPU-visible HVM1 allocation at the host's stock
+ * udmabuf `list_limit`; the bound is read from that refusal rather than
+ * mirrored here, so it cannot drift. Any nonzero value is unfixed black-frame
+ * surface, not a benign fallback. */
+static uint32_t vn_helios_unshared_host_visible_count;
+
+static bool
+vn_device_memory_is_host_visible(const struct vn_device *dev,
+                                 const struct vn_device_memory *mem)
+{
+   return (dev->physical_device->memory_properties
+              .memoryTypes[mem->base.vk.memory_type_index]
+              .propertyFlags &
+           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+}
+
 static VkResult
 vn_device_memory_alloc(struct vn_device *dev,
                        struct vn_device_memory *mem,
@@ -670,8 +749,36 @@ vn_device_memory_alloc(struct vn_device *dev,
 {
 #ifdef _WIN32
    if (vn_helios_submit_instance_mode(dev->instance) ==
-       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      /* ⛔ OFF BY DEFAULT, and the default is the measured configuration.
+       * Measured 2026-08-29 on KMD 22.22.392.0: with it on, a role-1 create
+       * refuses every size D3DKMTCreateAllocation will not take page-aligned
+       * (DXVK asks for 64-byte host-visible allocations), the surviving 4 MiB
+       * arm still fails its session allocate, and a probe process then wedges
+       * in the kernel. The route itself is sound -- see the arms-B-vs-D
+       * measurement in 16da2f5 for why it is the only one left -- but it is
+       * not finished, and shipping it on would replace a wrong picture with a
+       * hung one. HELIOS_HOST_VISIBLE_SHARED=1 is the arm. */
+      if (vn_helios_env_enabled("HELIOS_HOST_VISIBLE_SHARED") &&
+          vn_device_memory_is_host_visible(dev, mem) &&
+          !mem->base.vk.export_handle_types) {
+         const VkResult shared =
+            vn_device_memory_alloc_helios_shared(dev, mem, alloc_info);
+         if (shared == VK_SUCCESS)
+            return shared;
+         /* Every failure falls back rather than only the KMD's size refusal:
+          * the deferred route is the status quo and always admits, so a hard
+          * failure here would be a regression rather than a loud one. The
+          * counter is what stays loud -- any nonzero value is host-visible
+          * memory whose CPU view is still not the host's. */
+         const uint32_t n = ++vn_helios_unshared_host_visible_count;
+         if (n <= 16 || (n & 63) == 0)
+            vn_renderer_helios_diag_log(
+               "HHV1 host-visible NOT guest-backed n=%u bytes=%llu result=%d",
+               n, (unsigned long long)mem->base.vk.size, (int)shared);
+      }
       return vn_device_memory_defer_outer_allocate(dev, mem, alloc_info);
+   }
 
    /* A3 owns every ordinary allocation as one HVM1 object before the host
     * import.  Export handle types are A6 and are not advertised or emulated. */
@@ -1360,6 +1467,25 @@ vn_FreeMemory(VkDevice device,
       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;
    const bool host_materialized = mem->helios_host_materialized;
 
+   if (record_only && mem->base_bo) {
+      /* Storage this ICD owns. Its host object was created synchronously
+       * through the session, so it is retired the same way rather than through
+       * the deferred-record machinery, which describes outer-allocation
+       * lifetimes this memory does not have. */
+      if (!vn_device_memory_release_outer_association(dev, mem)) {
+         p_atomic_set(&dev->helios_lost, 1);
+         (void)vn_error(dev->instance, VK_ERROR_DEVICE_LOST);
+         return;
+      }
+      const VkResult free_result = vn_renderer_helios_free_memory(
+         dev->renderer, device, memory, mem->base_bo);
+      if (free_result != VK_SUCCESS)
+         (void)vn_error(dev->instance, free_result);
+      vn_device_memory_bo_fini(dev, mem);
+      vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
+      return;
+   }
+
    if (record_only) {
       /* An allocation that never appeared in an accepted batch has no host
        * namespace object to destroy and no queue milestone to join.  Discard
@@ -1592,6 +1718,28 @@ vn_MapMemory2(VkDevice device,
                          VK_ERROR_VALIDATION_FAILED_EXT);
       }
       const struct vk_device_memory *outer_mem_vk = &mem->base.vk;
+      if (mem->base_bo) {
+         /* Storage this ICD owns (vn_device_memory_alloc_helios_shared): the
+          * mapping is the allocation's own pages, which the host imported, so
+          * it is the same memory on both sides. */
+         VkDeviceSize bo_end = 0;
+         if (pMemoryMapInfo->size == VK_WHOLE_SIZE) {
+            bo_end = outer_mem_vk->size;
+         } else if (!pMemoryMapInfo->size ||
+                    __builtin_add_overflow(pMemoryMapInfo->offset,
+                                           pMemoryMapInfo->size, &bo_end)) {
+            return vn_error(dev->instance, VK_ERROR_VALIDATION_FAILED_EXT);
+         }
+         if (bo_end <= pMemoryMapInfo->offset || bo_end > outer_mem_vk->size)
+            return vn_error(dev->instance, VK_ERROR_VALIDATION_FAILED_EXT);
+         void *bo_ptr = vn_renderer_bo_map(dev->renderer, mem->base_bo, NULL);
+         if (!bo_ptr)
+            return vn_error(dev->instance, VK_ERROR_MEMORY_MAP_FAILED);
+         mem->map_start = pMemoryMapInfo->offset;
+         mem->map_end = bo_end;
+         *ppData = (char *)bo_ptr + pMemoryMapInfo->offset;
+         return VK_SUCCESS;
+      }
       const VkMemoryType *memory_type =
          &dev->physical_device->memory_properties.memoryTypes
             [outer_mem_vk->memory_type_index];
@@ -1728,7 +1876,8 @@ vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
    if (vn_helios_submit_instance_mode(dev->instance) ==
        VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
       if (!mem || mem->base.vk.base.device != &dev->base.vk ||
-          !mem->helios_outer_registered || mem->helios_free_pending ||
+          (!mem->helios_outer_registered && !mem->base_bo) ||
+          mem->helios_free_pending ||
           pMemoryUnmapInfo->flags || pMemoryUnmapInfo->pNext ||
           mem->map_end <= mem->map_start) {
          return vn_error(dev->instance,
