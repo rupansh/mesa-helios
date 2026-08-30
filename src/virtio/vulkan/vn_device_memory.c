@@ -560,9 +560,28 @@ vn_device_memory_defer_outer_allocate(
    struct vn_device_memory_alloc_info clean_info;
    const VkMemoryAllocateInfo *clean = vn_device_memory_fix_alloc_info(
       alloc_info, 0, false, force_capture_replay, &clean_info);
+   /* The KMD may have backed this outer allocation with the CREATOR'S OWN
+    * PAGES, in which case its host resource reaches the renderer as a udmabuf
+    * and only the importable type accepts it -- the same rule, and the same
+    * index, the guest-backed HVM1 route above already uses. Asking for the
+    * translated host-visible type instead makes the host vkAllocateMemory
+    * return OUT_OF_DEVICE_MEMORY, leaving the object uncreated; the next
+    * vkBindBufferMemory2 then fails "failed to look up object N of type 8" and
+    * loses the context (measured on KMD 22.22.418.0, host log). The bit is the
+    * KMD's report of what it actually built, not the UMD's request. */
+   const bool guest_page_backed =
+      (mem->helios_outer.association_flags &
+       HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED) != 0;
    clean_info.alloc.memoryTypeIndex =
-      vn_physical_device_renderer_memory_type_index(
-         dev->physical_device, mem->base.vk.memory_type_index);
+      guest_page_backed
+         ? dev->physical_device->helios_renderer_imported_memory_type_index
+         : vn_physical_device_renderer_memory_type_index(
+              dev->physical_device, mem->base.vk.memory_type_index);
+   if (guest_page_backed)
+      vn_renderer_helios_diag_log(
+         "HAM1 defer guest_backed bytes=%llu renderer_type=%u",
+         (unsigned long long)mem->helios_outer.outer_allocation_bytes,
+         clean_info.alloc.memoryTypeIndex);
 
    const VkImportMemoryResourceInfoMESA import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
