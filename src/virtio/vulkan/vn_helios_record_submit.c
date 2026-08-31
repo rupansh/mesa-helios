@@ -439,6 +439,22 @@ vn_helios_cmd_touch_image(struct vn_command_buffer *cmd,
    if (img->helios_presentable.tagged &&
        (access_flags & HELIOS_HOB1_ACCESS_WRITE))
       access_flags |= HELIOS_HOB1_ACCESS_PRIMARY_WRITE;
+   /* 2026-08-31: the flip buffers' imported memory reads all-zero at every
+    * flush while the batches execute clean, and the host consumer is probe-
+    * exonerated for every write engine. The remaining question is WHICH
+    * commands touch the big images — attachment draw, copy dst, or only
+    * reads. `opcode` is the VkCommandTypeEXT of the recording entrypoint. */
+   if (img->base.vk.extent.width >= 1280) {
+      static uint32_t hcc1_logged;
+      if (hcc1_logged < 1024u) {
+         hcc1_logged++;
+         vn_renderer_helios_diag_log(
+            "HCC1 pid=%lu img=%p %ux%u acc=0x%x op=%u",
+            (unsigned long)GetCurrentProcessId(), (void *)img,
+            img->base.vk.extent.width, img->base.vk.extent.height,
+            access_flags, opcode);
+      }
+   }
    bool found = false;
    for (uint32_t plane = 0; plane < ARRAY_SIZE(img->helios_bindings);
         plane++) {

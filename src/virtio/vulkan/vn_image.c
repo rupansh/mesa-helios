@@ -1022,6 +1022,41 @@ vn_BindImageMemory2(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
 #if DETECT_OS_WINDOWS
+   /* 2026-08-31: the scanned-out primary's pages are never written while the
+    * composition executes host-side. The unobserved link is which MEMORY each
+    * image is bound to — a token-registered import or something else. One line
+    * per bind, joined to HAM2 by token and to the UMD by `A7 outer assoc`. */
+   {
+      static uint32_t hbi1_logged;
+      for (uint32_t i = 0; i < bindInfoCount && hbi1_logged < 256u; i++) {
+         struct vn_image *bind_img = vn_image_from_handle(pBindInfos[i].image);
+         struct vn_device_memory *bind_mem =
+            vn_device_memory_from_handle(pBindInfos[i].memory);
+         if (!bind_img || !bind_mem)
+            continue;
+         hbi1_logged++;
+         vn_renderer_helios_diag_log(
+            "HBI1 pid=%lu img=%p %ux%u fmt=%u use=0x%x til=%u tag=%u idx=%u "
+            "mem=%p tok=%llu reg=%u bytes=%llu off=%llu",
+            (unsigned long)GetCurrentProcessId(), (void *)bind_img,
+            bind_img->base.vk.extent.width, bind_img->base.vk.extent.height,
+            (unsigned)bind_img->base.vk.format,
+            (unsigned)bind_img->base.vk.usage,
+            (unsigned)bind_img->base.vk.tiling,
+            bind_img->helios_presentable.tagged ? 1u : 0u,
+            bind_img->helios_presentable.image_index, (void *)bind_mem,
+            (unsigned long long)(bind_mem->helios_outer_registered
+                                    ? bind_mem->helios_outer
+                                         .outer_allocation_token
+                                    : 0),
+            bind_mem->helios_outer_registered ? 1u : 0u,
+            (unsigned long long)(bind_mem->helios_outer_registered
+                                    ? bind_mem->helios_outer
+                                         .outer_allocation_bytes
+                                    : 0),
+            (unsigned long long)pBindInfos[i].memoryOffset);
+      }
+   }
    STACK_ARRAY(struct vn_helios_memory_binding, helios_bindings,
                bindInfoCount);
    STACK_ARRAY(uint32_t, helios_planes, bindInfoCount);
