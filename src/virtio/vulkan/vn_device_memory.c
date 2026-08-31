@@ -577,11 +577,20 @@ vn_device_memory_defer_outer_allocate(
          ? dev->physical_device->helios_renderer_imported_memory_type_index
          : vn_physical_device_renderer_memory_type_index(
               dev->physical_device, mem->base.vk.memory_type_index);
-   if (guest_page_backed)
-      vn_renderer_helios_diag_log(
-         "HAM1 defer guest_backed bytes=%llu renderer_type=%u",
-         (unsigned long long)mem->helios_outer.outer_allocation_bytes,
-         clean_info.alloc.memoryTypeIndex);
+   /* ⭐ The parameters every import of this allocation must agree on. An opener
+    * whose allocationSize/memoryTypeIndex differ from the creator's does not
+    * alias the creator's backing — it gets fresh memory, and the creator's
+    * contents are gone. Logged for BOTH sides so they can be compared across
+    * processes by `outer_bytes`, which is the allocation's own size. */
+   vn_renderer_helios_diag_log(
+      "HAM2 defer pid=%lu token=%llu outer_bytes=%llu vk_size=%llu "
+      "guest_type=%u renderer_type=%u guest_backed=%u",
+      (unsigned long)GetCurrentProcessId(),
+      (unsigned long long)mem->helios_outer.outer_allocation_token,
+      (unsigned long long)mem->helios_outer.outer_allocation_bytes,
+      (unsigned long long)mem->base.vk.size,
+      mem->base.vk.memory_type_index, clean_info.alloc.memoryTypeIndex,
+      guest_page_backed ? 1u : 0u);
 
    const VkImportMemoryResourceInfoMESA import = {
       .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
