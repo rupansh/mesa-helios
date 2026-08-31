@@ -1795,6 +1795,35 @@ helios_record_append(struct vn_queue *queue,
    }
    scope->use_count = effective_use_count;
 
+   /* 2026-08-31: the scanned-out primary's pages are never written while dwm's
+    * renders execute host-side with zero refusals. The one unobserved link is
+    * whether a composition batch ever NAMES a flip-buffer allocation in its
+    * sealed uses. token:access pairs, bounded per process; correlate the
+    * tokens against HAM2's 4587520-byte defers. */
+   {
+      static uint32_t hru1_logged;
+      if (hru1_logged < 96u && effective_use_count) {
+         hru1_logged++;
+         char hru_buf[420];
+         int hru_off = 0;
+         for (uint32_t i = 0;
+              i < effective_use_count && i < 16u &&
+              hru_off < (int)sizeof(hru_buf) - 32;
+              i++) {
+            hru_off += snprintf(hru_buf + hru_off, sizeof(hru_buf) - hru_off,
+                                " %llu:%x",
+                                (unsigned long long)
+                                   scope->uses[i].outer_allocation_token,
+                                (unsigned)scope->uses[i].access_flags);
+         }
+         hru_buf[hru_off < (int)sizeof(hru_buf) ? hru_off
+                                                : (int)sizeof(hru_buf) - 1] = 0;
+         vn_renderer_helios_diag_log("HRU1 pid=%lu n=%u%s",
+                                     (unsigned long)GetCurrentProcessId(),
+                                     effective_use_count, hru_buf);
+      }
+   }
+
    uint32_t deferred_count = 0;
    uint32_t final_free_count = 0;
    uint32_t operand_count = 0;
