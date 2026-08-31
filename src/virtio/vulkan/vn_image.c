@@ -749,6 +749,30 @@ vn_CreateImage(VkDevice device,
       }
    }
 
+#if DETECT_OS_WINDOWS
+   /* 2026-08-31: a cross-process open zeroes the creator's pixels, and only the
+    * two sides' MEMORY parameters were ever compared (they match). Two images
+    * aliasing one host allocation with different create parameters would not,
+    * so print the image's too — bounded, first 64 per process. */
+   {
+      static uint32_t him1_logged;
+      if (him1_logged < 64u) {
+         him1_logged++;
+         vn_renderer_helios_diag_log(
+            "HIM1 pid=%lu %ux%ux%u fmt=%u mips=%u layers=%u samples=%u "
+            "tiling=%u usage=0x%x flags=0x%x sharing=%u layout=%u ext=0x%x",
+            (unsigned long)GetCurrentProcessId(), pCreateInfo->extent.width,
+            pCreateInfo->extent.height, pCreateInfo->extent.depth,
+            (unsigned)pCreateInfo->format, pCreateInfo->mipLevels,
+            pCreateInfo->arrayLayers, (unsigned)pCreateInfo->samples,
+            (unsigned)pCreateInfo->tiling, (unsigned)pCreateInfo->usage,
+            (unsigned)pCreateInfo->flags, (unsigned)pCreateInfo->sharingMode,
+            (unsigned)pCreateInfo->initialLayout,
+            external_info ? (unsigned)external_info->handleTypes : 0u);
+      }
+   }
+#endif
+
    const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
       vn_renderer_handle_type_for_guest(
          dev->physical_device,

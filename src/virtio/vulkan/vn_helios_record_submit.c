@@ -1657,8 +1657,9 @@ helios_record_append(struct vn_queue *queue,
     * every HNS1 submit is 32-112 bytes -- far too small to carry a recorded
     * Begin..End. This says whether any command-buffer bytes reach the batch at
     * all, which no existing counter distinguishes from a healthy submit. */
-   vn_renderer_helios_diag_log("HRA1 append streams=%u command_bytes=%llu "
-                               "payload=%llu uses=%u",
+   vn_renderer_helios_diag_log("HRA1 pid=%lu append streams=%u "
+                               "command_bytes=%llu payload=%llu uses=%u",
+                               (unsigned long)GetCurrentProcessId(),
                                streams ? streams->count : 0u,
                                (unsigned long long)command_bytes,
                                (unsigned long long)payload_bytes,
