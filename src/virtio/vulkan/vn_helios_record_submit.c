@@ -10,6 +10,7 @@
 #include "vn_helios_record_submit.h"
 
 #include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1542,6 +1543,8 @@ helios_record_append(struct vn_queue *queue,
             uint32_t n_begin = 0, n_end = 0, n_draw = 0, n_bindpipe = 0;
             uint32_t n_bq = 0, n_render = 0, n_endrender = 0, first = 0;
             uint32_t n_vp = 0, n_sc = 0, n_vpc = 0, n_scc = 0, n_disc = 0;
+            uint32_t n_b2i = 0, n_i2b = 0, n_cbuf = 0, n_cimg = 0;
+            uint32_t n_blit = 0, n_clear = 0, n_bar = 0, n_bar2 = 0;
             for (uint32_t b = 0; b < cmd->cs.buffer_count; b++) {
                const uint32_t *w = (const uint32_t *)cmd->cs.buffers[b].base;
                const size_t n = cmd->cs.buffers[b].committed_size / 4;
@@ -1565,6 +1568,14 @@ helios_record_append(struct vn_queue *queue,
                   case 227: n_disc++; break;     /* vkCmdSetRasterizerDiscardEnable */
                   case 213: n_render++; break;   /* vkCmdBeginRendering */
                   case 214: n_endrender++; break;/* vkCmdEndRendering */
+                  case 115: case 209: n_b2i++; break;  /* CopyBufferToImage[2] */
+                  case 116: case 210: n_i2b++; break;  /* CopyImageToBuffer[2] */
+                  case 112: case 207: n_cbuf++; break; /* CopyBuffer[2] */
+                  case 113: case 208: n_cimg++; break; /* CopyImage[2] */
+                  case 114: case 211: n_blit++; break; /* BlitImage[2] */
+                  case 119: n_clear++; break;    /* vkCmdClearColorImage */
+                  case 126: n_bar++; break;      /* vkCmdPipelineBarrier */
+                  case 204: n_bar2++; break;     /* vkCmdPipelineBarrier2 */
                   default: break;
                   }
                }
@@ -1572,11 +1583,49 @@ helios_record_append(struct vn_queue *queue,
             vn_renderer_helios_diag_log(
                "HRA2 stream[%u] bytes=%llu begin=%u end=%u draw=%u bindpipe=%u "
                "beginq=%u render=%u/%u vp=%u sc=%u vpcount=%u sccount=%u "
-               "rasterdiscard=%u",
+               "rasterdiscard=%u b2i=%u i2b=%u cbuf=%u cimg=%u blit=%u "
+               "clear=%u bar=%u/%u",
                i, (unsigned long long)exact, n_begin, n_end, n_draw,
                n_bindpipe, n_bq, n_render, n_endrender, n_vp, n_sc, n_vpc,
-               n_scc, n_disc);
+               n_scc, n_disc, n_b2i, n_i2b, n_cbuf, n_cimg, n_blit, n_clear,
+               n_bar, n_bar2);
             (void)first;
+         }
+
+         /* 2026-08-31: the INIT upload's stream is 192 B declaring uses=0 --
+          * 64 B of begin/end plus one 128 B command, and no copy flavour is
+          * 128 B (CopyBufferToImage2 is 136). A dword scan cannot say what it
+          * IS, only what it is not, so a short stream is dumped whole. */
+         static uint32_t hra3_dumps;
+         if (!command_use_count && exact <= 512 && hra3_dumps < 32u) {
+            hra3_dumps++;
+            char line[160];
+            uint32_t col = 0;
+            size_t off = 0;
+            int used = 0;
+            line[0] = '\0';
+            for (uint32_t b = 0; b < cmd->cs.buffer_count; b++) {
+               const uint32_t *w = (const uint32_t *)cmd->cs.buffers[b].base;
+               const size_t n = cmd->cs.buffers[b].committed_size / 4;
+               for (size_t k = 0; k < n; k++) {
+                  int wrote = snprintf(line + used, sizeof(line) - used,
+                                       "%08x ", w[k]);
+                  if (wrote <= 0 || (size_t)wrote >= sizeof(line) - used)
+                     break;
+                  used += wrote;
+                  if (++col == 8) {
+                     vn_renderer_helios_diag_log("HRA3 stream[%u] +%03u %s", i,
+                                                 (unsigned)off, line);
+                     off += 32;
+                     col = 0;
+                     used = 0;
+                     line[0] = '\0';
+                  }
+               }
+            }
+            if (col)
+               vn_renderer_helios_diag_log("HRA3 stream[%u] +%03u %s", i,
+                                           (unsigned)off, line);
          }
 
          list_for_each_entry(struct vn_cmd_query_record, query,
@@ -3489,6 +3538,20 @@ helios_record_entry_gate(struct vn_queue *queue,
       return VK_ERROR_VALIDATION_FAILED_EXT;
    }
    if (scope->context->owner != owner || scope->context->queue != queue) {
+      /* 2026-08-31: one translator context binds ONE queue endpoint, so a
+       * submit on a second queue lands here -- and DXVK's transfer submit runs
+       * first, so its failure drops the whole command list and the driver
+       * merely looks idle. An unnamed refusal cost a week; name the queues. */
+      static uint32_t logged;
+      if (logged < 16u) {
+         logged++;
+         vn_renderer_helios_diag_log(
+            "HRQ1 refuse=%u scope_queue=%p submit_queue=%p ring=%u/%u",
+            (unsigned)refusal, (const void *)scope->context->queue,
+            (const void *)queue,
+            scope->context->queue ? scope->context->queue->ring_idx : 0u,
+            queue->ring_idx);
+      }
       helios_record_refuse(owner, HELIOS_RECORD_REFUSE_FOREIGN_HANDLE);
       return VK_ERROR_VALIDATION_FAILED_EXT;
    }
