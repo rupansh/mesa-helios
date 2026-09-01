@@ -1134,13 +1134,16 @@ helios_scope_reserve_payload(struct HeliosTranslatorScope_T *scope,
       return true;
    uint64_t capacity =
       scope->payload_capacity ? scope->payload_capacity : 4096;
+   /* 2026-09-01: an in-loop `if (capacity < required) return false` here
+    * refused after ONE doubling, capping every batch at 8192 bytes — every
+    * draw-bearing composition batch was silently dropped (the black desktop).
+    * `required <= HELIOS_HOB1_MAX_BYTES` is proven above, so the loop always
+    * terminates with capacity >= required. */
    while (capacity < required) {
       const uint64_t next = capacity * 2;
       capacity = next > capacity && next <= HELIOS_HOB1_MAX_BYTES
                     ? next
                     : HELIOS_HOB1_MAX_BYTES;
-      if (capacity < required)
-         return false;
    }
    void *payload = realloc(scope->payload, (size_t)capacity);
    if (!payload)
