@@ -2170,8 +2170,14 @@ vn_helios_record_memory_teardown(struct vn_device *dev,
          .byte_length = mem->helios_outer.outer_allocation_bytes,
          .valid = true,
       },
-      .access_flags = HELIOS_HOB1_ACCESS_READ |
-                      HELIOS_HOB1_ACCESS_WRITE,
+      /* READ, not READ|WRITE: this record only orders the free behind prior
+       * GPU work; it writes nothing. The WRITE over-claim became the D3DDDI
+       * allocation-list WriteOperation bit, and dxgkrnl refuses a write
+       * reference to an allocation the process opened read-only with
+       * STATUS_ACCESS_DENIED — DWM opens flip-model swapchain buffers
+       * read-only and releases one per consumed frame, so every such frame
+       * killed DWM's device (ROADMAP D6, 2026-09-02). */
+      .access_flags = HELIOS_HOB1_ACCESS_READ,
    };
    return helios_record_append(
       scope->context->queue, HELIOS_RECORD_REFUSE_DEFERRED_USE,
