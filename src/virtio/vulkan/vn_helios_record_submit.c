@@ -1439,6 +1439,83 @@ vn_helios_record_defer_object_command(
    list_addtail(&item->link, &dev->helios_object_commands);
    dev->helios_object_command_count++;
    dev->helios_object_command_bytes += payload_bytes;
+   /* HOC4: unconditional defer-volume line every 1024 process-wide defers —
+    * dev=%p attributes which device defers at what share, count= shows its
+    * lane level, so per-device defer/append rates close the fill arithmetic
+    * even below the HOC2 threshold. */
+   {
+      static volatile LONG hoc4_calls;
+      if (InterlockedIncrement(&hoc4_calls) % 1024 == 0)
+         vn_renderer_helios_diag_log(
+            "HOC4 pid=%lu dev=%p defers=%ld count=%u",
+            (unsigned long)GetCurrentProcessId(), (void *)dev,
+            (long)hoc4_calls, dev->helios_object_command_count);
+   }
+   /* HOC2 lane census (2026-09-01): the lane filled to its 8192 cap in ~2 h
+    * and killed the device; classify what is stuck so the leaking arm has a
+    * name. Every 128th enqueue, under the mutex already held. dev=%p pairs
+    * with the same tag on HRA1 to show whether the deferring device is the
+    * one whose appends drain it. */
+   if (dev->helios_object_command_count % 128 == 0) {
+      uint32_t reserved = 0, no_mem = 0, free_pend = 0, live_unnamed = 0,
+               ready = 0;
+      const struct vn_helios_object_command *first_stuck = NULL;
+      list_for_each_entry(struct vn_helios_object_command, it,
+                          &dev->helios_object_commands, link) {
+         if (it->reserved_context_generation || it->reserved_batch_id) {
+            reserved++;
+            if (!first_stuck)
+               first_stuck = it;
+            continue;
+         }
+         bool missing = false, has_free_pend = false, has_live = false;
+         for (uint32_t d = 0; d < it->dep_count; d++) {
+            const struct vn_device_memory *mem =
+               helios_find_outer_memory_locked(dev, &it->deps[d]);
+            if (!mem) {
+               missing = true;
+               break;
+            }
+            if (!list_is_empty(&mem->helios_deferred_records)) {
+               has_live = true;
+               if (mem->helios_free_pending)
+                  has_free_pend = true;
+            }
+         }
+         if (missing)
+            no_mem++;
+         else if (has_free_pend)
+            free_pend++;
+         else if (has_live)
+            live_unnamed++;
+         else
+            ready++;
+         if ((missing || has_free_pend || has_live) && !first_stuck)
+            first_stuck = it;
+      }
+      vn_renderer_helios_diag_log(
+         "HOC2 pid=%lu dev=%p census count=%u bytes=%llu reserved=%u "
+         "no_mem=%u free_pend=%u live_unnamed=%u ready=%u",
+         (unsigned long)GetCurrentProcessId(), (void *)dev,
+         dev->helios_object_command_count,
+         (unsigned long long)dev->helios_object_command_bytes, reserved, no_mem,
+         free_pend, live_unnamed, ready);
+      /* Above 512 the lane is not a healthy backlog — name the oldest
+       * blocked item's first dep so the starving memory is identifiable. */
+      if (dev->helios_object_command_count >= 512 && first_stuck) {
+         const struct vn_helios_memory_binding *dep0 =
+            first_stuck->dep_count ? &first_stuck->deps[0] : NULL;
+         vn_renderer_helios_diag_log(
+            "HOC3 pid=%lu dev=%p stuck reserved=%llu/%llu deps=%u "
+            "dep0_tok=%llu dep0_gen=%llu",
+            (unsigned long)GetCurrentProcessId(), (void *)dev,
+            (unsigned long long)first_stuck->reserved_context_generation,
+            (unsigned long long)first_stuck->reserved_batch_id,
+            first_stuck->dep_count,
+            (unsigned long long)(dep0 ? dep0->outer_allocation_token : 0),
+            (unsigned long long)(dep0 ? dep0->device_generation : 0));
+      }
+   }
    simple_mtx_unlock(&dev->mutex);
    return VK_SUCCESS;
 }
@@ -1676,10 +1753,10 @@ helios_record_append(struct vn_queue *queue,
     * every HNS1 submit is 32-112 bytes -- far too small to carry a recorded
     * Begin..End. This says whether any command-buffer bytes reach the batch at
     * all, which no existing counter distinguishes from a healthy submit. */
-   vn_renderer_helios_diag_log("HRA1 pid=%lu append streams=%u "
+   vn_renderer_helios_diag_log("HRA1 pid=%lu dev=%p append streams=%u "
                                "command_bytes=%llu payload=%llu uses=%u",
                                (unsigned long)GetCurrentProcessId(),
-                               streams ? streams->count : 0u,
+                               (void *)dev, streams ? streams->count : 0u,
                                (unsigned long long)command_bytes,
                                (unsigned long long)payload_bytes,
                                command_use_count);
@@ -4012,6 +4089,18 @@ vn_helios_queue_submit2(struct vn_queue *queue,
    const enum vn_helios_submission_mode mode =
       vn_helios_submit_instance_mode(dev->instance);
    if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {
+      /* Flush fast path (2026-09-01, D1): an empty fence-less submit exists
+       * only to drain this device's pending object-command lane. When the
+       * lane is empty there is nothing to carry — succeed without recording,
+       * so the caller's periodic flush is free in the common case (the
+       * bracket's scope stays empty and closes abandoned as usual). */
+      if (!submit_count && fence == VK_NULL_HANDLE) {
+         simple_mtx_lock(&dev->mutex);
+         const bool lane_empty = !dev->helios_object_command_count;
+         simple_mtx_unlock(&dev->mutex);
+         if (lane_empty)
+            return VK_SUCCESS;
+      }
       struct vn_helios_command_use *command_uses = NULL;
       uint32_t command_use_count = 0;
       struct helios_command_streams command_streams = { 0 };

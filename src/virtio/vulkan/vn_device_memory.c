@@ -1584,8 +1584,17 @@ vn_FreeMemory(VkDevice device,
       memcpy(progress_points, mem->helios_outer_progress,
              sizeof(progress_points));
       simple_mtx_unlock(&dev->mutex);
-      if (host_materialized && !progress_count)
+      if (host_materialized && !progress_count) {
          joined = false;
+         /* HFM1 (2026-09-01): split the two joined=false arms — a
+          * materialized memory with ZERO progress points vs a live join
+          * failing. The first failed terminal batch of a teardown storm
+          * marks the whole outer device lost. */
+         vn_renderer_helios_diag_log(
+            "HFM1 pid=%lu tok=%llu no-progress (materialized, count=0)",
+            (unsigned long)GetCurrentProcessId(),
+            (unsigned long long)mem->helios_outer.outer_allocation_token);
+      }
       for (uint32_t i = 0; joined && i < progress_count; i++) {
          HeliosSyncProgressResultV1 progress;
          memset(&progress, 0, sizeof(progress));
@@ -1596,6 +1605,14 @@ vn_FreeMemory(VkDevice device,
          if (status != HELIOS_TRANSLATOR_STATUS_OK ||
              (progress.flags & HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST)) {
             joined = false;
+            vn_renderer_helios_diag_log(
+               "HFM1 pid=%lu tok=%llu join fail ctx=%llu val=%llu status=%d "
+               "flags=0x%x",
+               (unsigned long)GetCurrentProcessId(),
+               (unsigned long long)mem->helios_outer.outer_allocation_token,
+               (unsigned long long)progress_points[i].context_generation,
+               (unsigned long long)progress_points[i].progress_value,
+               (int)status, (unsigned)progress.flags);
          }
       }
 
