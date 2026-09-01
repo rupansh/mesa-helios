@@ -42,6 +42,16 @@ vn_cmd_submit(struct vn_command_buffer *cmd);
 #define HELIOS_REFUSE(cmd_handle, name)                                      \
    vn_helios_cmd_refuse(HELIOS_CMD(cmd_handle),                              \
                         VK_COMMAND_TYPE_##name##_EXT)
+/* An image barrier rewrites content only when it discards it (oldLayout
+ * UNDEFINED). A preserving transition is ordering, not a write: the WRITE
+ * over-claim became the D3DDDI allocation-list WriteOperation bit, and
+ * dxgkrnl refuses a write reference to an allocation the process opened
+ * read-only with STATUS_ACCESS_DENIED. DWM opens flip-model swapchain
+ * buffers read-only and transitions them at first use and release, so every
+ * consumed flip frame killed DWM's device (ROADMAP D6, 2026-09-02). */
+#define HELIOS_IMAGE_BARRIER_ACCESS(old_layout)                              \
+   ((old_layout) == VK_IMAGE_LAYOUT_UNDEFINED ? HELIOS_READ_WRITE            \
+                                              : HELIOS_READ)
 #else
 #define HELIOS_TOUCH_BUFFER(...) ((void)0)
 #define HELIOS_TOUCH_IMAGE(...) ((void)0)
@@ -1939,7 +1949,8 @@ vn_CmdWaitEvents(VkCommandBuffer commandBuffer,
          VK_COMMAND_TYPE_vkCmdWaitEvents_EXT);
    for (uint32_t i = 0; i < imageMemoryBarrierCount; i++)
       vn_helios_cmd_touch_image(
-         cmd, pImageMemoryBarriers[i].image, HELIOS_READ_WRITE,
+         cmd, pImageMemoryBarriers[i].image,
+         HELIOS_IMAGE_BARRIER_ACCESS(pImageMemoryBarriers[i].oldLayout),
          VK_COMMAND_TYPE_vkCmdWaitEvents_EXT);
 #endif
 
@@ -1982,7 +1993,9 @@ vn_CmdWaitEvents2(VkCommandBuffer commandBuffer,
            i < pDependencyInfos[d].imageMemoryBarrierCount; i++)
          vn_helios_cmd_touch_image(
             cmd, pDependencyInfos[d].pImageMemoryBarriers[i].image,
-            HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT);
+            HELIOS_IMAGE_BARRIER_ACCESS(
+               pDependencyInfos[d].pImageMemoryBarriers[i].oldLayout),
+            VK_COMMAND_TYPE_vkCmdWaitEvents2_EXT);
    }
 #endif
 
@@ -2017,7 +2030,8 @@ vn_CmdPipelineBarrier(VkCommandBuffer commandBuffer,
          VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT);
    for (uint32_t i = 0; i < imageMemoryBarrierCount; i++)
       vn_helios_cmd_touch_image(
-         cmd, pImageMemoryBarriers[i].image, HELIOS_READ_WRITE,
+         cmd, pImageMemoryBarriers[i].image,
+         HELIOS_IMAGE_BARRIER_ACCESS(pImageMemoryBarriers[i].oldLayout),
          VK_COMMAND_TYPE_vkCmdPipelineBarrier_EXT);
 #endif
 
@@ -2048,7 +2062,9 @@ vn_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++)
       vn_helios_cmd_touch_image(
          cmd, pDependencyInfo->pImageMemoryBarriers[i].image,
-         HELIOS_READ_WRITE, VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT);
+         HELIOS_IMAGE_BARRIER_ACCESS(
+            pDependencyInfo->pImageMemoryBarriers[i].oldLayout),
+         VK_COMMAND_TYPE_vkCmdPipelineBarrier2_EXT);
 #endif
 
    pDependencyInfo = vn_cmd_fix_dependency_infos(cmd, 1, pDependencyInfo);
