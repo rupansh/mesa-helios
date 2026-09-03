@@ -122,11 +122,22 @@ vn_renderer_helios_diag_log(const char *fmt, ...)
    line[used++] = '\n';
    line[used] = '\0';
    OutputDebugStringA(line);
-   /* Diagnostic triple-write: OutputDebugString needs a listener nobody has
-    * running, and dwm has no stderr; the append file is readable from the
-    * probe workflow. */
-   fputs(line, stderr);
-   fflush(stderr);
+   /* OutputDebugString needs a listener nobody has running, and dwm has no
+    * stderr; the append file is what the probe workflow reads. stderr is
+    * OPT-IN (HELIOS_ICD_DIAG_STDERR=1): a parent that does not drain the pipe
+    * blocks the child on the 4 KiB buffer forever — 3DMark's dxinfo helper
+    * sat in WriteFile inside a pipeline compile until its 60 s timeout, which
+    * is the "stuck at initializing" wait and the CLI's SystemInfo failure
+    * (2026-09-03). */
+   static int stderr_sink = -1;
+   if (stderr_sink < 0) {
+      const char *v = getenv("HELIOS_ICD_DIAG_STDERR");
+      stderr_sink = v && strcmp(v, "0") != 0 ? 1 : 0;
+   }
+   if (stderr_sink) {
+      fputs(line, stderr);
+      fflush(stderr);
+   }
    FILE *f = fopen("C:\\ProgramData\\Helios\\icd-diag.log", "a");
    if (f) {
       fputs(line, f);
