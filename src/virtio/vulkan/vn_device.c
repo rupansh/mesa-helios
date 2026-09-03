@@ -830,7 +830,16 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    /* Helios uses a System-class transport without the Linux DRM syncobj/fd
     * lifetime machinery.  Do not let renderer/context teardown race host-side
     * vkDestroyDevice consumption.
+    *
+    * Record-only: the device was created by the translation session's HTS1
+    * init and dies with the session at context destroy; the KMD's control
+    * schema refuses a wire vkDestroyDevice (opcode 12, UnknownOpcode) and that
+    * refusal loses the context (3DMarkCmd's probe device, 2026-09-03).
     */
+#if DETECT_OS_WINDOWS
+   if (vn_helios_submit_instance_mode(dev->instance) !=
+       VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)
+#endif
    {
       struct vn_ring_submit_command ring_submit;
       vn_submit_vkDestroyDevice(dev->primary_ring, 0, device, NULL,
