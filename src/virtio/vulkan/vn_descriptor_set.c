@@ -49,6 +49,10 @@ vn_descriptor_set_destroy(struct vn_device *dev,
    list_del(&set->head);
 
 #if DETECT_OS_WINDOWS
+   /* The host is freeing this set (pool reset/free/destroy).  Drop any pending
+    * deferred vkUpdateDescriptorSets that writes it, so no later batch splices
+    * a reference to the now-freed host object (defect A, 2026-09-04). */
+   vn_helios_record_drop_object_commands_for_set(dev, set->base.id);
    vk_free(alloc, set->helios_slots);
    set->helios_slots = NULL;
    set->helios_slot_count = 0;
@@ -1110,6 +1114,42 @@ helios_defer_descriptor_update(struct vn_device *dev,
    uint32_t dep_capacity = 0;
    bool ok = true;
 
+   /* The host dereferences every descriptor set this update touches, so each
+    * must still exist when the deferred command finally executes.  Record
+    * their guest object ids: if a set is destroyed (pool reset/free/destroy)
+    * while this command still lingers, the command is dropped rather than
+    * spliced into a batch that would fail the host object lookup (defect A). */
+   uint64_t *set_ids = NULL;
+   uint32_t set_count = 0;
+   uint32_t set_capacity = 0;
+#define HELIOS_ADD_SET_ID(handle)                                             \
+   do {                                                                       \
+      const struct vn_descriptor_set *_s =                                    \
+         vn_descriptor_set_from_handle(handle);                              \
+      if (_s && _s->base.id) {                                                \
+         bool _dup = false;                                                   \
+         for (uint32_t _i = 0; _i < set_count; _i++)                          \
+            if (set_ids[_i] == _s->base.id) { _dup = true; break; }           \
+         if (!_dup) {                                                         \
+            if (set_count == set_capacity) {                                  \
+               uint32_t _cap = set_capacity ? set_capacity * 2u : 8u;         \
+               uint64_t *_g = realloc(set_ids, _cap * sizeof(*set_ids));      \
+               if (!_g) { ok = false; }                                       \
+               else { set_ids = _g; set_capacity = _cap; }                    \
+            }                                                                 \
+            if (ok) set_ids[set_count++] = _s->base.id;                       \
+         }                                                                    \
+      }                                                                       \
+   } while (0)
+
+   for (uint32_t w = 0; w < write_count && ok; w++)
+      HELIOS_ADD_SET_ID(writes[w].dstSet);
+   for (uint32_t c = 0; c < copy_count && ok; c++) {
+      HELIOS_ADD_SET_ID(copies[c].dstSet);
+      HELIOS_ADD_SET_ID(copies[c].srcSet);
+   }
+#undef HELIOS_ADD_SET_ID
+
    for (uint32_t w = 0; w < write_count && ok; w++) {
       const VkWriteDescriptorSet *write = &writes[w];
       switch (write->descriptorType) {
@@ -1175,7 +1215,7 @@ helios_defer_descriptor_update(struct vn_device *dev,
             const size_t len = vn_cs_encoder_get_len(&enc);
             if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity) {
                defer_result = vn_helios_record_defer_object_command(
-                  dev, buf, len, deps, dep_count);
+                  dev, buf, len, deps, dep_count, set_ids, set_count);
                if (defer_result == VK_SUCCESS)
                   buf = NULL;
             } else {
@@ -1186,6 +1226,7 @@ helios_defer_descriptor_update(struct vn_device *dev,
       }
    }
    free(deps);
+   free(set_ids);
    if (defer_result != VK_SUCCESS) {
       /* Falling back to the ring could overtake pending creates and kill the
        * venus context from the host side; fail the device loudly instead. */

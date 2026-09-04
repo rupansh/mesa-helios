@@ -92,6 +92,14 @@ struct vn_helios_object_command {
    uint64_t reserved_batch_id;
    uint8_t *payload;
    uint64_t payload_bytes;
+   /* Descriptor sets this command's vkUpdateDescriptorSets writes (guest
+    * vn_object_id, baked into `payload`).  NULL/0 for non-update commands.
+    * A separate malloc: when any of these sets is destroyed on the host
+    * (pool reset/free/destroy), the update becomes a stale reference and must
+    * be dropped before it is spliced — the host would else fail its object
+    * lookup and destroy the whole venus context (defect A, 2026-09-04). */
+   uint64_t *update_set_ids;
+   uint32_t update_set_count;
    uint32_t dep_count;
    struct vn_helios_memory_binding deps[];
 };
@@ -1404,22 +1412,39 @@ vn_helios_record_defer_object_command(
    void *payload,
    uint64_t payload_bytes,
    const struct vn_helios_memory_binding *deps,
-   uint32_t dep_count)
+   uint32_t dep_count,
+   const uint64_t *update_set_ids,
+   uint32_t update_set_count)
 {
    if (!dev || !payload || !payload_bytes ||
        payload_bytes > HELIOS_HOB1_MAX_BYTES ||
-       (dep_count && !deps) || dep_count > HELIOS_HOB1_MAX_USE_RECORDS)
+       (dep_count && !deps) || dep_count > HELIOS_HOB1_MAX_USE_RECORDS ||
+       (update_set_count && !update_set_ids))
       return VK_ERROR_VALIDATION_FAILED_EXT;
    size_t item_bytes;
    if (!helios_size_mul(dep_count, sizeof(*deps), &item_bytes) ||
        item_bytes > SIZE_MAX - sizeof(struct vn_helios_object_command))
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   uint64_t *set_ids = NULL;
+   if (update_set_count) {
+      size_t set_bytes;
+      if (!helios_size_mul(update_set_count, sizeof(*set_ids), &set_bytes))
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      set_ids = malloc(set_bytes);
+      if (!set_ids)
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      memcpy(set_ids, update_set_ids, set_bytes);
+   }
    struct vn_helios_object_command *item =
       calloc(1, sizeof(*item) + item_bytes);
-   if (!item)
+   if (!item) {
+      free(set_ids);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    item->payload = payload;
    item->payload_bytes = payload_bytes;
+   item->update_set_ids = set_ids;
+   item->update_set_count = update_set_count;
    item->dep_count = dep_count;
    if (dep_count)
       memcpy(item->deps, deps, item_bytes);
@@ -1429,6 +1454,7 @@ vn_helios_record_defer_object_command(
           HELIOS_OBJECT_COMMAND_MAX_PENDING_BYTES - payload_bytes ||
        dev->helios_object_command_count == HELIOS_HOB1_MAX_OPERAND_RECORDS) {
       simple_mtx_unlock(&dev->mutex);
+      free(item->update_set_ids);
       free(item);
       vn_renderer_helios_diag_log(
          "HOC1 pending-lane overflow bytes=%llu count=%u",
@@ -1534,12 +1560,64 @@ vn_helios_record_drop_object_commands(struct vn_device *dev)
    list_for_each_entry_safe(struct vn_helios_object_command, item,
                             &dev->helios_object_commands, link) {
       list_del(&item->link);
+      free(item->update_set_ids);
       free(item->payload);
       free(item);
    }
    dev->helios_object_command_count = 0;
    dev->helios_object_command_bytes = 0;
    simple_mtx_unlock(&dev->mutex);
+}
+
+/* A descriptor set is being destroyed on the host (via vkResetDescriptorPool /
+ * vkFreeDescriptorSets / vkDestroyDescriptorPool, all synchronous on the
+ * control ring).  Any pending deferred vkUpdateDescriptorSets that writes this
+ * set is now a stale reference: if a later sealed batch splices it, the host
+ * fails the object lookup ("failed to look up object N of type 23") and
+ * destroys the whole venus context (defect A).  Drop those commands here,
+ * before they can be consumed.
+ *
+ * Only NOT-reserved commands are dropped: a reserved one has already been
+ * memcpy'd into an in-flight scope's payload and that batch was enqueued on
+ * the SUBMIT_3D virtqueue before this synchronous free — the host processes
+ * the update before the free, so the set is still live for it. */
+void
+vn_helios_record_drop_object_commands_for_set(struct vn_device *dev,
+                                              uint64_t set_id)
+{
+   if (!dev || !set_id)
+      return;
+   uint32_t dropped = 0;
+   simple_mtx_lock(&dev->mutex);
+   list_for_each_entry_safe(struct vn_helios_object_command, item,
+                            &dev->helios_object_commands, link) {
+      if (item->reserved_context_generation || item->reserved_batch_id)
+         continue;
+      bool refs = false;
+      for (uint32_t i = 0; i < item->update_set_count; i++) {
+         if (item->update_set_ids[i] == set_id) {
+            refs = true;
+            break;
+         }
+      }
+      if (!refs)
+         continue;
+      list_del(&item->link);
+      assert(dev->helios_object_command_count > 0);
+      dev->helios_object_command_count--;
+      dev->helios_object_command_bytes -= item->payload_bytes;
+      free(item->update_set_ids);
+      free(item->payload);
+      free(item);
+      dropped++;
+   }
+   const uint32_t remaining = dev->helios_object_command_count;
+   simple_mtx_unlock(&dev->mutex);
+   if (dropped)
+      vn_renderer_helios_diag_log(
+         "HDU pid=%lu drop set_id=%llu dropped=%u pending=%u",
+         (unsigned long)GetCurrentProcessId(),
+         (unsigned long long)set_id, dropped, remaining);
 }
 
 static VkResult
@@ -2094,6 +2172,7 @@ helios_record_append(struct vn_queue *queue,
             assert(dev->helios_object_command_count > 0);
             dev->helios_object_command_count--;
             dev->helios_object_command_bytes -= item->payload_bytes;
+            free(item->update_set_ids);
             free(item->payload);
             free(item);
             break;
@@ -2484,6 +2563,7 @@ helios_scope_retire_object_commands(struct HeliosTranslatorScope_T *scope,
    simple_mtx_unlock(&dev->mutex);
    if (committed) {
       for (uint32_t i = 0; i < scope->object_command_count; i++) {
+         free(scope->object_commands[i]->update_set_ids);
          free(scope->object_commands[i]->payload);
          free(scope->object_commands[i]);
       }

@@ -926,7 +926,8 @@ vn_CreateBufferView(VkDevice device,
             const size_t len = vn_cs_encoder_get_len(&enc);
             if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity) {
                defer_result = vn_helios_record_defer_object_command(
-                  dev, buf, len, &view->helios_buffer->helios_binding, 1);
+                  dev, buf, len, &view->helios_buffer->helios_binding, 1,
+                  NULL, 0);
                if (defer_result == VK_SUCCESS)
                   buf = NULL;
             } else {
@@ -986,7 +987,7 @@ vn_DestroyBufferView(VkDevice device,
             if (!vn_cs_encoder_get_fatal(&enc) && len && len <= capacity &&
                 vn_helios_record_defer_object_command(
                    dev, buf, len, &view->helios_buffer->helios_binding,
-                   1) == VK_SUCCESS) {
+                   1, NULL, 0) == VK_SUCCESS) {
                destroyed = true;
             } else {
                free(buf);

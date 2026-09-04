@@ -1301,7 +1301,7 @@ vn_CreateImageView(VkDevice device,
                if (!vn_cs_encoder_get_fatal(&enc) && len &&
                    len <= capacity) {
                   defer_result = vn_helios_record_defer_object_command(
-                     dev, buf, len, deps, dep_count);
+                     dev, buf, len, deps, dep_count, NULL, 0);
                   if (defer_result == VK_SUCCESS)
                      buf = NULL;
                } else {
@@ -1372,7 +1372,7 @@ vn_DestroyImageView(VkDevice device,
                if (!vn_cs_encoder_get_fatal(&enc) && len &&
                    len <= capacity &&
                    vn_helios_record_defer_object_command(
-                      dev, buf, len, deps, dep_count) == VK_SUCCESS) {
+                      dev, buf, len, deps, dep_count, NULL, 0) == VK_SUCCESS) {
                   destroyed = true;
                } else {
                   free(buf);

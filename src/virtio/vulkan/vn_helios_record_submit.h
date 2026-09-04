@@ -214,11 +214,21 @@ vn_helios_record_defer_object_command(
    void *payload,
    uint64_t payload_bytes,
    const struct vn_helios_memory_binding *deps,
-   uint32_t dep_count);
+   uint32_t dep_count,
+   const uint64_t *update_set_ids,
+   uint32_t update_set_count);
 
 /* Device teardown: free never-consumed object commands. */
 void
 vn_helios_record_drop_object_commands(struct vn_device *dev);
+
+/* A descriptor set is being destroyed on the host (pool reset/free/destroy):
+ * drop any pending, not-yet-spliced object command whose deferred
+ * vkUpdateDescriptorSets writes that set, so a later batch can never reference
+ * the freed host object (defect A). */
+void
+vn_helios_record_drop_object_commands_for_set(struct vn_device *dev,
+                                              uint64_t set_id);
 
 #endif /* _WIN32 */
 #endif /* VN_HELIOS_RECORD_SUBMIT_H */
