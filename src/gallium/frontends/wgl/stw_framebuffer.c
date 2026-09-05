@@ -139,6 +139,9 @@ stw_framebuffer_get_size(struct stw_framebuffer *fb)
    RECT client_rect;
    RECT window_rect;
    POINT client_pos;
+#ifdef GALLIUM_ZINK
+   const bool was_minimized = fb->minimized;
+#endif
 
    /*
     * Sanity checking.
@@ -160,6 +163,16 @@ stw_framebuffer_get_size(struct stw_framebuffer *fb)
    height = client_rect.bottom - client_rect.top;
 
    fb->minimized = width == 0 || height == 0;
+
+#ifdef GALLIUM_ZINK
+   if (stw_dev->zink && fb->minimized != was_minimized) {
+      /* Zink uses ordinary resources while minimized and drawable resources
+       * otherwise.  Revalidate on both transitions, even though the nonzero
+       * framebuffer dimensions are deliberately preserved while minimized.
+       */
+      fb->must_resize = true;
+   }
+#endif
 
    if (width <= 0 || height <= 0) {
       /*

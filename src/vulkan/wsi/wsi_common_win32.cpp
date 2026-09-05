@@ -608,23 +608,62 @@ wsi_win32_hwnd_comp_release(struct wsi_win32_vehicle_runtime *rt,
       free(comp);
 }
 
-/* Vulkan surface format -> vehicle backbuffer format. Flip-model swapchains
- * refuse SRGB formats; UNORM + raw bytes matches what the sw path presents
- * today (the bits are sRGB-encoded either way, dwm treats composition
- * surfaces as sRGB content). Unsupported -> DXGI_FORMAT_UNKNOWN = the chain
- * latches FAILED (counted), sw path serves it. */
-static DXGI_FORMAT
-wsi_win32_vehicle_dxgi_format(VkFormat format)
+/* One source of truth for every Win32 presentation path.  The DXGI format is
+ * used by native and vehicle swapchains; the masks describe the same bytes to
+ * GDI when a software present is required.  Keep formats here only when all
+ * three paths can preserve their component layout.
+ *
+ * Flip-model swapchains refuse SRGB DXGI formats.  Mapping the Vulkan SRGB
+ * format to UNORM preserves the bytes: the surface color space still tells
+ * DWM that the encoded values are nonlinear. */
+struct wsi_win32_present_format {
+   VkFormat vk_format;
+   DXGI_FORMAT dxgi_format;
+   DWORD red_mask;
+   DWORD green_mask;
+   DWORD blue_mask;
+   DWORD alpha_mask;
+};
+
+static const struct wsi_win32_present_format wsi_win32_present_formats[] = {
+   { VK_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM,
+     0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000 },
+   { VK_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM,
+     0x000000ff, 0x0000ff00, 0x00ff0000, 0xff000000 },
+   { VK_FORMAT_B8G8R8A8_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM,
+     0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000 },
+   { VK_FORMAT_A2B10G10R10_UNORM_PACK32, DXGI_FORMAT_R10G10B10A2_UNORM,
+     0x000003ff, 0x000ffc00, 0x3ff00000, 0xc0000000 },
+};
+
+static const struct wsi_win32_present_format *
+wsi_win32_find_present_format(VkFormat format)
 {
-   switch (format) {
-   case VK_FORMAT_B8G8R8A8_UNORM:
-   case VK_FORMAT_B8G8R8A8_SRGB:
-      return DXGI_FORMAT_B8G8R8A8_UNORM;
-   case VK_FORMAT_R8G8B8A8_UNORM:
-      return DXGI_FORMAT_R8G8B8A8_UNORM;
-   default:
-      return DXGI_FORMAT_UNKNOWN;
+   for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++) {
+      if (wsi_win32_present_formats[i].vk_format == format)
+         return &wsi_win32_present_formats[i];
    }
+
+   return NULL;
+}
+
+static BITMAPV5HEADER
+wsi_win32_bitmap_header(const struct wsi_win32_present_format *format,
+                        LONG width, LONG height)
+{
+   BITMAPV5HEADER header = {};
+   header.bV5Size = sizeof(header);
+   header.bV5Width = width;
+   header.bV5Height = -height;
+   header.bV5Planes = 1;
+   header.bV5BitCount = 32;
+   header.bV5Compression = BI_BITFIELDS;
+   header.bV5RedMask = format->red_mask;
+   header.bV5GreenMask = format->green_mask;
+   header.bV5BlueMask = format->blue_mask;
+   header.bV5AlphaMask = format->alpha_mask;
+   header.bV5CSType = LCS_sRGB;
+   return header;
 }
 
 enum wsi_win32_image_state {
@@ -694,7 +733,10 @@ struct wsi_win32_swapchain {
    mtx_t                      acquire_mutex;
    struct u_cnd_monotonic     acquire_cond;
    uint64_t                     flip_sequence;
-   VkResult                     status;
+   /* First terminal swapchain error.  Access only through the Interlocked
+    * helpers below because async presentation may update it from a worker.
+    */
+   volatile LONG                status;
    VkExtent2D                 extent;
    HWND wnd;
    HDC chain_dc;
@@ -963,8 +1005,9 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
    if (!wsi_win32_vehicle_enabled() || chain->dxgi)
       return;
 
-   DXGI_FORMAT format = wsi_win32_vehicle_dxgi_format(create_info->imageFormat);
-   if (format == DXGI_FORMAT_UNKNOWN) {
+   const struct wsi_win32_present_format *format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!format) {
       helios_wsi_vehicle_diag("REFUSED chain=%p unsupported VkFormat %u",
                               (void *)chain, (unsigned)create_info->imageFormat);
       InterlockedIncrement(&helios_vehicle_create_fails);
@@ -976,7 +1019,7 @@ wsi_win32_vehicle_start(struct wsi_win32_swapchain *chain,
    v->hwnd = win32_surface->hwnd;
    v->width = MAX2(create_info->imageExtent.width, 1u);
    v->height = MAX2(create_info->imageExtent.height, 1u);
-   v->format = format;
+   v->format = format->dxgi_format;
    /* BufferCount >= 3: flip-model needs headroom so Present never blocks on
     * the compositor holding a buffer (design note, road 4). */
    v->buffer_count = MAX2(3u, create_info->minImageCount);
@@ -1170,15 +1213,83 @@ wsi_win32_surface_get_support(VkIcdSurfaceBase *surface,
 }
 
 static VkResult
+wsi_win32_get_client_extent(HWND hwnd, VkExtent2D *extent)
+{
+   RECT rect;
+   if (!GetClientRect(hwnd, &rect))
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   const LONG width = rect.right - rect.left;
+   const LONG height = rect.bottom - rect.top;
+
+   /* The Win32 WSI specification requires both dimensions to be zero when
+    * the window has no drawable area.  GetClientRect can briefly return a
+    * zero for only one dimension while a window is being created or resized.
+    */
+   if (width <= 0 || height <= 0)
+      *extent = { 0u, 0u };
+   else
+      *extent = { (uint32_t)width, (uint32_t)height };
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+wsi_win32_swapchain_read_status(struct wsi_win32_swapchain *chain)
+{
+   return (VkResult)InterlockedCompareExchange(&chain->status,
+                                                VK_SUCCESS, VK_SUCCESS);
+}
+
+static VkResult
+wsi_win32_swapchain_latch_error(struct wsi_win32_swapchain *chain,
+                                VkResult result)
+{
+   assert(result < 0);
+
+   const LONG previous =
+      InterlockedCompareExchange(&chain->status, (LONG)result, VK_SUCCESS);
+   if (previous == VK_SUCCESS && !chain->dxgi) {
+      mtx_lock(&chain->acquire_mutex);
+      u_cnd_monotonic_broadcast(&chain->acquire_cond);
+      mtx_unlock(&chain->acquire_mutex);
+   }
+
+   return previous == VK_SUCCESS ? result : (VkResult)previous;
+}
+
+static VkResult
+wsi_win32_swapchain_validate_extent(struct wsi_win32_swapchain *chain)
+{
+   VkResult result = wsi_win32_swapchain_read_status(chain);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkExtent2D current_extent;
+   result = wsi_win32_get_client_extent(chain->surface->base.hwnd,
+                                        &current_extent);
+   if (result != VK_SUCCESS)
+      return wsi_win32_swapchain_latch_error(chain, result);
+
+   if (current_extent.width != chain->extent.width ||
+       current_extent.height != chain->extent.height)
+      return wsi_win32_swapchain_latch_error(chain,
+                                             VK_ERROR_OUT_OF_DATE_KHR);
+
+   return wsi_win32_swapchain_read_status(chain);
+}
+
+static VkResult
 wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
                                    struct wsi_device *wsi_device,
                                    VkSurfaceCapabilitiesKHR* caps)
 {
    VkIcdSurfaceWin32 *surface = (VkIcdSurfaceWin32 *)surf;
 
-   RECT win_rect;
-   if (!GetClientRect(surface->hwnd, &win_rect))
-      return VK_ERROR_SURFACE_LOST_KHR;
+   VkExtent2D extent;
+   VkResult result = wsi_win32_get_client_extent(surface->hwnd, &extent);
+   if (result != VK_SUCCESS)
+      return result;
 
    caps->minImageCount = 1;
 
@@ -1194,15 +1305,12 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
       caps->maxImageCount = 0;
    }
 
-   caps->currentExtent = {
-      (uint32_t)win_rect.right - (uint32_t)win_rect.left,
-      (uint32_t)win_rect.bottom - (uint32_t)win_rect.top
-   };
-   caps->minImageExtent = { 1u, 1u };
-   caps->maxImageExtent = {
-      wsi_device->maxImageDimension2D,
-      wsi_device->maxImageDimension2D,
-   };
+   /* Win32 does not support choosing a swapchain extent independently of the
+    * native window size.  This includes the normalized 0x0 minimized state.
+    */
+   caps->currentExtent = extent;
+   caps->minImageExtent = extent;
+   caps->maxImageExtent = extent;
 
    caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
    caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
@@ -1297,23 +1405,14 @@ wsi_win32_surface_get_capabilities2(VkIcdSurfaceBase *surface,
 }
 
 
-static const struct {
-   VkFormat     format;
-} available_surface_formats[] = {
-   { VK_FORMAT_B8G8R8A8_UNORM },
-   { VK_FORMAT_R8G8B8A8_UNORM },
-   { VK_FORMAT_B8G8R8A8_SRGB },
-};
-
-
 static void
 get_sorted_vk_formats(struct wsi_device *wsi_device, VkFormat *sorted_formats)
 {
-   for (unsigned i = 0; i < ARRAY_SIZE(available_surface_formats); i++)
-      sorted_formats[i] = available_surface_formats[i].format;
+   for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++)
+      sorted_formats[i] = wsi_win32_present_formats[i].vk_format;
 
    if (wsi_device->force_bgra8_unorm_first) {
-      for (unsigned i = 0; i < ARRAY_SIZE(available_surface_formats); i++) {
+      for (unsigned i = 0; i < ARRAY_SIZE(wsi_win32_present_formats); i++) {
          if (sorted_formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
             sorted_formats[i] = sorted_formats[0];
             sorted_formats[0] = VK_FORMAT_B8G8R8A8_UNORM;
@@ -1331,7 +1430,7 @@ wsi_win32_surface_get_formats(VkIcdSurfaceBase *icd_surface,
 {
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
-   VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
+   VkFormat sorted_formats[ARRAY_SIZE(wsi_win32_present_formats)];
    get_sorted_vk_formats(wsi_device, sorted_formats);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
@@ -1353,7 +1452,7 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
 {
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
-   VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
+   VkFormat sorted_formats[ARRAY_SIZE(wsi_win32_present_formats)];
    get_sorted_vk_formats(wsi_device, sorted_formats);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
@@ -1542,6 +1641,11 @@ wsi_win32_image_init(VkDevice device_h,
                      const VkAllocationCallbacks *allocator,
                      struct wsi_win32_image *image)
 {
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!present_format)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    VkResult result = wsi_create_image(&chain->base, &chain->base.image_info,
                                       &image->base);
    if (result != VK_SUCCESS)
@@ -1555,27 +1659,35 @@ wsi_win32_image_init(VkDevice device_h,
       return VK_SUCCESS;
 
    HDC wnd_dc = GetDC(chain->wnd);
-   if (!wnd_dc)
+   if (!wnd_dc) {
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_SURFACE_LOST_KHR;
+   }
 
    image->sw.dc = CreateCompatibleDC(wnd_dc);
    ReleaseDC(chain->wnd, wnd_dc);
-   if (!image->sw.dc)
+   if (!image->sw.dc) {
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    HBITMAP bmp = NULL;
 
-   BITMAPINFO info = { 0 };
-   info.bmiHeader.biSize = sizeof(BITMAPINFO);
-   info.bmiHeader.biWidth = create_info->imageExtent.width;
-   info.bmiHeader.biHeight = -create_info->imageExtent.height;
-   info.bmiHeader.biPlanes = 1;
-   info.bmiHeader.biBitCount = 32;
-   info.bmiHeader.biCompression = BI_RGB;
+   BITMAPV5HEADER info =
+      wsi_win32_bitmap_header(present_format,
+                              (LONG)create_info->imageExtent.width,
+                              (LONG)create_info->imageExtent.height);
 
-   bmp = CreateDIBSection(image->sw.dc, &info, DIB_RGB_COLORS, &image->sw.ppvBits, NULL, 0);
-   if (!bmp || !image->sw.ppvBits)
+   bmp = CreateDIBSection(image->sw.dc, (BITMAPINFO *)&info, DIB_RGB_COLORS,
+                          &image->sw.ppvBits, NULL, 0);
+   if (!bmp || !image->sw.ppvBits) {
+      if (bmp)
+         DeleteObject(bmp);
+      DeleteDC(image->sw.dc);
+      image->sw.dc = NULL;
+      wsi_destroy_image(&chain->base, &image->base);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
 
    SelectObject(image->sw.dc, bmp);
 
@@ -1715,8 +1827,9 @@ wsi_win32_release_images(struct wsi_swapchain *drv_chain,
    struct wsi_win32_swapchain *chain =
       (struct wsi_win32_swapchain *)drv_chain;
 
-   if (chain->status == VK_ERROR_SURFACE_LOST_KHR)
-      return chain->status;
+   VkResult status = wsi_win32_swapchain_read_status(chain);
+   if (status == VK_ERROR_SURFACE_LOST_KHR)
+      return status;
 
    for (uint32_t i = 0; i < count; i++) {
       uint32_t index = indices[i];
@@ -1747,6 +1860,10 @@ wsi_win32_acquire_idle_cpu_image_locked(struct wsi_win32_swapchain *chain,
                                         const VkAcquireNextImageInfoKHR *info,
                                         uint32_t *out_image_index)
 {
+   VkResult status = wsi_win32_swapchain_read_status(chain);
+   if (status != VK_SUCCESS)
+      return status;
+
    if (wsi_win32_find_idle_image(chain, out_image_index))
       return VK_SUCCESS;
 
@@ -1763,6 +1880,10 @@ wsi_win32_acquire_idle_cpu_image_locked(struct wsi_win32_swapchain *chain,
          return VK_TIMEOUT;
       else if (ret != thrd_success)
          return VK_ERROR_OUT_OF_DATE_KHR;
+
+      status = wsi_win32_swapchain_read_status(chain);
+      if (status != VK_SUCCESS)
+         return status;
    } while (!wsi_win32_find_idle_image(chain, out_image_index));
 
    return VK_SUCCESS;
@@ -1777,6 +1898,8 @@ wsi_win32_acquire_idle_cpu_image(struct wsi_win32_swapchain *chain,
    VkResult result = wsi_win32_acquire_idle_cpu_image_locked(chain, info,
                                                              out_image_index);
    mtx_unlock(&chain->acquire_mutex);
+   if (result == VK_ERROR_OUT_OF_DATE_KHR)
+      result = wsi_win32_swapchain_latch_error(chain, result);
    return result;
 }
 
@@ -1847,22 +1970,34 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
    struct wsi_win32_swapchain *chain =
       (struct wsi_win32_swapchain *)drv_chain;
 
-   /* Bail early if the swapchain is broken */
-   if (chain->status != VK_SUCCESS)
-      return chain->status;
+   /* Win32 swapchain extents are fixed to the native client area.  Report a
+    * live resize at acquire so applications can recreate the swapchain before
+    * rendering another frame at stale dimensions.
+    */
+   VkResult result = wsi_win32_swapchain_validate_extent(chain);
+   if (result != VK_SUCCESS)
+      return result;
 
    /* acquire timeout has to be explicitly handled for sw wsi */
    if (!chain->dxgi) {
-      VkResult result =
+      result =
          wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
-      if (result == VK_SUCCESS)
+      if (result == VK_SUCCESS) {
          wsi_win32_acquire_gate_vehicle_release(chain,
                                                 &chain->images[*image_index]);
+         result = wsi_win32_swapchain_validate_extent(chain);
+         if (result != VK_SUCCESS)
+            wsi_win32_set_image_idle(chain, &chain->images[*image_index]);
+      }
       return result;
    }
 
-   if (wsi_win32_find_idle_image(chain, image_index))
-      return VK_SUCCESS;
+   if (wsi_win32_find_idle_image(chain, image_index)) {
+      result = wsi_win32_swapchain_validate_extent(chain);
+      if (result != VK_SUCCESS)
+         wsi_win32_set_image_idle(chain, &chain->images[*image_index]);
+      return result;
+   }
 
    assert(chain->dxgi);
    uint32_t index = chain->dxgi->GetCurrentBackBufferIndex();
@@ -1877,7 +2012,23 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
 
    *image_index = index;
    chain->images[index].state = WSI_IMAGE_DRAWING;
-   return VK_SUCCESS;
+   result = wsi_win32_swapchain_validate_extent(chain);
+   if (result != VK_SUCCESS)
+      wsi_win32_set_image_idle(chain, &chain->images[index]);
+   return result;
+}
+
+static VkResult
+wsi_win32_pre_present(struct wsi_swapchain *drv_chain, uint32_t image_index)
+{
+   struct wsi_win32_swapchain *chain =
+      (struct wsi_win32_swapchain *)drv_chain;
+   assert(image_index < chain->base.image_count);
+
+   VkResult result = wsi_win32_swapchain_validate_extent(chain);
+   if (result != VK_SUCCESS)
+      wsi_win32_set_image_idle(chain, &chain->images[image_index]);
+   return result;
 }
 
 static VkResult
@@ -1921,9 +2072,7 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
       chain->surface->current_swapchain = chain;
    }
 
-   /* Mark the other image idle */
-   chain->status = VK_SUCCESS;
-   return VK_SUCCESS;
+   return wsi_win32_swapchain_read_status(chain);
 }
 
 /* Unbind the surface visual's content when THIS chain is bound. Required
@@ -2088,7 +2237,6 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
          helios_wsi_vehicle_diag(
             "drop streak chain=%p len=%u (latency waitable unsignaled — dwm "
             "not consuming)", (void *)chain, streak);
-      chain->status = VK_SUCCESS;
       wsi_win32_set_image_idle(chain, image);
       return true;
    }
@@ -2194,7 +2342,8 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
       /* A dead window is a swapchain-fatal condition, not just a vehicle
        * one — surface loss must reach the app (unit 4 lifecycle). */
       if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
-         chain->status = VK_ERROR_SURFACE_LOST_KHR;
+         wsi_win32_swapchain_latch_error(chain,
+                                         VK_ERROR_SURFACE_LOST_KHR);
       return false;
    }
 
@@ -2256,7 +2405,6 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
    }
 
    InterlockedIncrement(&helios_vehicle_presents);
-   chain->status = VK_SUCCESS;
    wsi_win32_set_image_idle(chain, image);
    return true;
 }
@@ -2273,6 +2421,12 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    assert(image->state == WSI_IMAGE_DRAWING);
 
+   VkResult result = wsi_win32_swapchain_validate_extent(chain);
+   if (result != VK_SUCCESS) {
+      wsi_win32_set_image_idle(chain, image);
+      return result;
+   }
+
    if (chain->dxgi)
       return wsi_win32_queue_present_dxgi(chain, image, damage);
 
@@ -2287,7 +2441,7 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
        * serial frame-fence wait + invalidate; cleared on latch. */
       chain->base.helios_vehicle_serving = true;
       if (wsi_win32_queue_present_vehicle(chain, image))
-         return chain->status;
+         return wsi_win32_swapchain_read_status(chain);
       chain->base.helios_vehicle_serving = false;
    } else if (vehicle_state == WSI_VEHICLE_INIT) {
       InterlockedIncrement(&helios_vehicle_fallbacks);
@@ -2329,17 +2483,16 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    HDC wnd_dc = GetDC(chain->wnd);
    helios_get_dc_ns = os_time_get_nano() - helios_start_ns;
    if (!wnd_dc) {
-      chain->status = VK_ERROR_SURFACE_LOST_KHR;
-      return chain->status;
+      return wsi_win32_swapchain_latch_error(chain,
+                                             VK_ERROR_SURFACE_LOST_KHR);
    }
 
-   BITMAPINFO info = { 0 };
-   info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-   info.bmiHeader.biWidth = present_bitmap_width;
-   info.bmiHeader.biHeight = -(LONG)chain->extent.height;
-   info.bmiHeader.biPlanes = 1;
-   info.bmiHeader.biBitCount = 32;
-   info.bmiHeader.biCompression = BI_RGB;
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(chain->base.image_info.create.format);
+   assert(present_format);
+   BITMAPV5HEADER info =
+      wsi_win32_bitmap_header(present_format, present_bitmap_width,
+                              (LONG)chain->extent.height);
 
    helios_start_ns = os_time_get_nano();
    int copied;
@@ -2349,7 +2502,8 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
    } else {
       copied = StretchDIBits(wnd_dc, 0, 0, chain->extent.width,
                              chain->extent.height, 0, 0, chain->extent.width,
-                             chain->extent.height, present_bits, &info,
+                             chain->extent.height, present_bits,
+                             (BITMAPINFO *)&info,
                              DIB_RGB_COLORS, SRCCOPY);
    }
    helios_stretch_ns = os_time_get_nano() - helios_start_ns;
@@ -2358,7 +2512,7 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
               "wsi/win32: GDI present failed, ret=%d, GetLastError=%lu, dst=%p, extent=%ux%u\n",
               copied, (unsigned long)GetLastError(), wnd_dc,
               chain->extent.width, chain->extent.height);
-      chain->status = VK_ERROR_MEMORY_MAP_FAILED;
+      wsi_win32_swapchain_latch_error(chain, VK_ERROR_MEMORY_MAP_FAILED);
    }
    ReleaseDC(chain->wnd, wnd_dc);
    helios_win32_wsi_perf_note_frame(can_present_cpu_map_directly,
@@ -2367,7 +2521,7 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    wsi_win32_set_image_idle(chain, image);
 
-   return chain->status;
+   return wsi_win32_swapchain_read_status(chain);
 }
 
 static VkResult
@@ -2378,6 +2532,11 @@ wsi_win32_surface_create_swapchain_dxgi(
    const VkSwapchainCreateInfoKHR *create_info,
    struct wsi_win32_swapchain *chain)
 {
+   const struct wsi_win32_present_format *present_format =
+      wsi_win32_find_present_format(create_info->imageFormat);
+   if (!present_format)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
    IDXGIFactory4 *factory = wsi->dxgi.factory;
    ID3D12CommandQueue *queue =
       (ID3D12CommandQueue *)wsi->wsi->win32.get_d3d12_command_queue(device);
@@ -2401,7 +2560,7 @@ wsi_win32_surface_create_swapchain_dxgi(
    DXGI_SWAP_CHAIN_DESC1 desc = {
       create_info->imageExtent.width,
       create_info->imageExtent.height,
-      DXGI_FORMAT_B8G8R8A8_UNORM,
+      present_format->dxgi_format,
       create_info->imageArrayLayers > 1,  // Stereo
       { 1 },                              // SampleDesc
       0,                                  // Usage (filled in below)
@@ -2458,6 +2617,25 @@ wsi_win32_surface_create_swapchain(
       (struct wsi_win32 *) wsi_device->wsi[VK_ICD_WSI_PLATFORM_WIN32];
 
    assert(create_info->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+
+   if (!wsi_win32_find_present_format(create_info->imageFormat))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   /* Win32 requires the swapchain extent to match the current client area.
+    * Reject stale and zero-area extents before image setup so invalid
+    * allocations never reach the Vulkan driver.  Applications can query the
+    * new capabilities and retry after the window changes.
+    */
+   VkExtent2D surface_extent;
+   VkResult result =
+      wsi_win32_get_client_extent(surface->base.hwnd, &surface_extent);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (surface_extent.width == 0 || surface_extent.height == 0 ||
+       create_info->imageExtent.width != surface_extent.width ||
+       create_info->imageExtent.height != surface_extent.height)
+      return VK_ERROR_INITIALIZATION_FAILED;
 
    /* Helios async present: with the fence-wait + blit on the worker thread,
     * the swapchain depth is the app's run-ahead budget — at the requested 2-3
@@ -2519,9 +2697,8 @@ wsi_win32_surface_create_swapchain(
    struct wsi_base_image_params *image_params = supports_dxgi ?
       &dxgi_image_params.base : &cpu_image_params.base;
 
-   VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
-                                        create_info, image_params,
-                                        allocator);
+   result = wsi_swapchain_init(wsi_device, &chain->base, device,
+                               create_info, image_params, allocator);
    if (result != VK_SUCCESS) {
       u_cnd_monotonic_destroy(&chain->acquire_cond);
       mtx_destroy(&chain->acquire_mutex);
@@ -2532,6 +2709,7 @@ wsi_win32_surface_create_swapchain(
    chain->base.destroy = wsi_win32_swapchain_destroy;
    chain->base.get_wsi_image = wsi_win32_get_wsi_image;
    chain->base.acquire_next_image = wsi_win32_acquire_next_image;
+   chain->base.pre_present = wsi_win32_pre_present;
    chain->base.release_images = wsi_win32_release_images;
    chain->base.queue_present = wsi_win32_queue_present;
    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, create_info);

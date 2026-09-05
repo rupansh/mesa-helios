@@ -121,9 +121,11 @@ struct helios_unicode_string {
 #define HELIOS_ESCAPE_UNREGISTER_FENCE_EVENT 0x000Cu
 #define HELIOS_ESCAPE_QUERY_SCANOUT           0x000Du
 #define HELIOS_ESCAPE_PRESENT_STREAM           0x0010u
+#define HELIOS_ESCAPE_PRESENT_BUFFER_READ      0x0012u
 
 #define HELIOS_PRESENT_STREAM_OP_REGISTER   1u
 #define HELIOS_PRESENT_STREAM_OP_UNREGISTER 2u
+#define HELIOS_PRESENT_BUFFER_READ_ACCEPTED 0u
 
 /* helios_escape_fence_event.out_state values (protocol/src/escape.rs). */
 #define HELIOS_FENCE_EVENT_REGISTERED       0u
@@ -144,7 +146,8 @@ struct helios_unicode_string {
 #define HELIOS_WDDM_ALLOC_KIND_TRACKING 3u
 #define HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING 0x40000000u
 #define HELIOS_WDDM_IDENTITY_MAGIC      0x4849444Eu /* 'HIDN' */
-#define HELIOS_WDDM_IDENTITY_VERSION    1u
+#define HELIOS_WDDM_IDENTITY_VERSION_LEGACY 1u
+#define HELIOS_WDDM_IDENTITY_VERSION    2u
 #define HELIOS_STATUS_PENDING           ((NTSTATUS)0x00000103L)
 
 #ifndef OBJ_INHERIT
@@ -193,6 +196,15 @@ struct helios_escape_present_stream {
    uint64_t cookie; /* out on REGISTER; exact in on UNREGISTER */
    uint32_t ctx_id;
    uint32_t op;
+};
+
+struct helios_escape_present_buffer_read {
+   struct helios_escape_header hdr;
+   uint64_t cookie;
+   uint32_t resource_id;
+   uint32_t ctx_id;
+   uint32_t value;
+   uint32_t out_state;
 };
 
 struct helios_escape_alloc_blob {
@@ -334,6 +346,8 @@ _Static_assert(sizeof(struct helios_escape_ctx_destroy) == 24, "ctx_destroy size
 _Static_assert(sizeof(struct helios_escape_submit_venus) == 40, "submit size");
 _Static_assert(sizeof(struct helios_escape_present_stream) == 32,
                "present_stream size");
+_Static_assert(sizeof(struct helios_escape_present_buffer_read) == 40,
+               "present_buffer_read size");
 _Static_assert(sizeof(struct helios_escape_alloc_blob) == 48, "alloc_blob size");
 _Static_assert(sizeof(struct helios_escape_map_blob) == 32, "map_blob size");
 _Static_assert(sizeof(struct helios_escape_release_blob) == 32, "release_blob size");
@@ -1299,6 +1313,7 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
          ? ep->ExceptionRecord->ExceptionInformation[1]
          : 0;
    CONTEXT *c = ep->ContextRecord;
+#if defined(__x86_64__) || defined(_M_X64)
    fprintf(f,
            "%lld pid=%lu av code=0x%08lx ip=0x%llx fault=0x%llx "
            "rax=0x%llx rbx=0x%llx rcx=0x%llx rdx=0x%llx "
@@ -1310,6 +1325,25 @@ helios_vectored_exception_handler(PEXCEPTION_POINTERS ep)
            (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
            (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
            (unsigned long long)c->R8, (unsigned long long)c->R9);
+#elif defined(__i386__) || defined(_M_IX86)
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=0x%08lx fault=0x%llx "
+           "eax=0x%08lx ebx=0x%08lx ecx=0x%08lx edx=0x%08lx "
+           "esi=0x%08lx edi=0x%08lx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           (unsigned long)c->Eip, (unsigned long long)fault,
+           (unsigned long)c->Eax, (unsigned long)c->Ebx,
+           (unsigned long)c->Ecx, (unsigned long)c->Edx,
+           (unsigned long)c->Esi, (unsigned long)c->Edi);
+#else
+   fprintf(f,
+           "%lld pid=%lu av code=0x%08lx ip=%p fault=0x%llx\n",
+           (long long)time(NULL), (unsigned long)GetCurrentProcessId(),
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress,
+           (unsigned long long)fault);
+#endif
    fclose(f);
    return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -1554,14 +1588,11 @@ vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
    struct helios *helios = (struct helios *)renderer;
    uint64_t cookie = 0;
    mtx_lock(&helios->dev_mutex);
-   /* One Venus context has one UMD-created present timeline.  Reject a
-    * different semaphore rather than trying to infer a winner or allowing
-    * two cookies to make the marker's stream identity ambiguous.  Once its
-    * VkSemaphore is destroyed, unregister clears this record and a later
-    * explicit registration is possible. */
-   const bool ok = !helios->present_streams &&
-      helios_ioctl_present_stream(helios, HELIOS_PRESENT_STREAM_OP_REGISTER,
-                                  &cookie);
+   /* Each semaphore has an exact cookie and every per-frame marker carries
+    * that cookie, so multiple timelines in one Venus context remain
+    * unambiguous. The KMD's fixed stream table is the admission bound. */
+   const bool ok = helios_ioctl_present_stream(
+      helios, HELIOS_PRESENT_STREAM_OP_REGISTER, &cookie);
    if (ok) {
       entry->cookie = cookie;
       entry->next = helios->present_streams;
@@ -1573,6 +1604,38 @@ vn_renderer_helios_present_stream_register(struct vn_renderer *renderer,
    if (!ok)
       free(entry);
    return ok;
+}
+
+bool
+vn_renderer_helios_present_buffer_read(struct vn_renderer *renderer,
+                                       uint64_t cookie,
+                                       uint32_t resource_id,
+                                       uint32_t value)
+{
+   if (!renderer || !cookie || !resource_id || !value)
+      return false;
+
+   struct helios *helios = (struct helios *)renderer;
+   bool accepted = false;
+   mtx_lock(&helios->dev_mutex);
+
+   const struct helios_present_stream *entry = helios->present_streams;
+   while (entry && entry->cookie != cookie)
+      entry = entry->next;
+
+   if (entry && helios->ctx_id) {
+      struct helios_escape_present_buffer_read req = { 0 };
+      helios_hdr_init(&req.hdr, HELIOS_ESCAPE_PRESENT_BUFFER_READ, sizeof(req));
+      req.cookie = cookie;
+      req.resource_id = resource_id;
+      req.ctx_id = helios->ctx_id;
+      req.value = value;
+      accepted = helios_escape(helios, &req, sizeof(req)) &&
+         req.out_state == HELIOS_PRESENT_BUFFER_READ_ACCEPTED;
+   }
+
+   mtx_unlock(&helios->dev_mutex);
+   return accepted;
 }
 
 void
@@ -3815,7 +3878,8 @@ vn_renderer_helios_external_memory_open(
 
    const bool identity_valid =
       identity.magic == HELIOS_WDDM_IDENTITY_MAGIC &&
-      identity.version == HELIOS_WDDM_IDENTITY_VERSION &&
+      (identity.version == HELIOS_WDDM_IDENTITY_VERSION_LEGACY ||
+       identity.version == HELIOS_WDDM_IDENTITY_VERSION) &&
       identity.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY &&
       identity.resource_id != 0 && identity.blob_size >= allocation_size &&
       identity.venus_alloc_size == allocation_size &&
@@ -3844,13 +3908,17 @@ vn_renderer_helios_external_memory_open(
    mtx_unlock(&helios->dev_mutex);
 
    if (!external) {
-      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u size=%llu/%llu type=%u/%u",
+      helios_diag("external memory open failed status=0x%08x resource=0x%x allocation=0x%x identity=%u/%u/%u kind=%u/%u blob=%llu/%llu size=%llu/%llu type=%u/%u valid=%u",
                   (unsigned)st, (unsigned)open.hResource,
                   (unsigned)allocation_info.hAllocation, identity.magic,
                   identity.version, identity.resource_id,
+                  identity.kind, HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
+                  (unsigned long long)identity.blob_size,
+                  (unsigned long long)allocation_size,
                   (unsigned long long)identity.venus_alloc_size,
                   (unsigned long long)allocation_size,
-                  identity.memory_type_index, memory_type_index);
+                  identity.memory_type_index, memory_type_index,
+                  identity_valid);
       return st == 0 && identity_valid ? VK_ERROR_OUT_OF_HOST_MEMORY
                                       : VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
