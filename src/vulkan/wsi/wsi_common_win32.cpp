@@ -95,8 +95,10 @@ static volatile LONG helios_vehicle_present_fails;  /* Present()/copy errors */
 static volatile LONG helios_vehicle_fallbacks;      /* presents served sw while
                                                      * INIT/FAILED on a vehicle-
                                                      * requested chain */
-static volatile LONG helios_vehicle_wait_timeouts;  /* wait_last_present bounded
-                                                     * timeouts (unit 3) */
+static volatile LONG helios_vehicle_wait_timeouts;  /* copies still pending after
+                                                     * their first wait slice */
+static volatile LONG helios_vehicle_copy_wait_errors;
+static volatile LONG helios_vehicle_copy_wait_cancels;
 static volatile LONG helios_vehicle_drops;          /* non-FIFO frames dropped
                                                      * because DXGI would block
                                                      * (latency queue full) */
@@ -165,6 +167,7 @@ helios_win32_wsi_perf_write(void)
            " vehicle: ready=%ld creates=%ld fails=%ld exp_miss=%ld"
            " tgt_reuse=%ld"
            " presents=%ld pfails=%ld odd_hr=%ld fallbacks=%ld wait_to=%ld"
+           " wait_err=%ld wait_cancel=%ld"
            " drops=%ld\n",
            helios_win32_wsi_perf.frames,
            helios_win32_wsi_perf.direct_frames,
@@ -186,6 +189,7 @@ helios_win32_wsi_perf_write(void)
            helios_vehicle_presents, helios_vehicle_present_fails,
            helios_vehicle_present_odd,
            helios_vehicle_fallbacks, helios_vehicle_wait_timeouts,
+           helios_vehicle_copy_wait_errors, helios_vehicle_copy_wait_cancels,
            helios_vehicle_drops);
 
    if (f != stderr)
@@ -353,10 +357,9 @@ wsi_helios_vehicle_enabled(void)
    return wsi_win32_vehicle_enabled();
 }
 
-/* Bound (µs) for the post-Present wait on the vehicle's frame copy before
- * the frame image is recycled (helios_umd_wait_last_present). 32 ms default
- * is a deadline, never permission to reuse. Zero performs a readiness check;
- * an incomplete copy is terminal for this swapchain. */
+/* Sleeping wait slice, not a frame deadline. A slow copy remains owned by
+ * the helper until its fixed completion target retires. Clamp overrides to
+ * 1..32 ms so cancellation stays bounded and zero cannot create a spin loop. */
 static uint32_t
 wsi_win32_vehicle_wait_us(void)
 {
@@ -368,7 +371,7 @@ wsi_win32_vehicle_wait_us(void)
                                   sizeof(value)) &&
           value[0])
          parsed = atoi(value);
-      cached = parsed < 0 ? 0 : parsed;
+      cached = CLAMP(parsed, 1000, 32000);
    }
    return (uint32_t)cached;
 }
@@ -889,7 +892,7 @@ wsi_win32_vehicle_build(struct wsi_win32_swapchain *chain)
       v->set_source = (helios_umd_set_present_source_fn)
          wsi_win32_vehicle_find_umd_export("helios_umd_set_present_source_v2");
       v->wait_present = (helios_umd_wait_last_present_fn)
-         wsi_win32_vehicle_find_umd_export("helios_umd_wait_last_present");
+         wsi_win32_vehicle_find_umd_export("helios_umd_wait_present_copy_v2");
       v->clear_source = (helios_umd_clear_present_source_fn)
          wsi_win32_vehicle_find_umd_export("helios_umd_clear_present_source_v2");
       if (!v->set_source || !v->wait_present || !v->clear_source) {
@@ -1977,6 +1980,56 @@ wsi_win32_vehicle_latch_present_fail(struct wsi_win32_swapchain *chain)
    wsi_win32_vehicle_unbind_content(chain);
 }
 
+/* Wait for the captured helper copy, keeping the source unavailable while
+ * pending. The versioned export guarantees that 1 means pending, not a
+ * missing context/bridge exception, and that retries never move the target. */
+static VkResult
+wsi_win32_wait_vehicle_copy(struct wsi_win32_swapchain *chain,
+                           struct wsi_win32_image *image)
+{
+   struct wsi_win32_vehicle *v = &chain->vehicle;
+   const uint64_t start = os_time_get_nano();
+   bool pending = false;
+   for (;;) {
+      VkResult status = wsi_win32_swapchain_validate_extent(chain);
+      if (status != VK_SUCCESS)
+         return status;
+
+      if (chain->base.helios_async.enabled) {
+         mtx_lock(&chain->base.helios_async.mutex);
+         const bool stop = chain->base.helios_async.stop;
+         mtx_unlock(&chain->base.helios_async.mutex);
+         if (stop)
+            return VK_ERROR_OUT_OF_DATE_KHR;
+      }
+
+      const int32_t result = v->wait_present(wsi_win32_vehicle_wait_us());
+      if (result == 0) {
+         if (pending)
+            helios_wsi_vehicle_diag(
+               "copy completed after pending chain=%p resid=%u producer=%" PRIu64 " wait_us=%" PRIu64,
+               (void *)chain, image->vehicle.resid, image->base.helios_present_value,
+               (os_time_get_nano() - start) / 1000);
+         return VK_SUCCESS;
+      }
+      if (result != 1) {
+         helios_wsi_vehicle_diag(
+            "copy wait error chain=%p result=%d removed=0x%08lx",
+            (void *)chain, result, (unsigned long)v->dev->GetDeviceRemovedReason());
+         return VK_ERROR_DEVICE_LOST;
+      }
+      if (!pending) {
+         InterlockedIncrement(&helios_vehicle_wait_timeouts);
+         helios_wsi_vehicle_diag(
+            "copy pending chain=%p resid=%u producer=%" PRIu64 "; image retained",
+            (void *)chain, image->vehicle.resid, image->base.helios_present_value);
+         pending = true;
+      }
+      if (FAILED(v->dev->GetDeviceRemovedReason()))
+         return VK_ERROR_DEVICE_LOST;
+   }
+}
+
 /* Pass the exact source dependency to the helper. Copy completion remains
  * a separate, mandatory recycle guard; readiness never releases a reader. */
 static bool
@@ -2078,11 +2131,19 @@ wsi_win32_queue_present_vehicle(struct wsi_win32_swapchain *chain,
 
    // Present may fail after submitting a copy. Drain that read before any
    // fallback/recycle, including HRESULT failures and visual binding failure.
-   if (copied && v->wait_present(wsi_win32_vehicle_wait_us()) != 0) {
-      InterlockedIncrement(&helios_vehicle_wait_timeouts);
-      helios_wsi_vehicle_diag("copy completion failed chain=%p; image retained", (void *)chain);
-      wsi_win32_swapchain_latch_error(chain, VK_ERROR_DEVICE_LOST);
-      return false;
+   if (copied) {
+      const VkResult completion = wsi_win32_wait_vehicle_copy(chain, image);
+      if (completion != VK_SUCCESS) {
+         volatile LONG *counter = completion == VK_ERROR_DEVICE_LOST
+            ? &helios_vehicle_copy_wait_errors : &helios_vehicle_copy_wait_cancels;
+         const LONG n = InterlockedIncrement(counter);
+         helios_wsi_vehicle_diag(
+            "copy completion cancelled/failed chain=%p result=%d %s=%ld; image retained",
+            (void *)chain, completion,
+            completion == VK_ERROR_DEVICE_LOST ? "wait_err" : "wait_cancel", n);
+         wsi_win32_swapchain_latch_error(chain, completion);
+         return false;
+      }
    }
    image->vehicle.read_unproven = false;
    if (!copied) {
