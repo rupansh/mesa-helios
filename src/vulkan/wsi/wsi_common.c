@@ -544,6 +544,7 @@ wsi_device_init(struct wsi_device *wsi,
       WSI_GET_CB(WaitSemaphores);
 #ifdef VK_USE_PLATFORM_WIN32_KHR
    WSI_GET_CB(ImportSemaphoreWin32HandleKHR);
+   WSI_GET_CB(GetSemaphoreWin32HandleKHR);
 #endif
 #undef WSI_GET_CB
 

@@ -285,13 +285,9 @@ struct wsi_swapchain {
       VkResult status;
    } helios_async;
 
-   /* Helios dcomp present vehicle (win32): when the backend created a
-    * present-order semaphore (timeline, exported under a
-    * Global\HeliosPresentFence_<pid>_<start>_<id> kernel name), every present's
-    * pre-present submit signals value = ++next_value and stamps it into
-    * wsi_image::helios_present_value. The publish of (frame resid -> pid,
-    * fence id, value) pairs the vehicle's copy-time consumer wait with this
-    * signal, which the ICD retire thread fires at host GPU completion.
+   /* Helios dcomp vehicle: an unnamed NT timeline handle and this frame's
+    * exact pre-present signal value pass through the helper seam. The helper
+    * copy waits on that imported semaphore before reading the source image.
     * VK_NULL_HANDLE = feature off (the common code then does nothing). */
    struct {
       VkSemaphore semaphore;
@@ -303,10 +299,9 @@ struct wsi_swapchain {
     * invalidate) is skipped then — a 4 ms serial cost per present whose
     * ordering duties are covered elsewhere: the vehicle's copy-time
     * consumer wait orders the copy against the frame's GPU writes, and the
-    * pre-present throttle still waits fences[i] before reuse. Written and
-    * read on the (single) present worker thread; the one frame that races
-    * a FAILED latch falls back to GDI without the wait — bounded, counted,
-    * self-heals. */
+    * pre-present throttle still waits fences[i] before reuse. Copy completion
+    * separately protects recycling. Written and read on the single present
+    * thread; fallback explicitly waits and invalidates this frame's source. */
    bool helios_vehicle_serving;
    /**
     * Timeline for presents completing according to VK_KHR_present_wait.  The

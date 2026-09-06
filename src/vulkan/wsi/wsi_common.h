@@ -265,6 +265,7 @@ struct wsi_device {
    /* Helios dcomp present vehicle: import of the vehicle's named present
     * fence (acquire-side image-recycle gate). */
    WSI_CB(ImportSemaphoreWin32HandleKHR);
+   WSI_CB(GetSemaphoreWin32HandleKHR);
 #endif
 #undef WSI_CB
 

@@ -42,6 +42,30 @@
 void vn_renderer_helios_diag_log(const char *fmt, ...);
 #endif
 
+#if DETECT_OS_WINDOWS
+/* Detach is serialized with the retire worker's actual pointer dereference.
+ * Once revoked, this semaphore uses the ordinary wire completion path. */
+static void
+helios_semaphore_revoke_feedback(struct vn_device *dev, struct vn_semaphore *sem)
+{
+   p_atomic_set(&sem->helios_feedback_gpu_only, false);
+   if (sem->permanent.win32_sync)
+      vn_renderer_helios_sync_set_feedback(dev->renderer,
+                                          sem->permanent.win32_sync, NULL);
+}
+
+static VkResult
+helios_stream_mutation_refused(struct vn_device *dev, const char *operation)
+{
+   static uint32_t refused;
+   const uint32_t n = p_atomic_inc_return(&refused);
+   if (n == 1 || (n % 64) == 0)
+      vn_renderer_helios_diag_log("HELIOS registered GPU stream refuses %s count=%u",
+                                  operation, n);
+   return vn_error(dev->instance, VK_ERROR_UNKNOWN);
+}
+#endif
+
 struct helios_queue_submit2_perf {
    bool initialized;
    bool enabled;
@@ -802,6 +826,13 @@ vn_queue_submission_count_batch_feedback(struct vn_queue_submission *submit,
             feedback_types |= VN_FEEDBACK_TYPE_SEMAPHORE;
             extra_cmd_count++;
          } else {
+#if DETECT_OS_WINDOWS
+            /* The later host-query resync writes this slot from the CPU.
+             * Revoke BEFORE making that path reachable, including old entries
+             * already queued on the retire worker. Never reattach it. */
+            helios_semaphore_revoke_feedback(
+               vn_device_from_vk(queue->base.vk.base.device), sem);
+#endif
             const uint64_t counter =
                vn_get_signal_semaphore_counter(submit, batch_index, i);
             simple_mtx_lock(&sem->feedback.counter_mtx);
@@ -1709,7 +1740,8 @@ helios_sem_should_forward_host_signal(VkDevice dev_handle,
 static VkResult
 vn_signal_win32_external_semaphore(struct vn_device *dev,
                                    struct vn_semaphore *sem,
-                                   uint64_t value)
+                                   uint64_t value,
+                                   bool can_feedback)
 {
 #if DETECT_OS_WINDOWS
    struct vn_sync_payload *payload = sem->payload;
@@ -1741,6 +1773,8 @@ vn_signal_win32_external_semaphore(struct vn_device *dev,
           value <= UINT32_MAX) {
          batch.present_cookie = sem->helios_present_stream_cookie;
          batch.present_value32 = (uint32_t)value;
+         batch.present_feedback = can_feedback && sem->feedback.slot &&
+            p_atomic_read(&sem->helios_feedback_gpu_only);
       }
    }
 
@@ -1779,7 +1813,9 @@ helios_venus_register_present_stream(VkDevice device,
        sem->type != VK_SEMAPHORE_TYPE_TIMELINE || !sem->is_external ||
        sem->external_handle_types !=
           VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
-       sem->payload != &sem->permanent || !sem->permanent.win32_sync)
+       sem->payload != &sem->permanent || !sem->permanent.win32_sync ||
+       !p_atomic_read(&sem->helios_feedback_gpu_only) ||
+       p_atomic_read(&sem->helios_max_forwarded_host_value) != 0)
       return false;
 
    uint64_t cookie = 0;
@@ -2018,7 +2054,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
                   ? vn_get_signal_semaphore_counter(submit, i, j)
                   : 1;
             result =
-               vn_signal_win32_external_semaphore(dev, sem, value);
+               vn_signal_win32_external_semaphore(dev, sem, value, queue->can_feedback);
             if (result != VK_SUCCESS) {
                vn_queue_submission_cleanup(submit);
                return vn_error(instance, result);
@@ -3473,6 +3509,7 @@ vn_CreateSemaphore(VkDevice device,
     * skipped. vk_zalloc already zeroed it; this makes non-zero initialValue
     * explicit. */
    sem->helios_max_forwarded_host_value = initial_val;
+   sem->helios_feedback_gpu_only = initial_val == 0;
 #endif
 
    const struct VkExportSemaphoreCreateInfo *export_info =
@@ -4029,6 +4066,14 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pSignalInfo->semaphore);
 
+#if DETECT_OS_WINDOWS
+   /* Registered private streams have queue-only signals. A CPU signal cannot
+    * stand in for work admitted by HE12 or allocation producer publication. */
+   if (sem->helios_present_stream_cookie)
+      return helios_stream_mutation_refused(dev, "CPU signal");
+   helios_semaphore_revoke_feedback(dev, sem);
+#endif
+
    /* Helios: the HOST timeline for a WDDM-folded semaphore is advanced
     * monotonically by the queue-submit signal path (vn_queue_submit ->
     * vn_submit_vkQueueSubmit2). An explicit vkSignalSemaphore that lags that
@@ -4302,6 +4347,11 @@ vn_ImportSemaphoreFdKHR(
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pImportSemaphoreFdInfo->semaphore);
+#if DETECT_OS_WINDOWS
+   if (sem->helios_present_stream_cookie)
+      return helios_stream_mutation_refused(dev, "fd import");
+   helios_semaphore_revoke_feedback(dev, sem);
+#endif
    ASSERTED const bool sync_file =
       pImportSemaphoreFdInfo->handleType ==
       VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
@@ -4390,6 +4440,9 @@ vn_ImportSemaphoreWin32HandleKHR(
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pImportSemaphoreWin32HandleInfo->semaphore);
+   if (sem->helios_present_stream_cookie)
+      return helios_stream_mutation_refused(dev, "Win32 import");
+   helios_semaphore_revoke_feedback(dev, sem);
    struct vn_sync_payload *temp = &sem->temporary;
    struct vn_renderer_sync *sync = NULL;
    VkResult result;

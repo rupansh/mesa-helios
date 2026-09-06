@@ -102,6 +102,9 @@ struct vn_renderer_submit_batch {
     * the KMD overwrites that field with its normal fresh wire fence id. */
    uint64_t present_cookie;
    uint32_t present_value32;
+   /* This exact tagged submit includes the owning GPU-only semaphore's
+    * feedback command. Never infer this from a CPU/WDDM counter query. */
+   bool present_feedback;
 
    /* syncs to update when the timeline is signaled */
    struct vn_renderer_sync *const *syncs;
@@ -252,7 +255,7 @@ vn_renderer_helios_sync_create_from_win32(
 
 /* Open a NAMED NT-shared WDDM sync (the VkImportSemaphoreWin32HandleInfoKHR
  * `name` path). `name` is the Win32-style name the exporter used, e.g.
- * L"Global\\HeliosPresentFence_1234". */
+ * a caller-supplied name. */
 VkResult
 vn_renderer_helios_sync_create_from_win32_name(
    struct vn_renderer *renderer,
